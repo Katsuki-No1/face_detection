@@ -253,6 +253,26 @@ YOLO Pose モデルを学習する場合は、次のように実行します。
 - `<split>_best_threshold.json`: 最も F1 が高い threshold の行が保存されます。
 - `<split>_raw_predictions.jsonl`: `--write-predictions` を指定した場合に、推論結果が保存されます。
 
+### 現在の baseline 結果
+
+現在の内部 test split に対する暫定的な評価結果です。この比較は最終的なベンチマーク性能を示すものではなく、今後の失敗分析で使う baseline model を選ぶためのものです。各手法では、val split で F1 が最も高くなった confidence threshold を選び、その値を test split に適用しています。評価は IoU threshold `0.5` の face bbox detection F1 で行っています。
+
+| method | val threshold | test F1 | precision | recall | TP | FP | FN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO11s Pose | 0.51 | 0.8073 | 0.9565 | 0.6984 | 44 | 2 | 19 |
+| YOLO11n Pose | 0.55 | 0.7778 | 0.9333 | 0.6667 | 42 | 3 | 21 |
+| YOLO11m Pose | 0.52 | 0.7593 | 0.9111 | 0.6508 | 41 | 4 | 22 |
+| SCRFD + MediaPipe | 0.09 | 0.5938 | 0.5846 | 0.6032 | 38 | 27 | 25 |
+
+現時点では YOLO11s Pose を暫定 baseline とします。F1、precision、recall のバランスが最もよく、model size も YOLO11m Pose より扱いやすいためです。ただし、YOLO11s Pose と YOLO11m Pose では失敗するケースが一部異なるため、model ごとの失敗理由の確認は継続します。SCRFD + MediaPipe は比較用 baseline として残しますが、現在の test split では false positive が多く出ています。
+
+主な観察結果は次のとおりです。
+
+- YOLO11s Pose は precision が高い一方で、難しい face の検出漏れが残っています。
+- 検出できていない face は、confidence threshold の調整だけではあまり改善しにくい傾向があります。
+- 失敗しやすい条件には、斜め向きの顔、blur、occlusion、小さい顔、partial face、極端な close-up があります。
+- 失敗理由の目視確認では、raw 出力にアノテーション bbox と一部重なるだけで顔を正しく囲えていない矩形が多く含まれていました。次の改善では、顔として確信を持てる矩形の confidence を上げる方針にします。具体的には、学習データの bbox 定義の一貫性、難例の追加、入力解像度、または学習設定を見直します。
+
 顔検出では、次の観点を分けて確認することを推奨します。
 
 - 顔が写っていない画像: false positive が過度に増えていないかを確認します。
@@ -380,4 +400,3 @@ git add --dry-run .
 - 推論結果が出ない場合: `--conf` を下げるか、指定したモデルの重みが目的の task に対応しているかを確認してください。
 - dataset checker が失敗する場合: label の欠損、bbox の範囲、keypoint の visibility、生成された YAML の `kpt_shape` を確認してください。
 - overlay 生成時に import error が出る場合: リポジトリのルートからコマンドを実行してください。
-
