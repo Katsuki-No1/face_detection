@@ -381,9 +381,3 @@ git add --dry-run .
 - dataset checker が失敗する場合: label の欠損、bbox の範囲、keypoint の visibility、生成された YAML の `kpt_shape` を確認してください。
 - overlay 生成時に import error が出る場合: リポジトリのルートからコマンドを実行してください。
 
-## GitHub 公開前の確認項目
-
-- 生成した設定ファイルやログの中に、ローカルパスが残っていないことを確認してください。
-- 実動画、抽出フレーム、顔画像、CVAT XML/ZIP export、JSONL 形式の推論結果、学習済みの重みを commit しないでください。
-- 非公開の案件名、作業者名、動画 ID、顧客固有の用語を commit しないでください。
-- `git add --dry-run .` を再実行し、commit 予定のファイルを目視で確認してください。
