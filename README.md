@@ -12,6 +12,7 @@
 - YOLO Pose のラベルが学習可能な形式になっているかを確認できます。
 - Ultralytics を使って YOLO Pose モデルを学習、または fine-tune できます。
 - confidence threshold を探索し、YOLO Pose の bbox detection の F1 を評価できます。
+- OpenMMLab の RTMDet と RTMPose を使い、顔検出と 5 点ランドマーク推定を二段構成で fine-tune できます。
 - SCRFD による顔検出と、必要に応じた MediaPipe による目のランドマーク抽出を実行できます。
 - ラベルの確認、YOLO Pose の推論結果、SCRFD と MediaPipe の処理段階、検出エラーの確認用に overlay 画像を生成できます。
 
@@ -39,6 +40,7 @@ script/
   script_data/                         # アノテーションとフレームに関する補助スクリプト
   script_model/                        # SCRFD/MediaPipe の推論とデバッグ用スクリプト
   script_experiment/                   # 評価、可視化、確認用の補助スクリプト
+    rtmdet_rtmpose_experiment.py       # RTMDet + RTMPose の変換、学習、推論、評価をまとめた CLI
   script_process/                      # 前処理と後処理の補助スクリプト
 
 docs/
@@ -265,6 +267,36 @@ YOLO Pose モデルを学習する場合は、次のように実行します。
 | SCRFD + MediaPipe | 0.09 | 0.5938 | 0.5846 | 0.6032 | 38 | 27 | 25 |
 
 現時点では YOLO11s Pose を暫定 baseline とします。F1、precision、recall のバランスが最もよく、model size も YOLO11m Pose より扱いやすいためです。ただし、YOLO11s Pose と YOLO11m Pose では失敗するケースが一部異なるため、model ごとの失敗理由の確認は継続します。SCRFD + MediaPipe は比較用 baseline として残しますが、現在の test split では false positive が多く出ています。
+
+### RTMDet + RTMPose-face の実験結果
+
+YOLO Pose とは別系統の実験として、OpenMMLab の RTMDet と RTMPose を組み合わせた二段構成の fine-tune も行っています。RTMDet は `head` と `face` の 2 クラスを同時に検出し、そのうち `face` bbox だけを RTMPose に渡して 5 点 keypoint を推定します。つまり、現在の構成は「頭を検出してから顔を探す」cascade ではありません。
+
+実験用の変換データ、checkpoint、推論結果、評価値、可視化画像は `output_experiment/` 以下に保存します。このディレクトリは Git 管理対象外です。実行の入口は `script/script_experiment/rtmdet_rtmpose_experiment.py` です。
+
+```bash
+.venv/bin/python script/script_experiment/rtmdet_rtmpose_experiment.py run-all \
+  --data-root . \
+  --output-dir output_experiment \
+  --mode full \
+  --device cuda:0
+```
+
+現在の test split は、YOLO11s Pose と SCRFD + MediaPipe の比較で使ったものと同じ 30 画像、63 件の face アノテーションです。次の表では、face bbox detection として公平に比較できる値だけを並べています。RTMDet は可視化を見やすくするため、スコアしきい値 `0.50` で評価しています。YOLO11s Pose と SCRFD + MediaPipe は、それぞれ val split で F1 が最も高くなったしきい値を test split に適用しています。
+
+| method | threshold | test F1 | precision | recall | TP | FP | FN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO11s Pose | 0.51 | 0.8073 | 0.9565 | 0.6984 | 44 | 2 | 19 |
+| RTMDet + RTMPose-face | 0.50 | 0.6931 | 0.9211 | 0.5556 | 35 | 3 | 28 |
+| SCRFD + MediaPipe | 0.09 | 0.5938 | 0.5846 | 0.6032 | 38 | 27 | 25 |
+
+この条件では、YOLO11s Pose が最もよい F1 と recall を出しています。RTMDet + RTMPose-face は YOLO11s Pose より検出漏れが多く、F1 は下がります。一方で、SCRFD + MediaPipe と比べると false positive が大きく減り、precision と F1 は上回っています。SCRFD + MediaPipe は recall では RTMDet + RTMPose-face より少し高いものの、false positive が多く、画面上の検出結果も散らかりやすい傾向があります。
+
+RTMDet 単体の `head` と `face` をまとめた参考値は precision `0.9579`、recall `0.6842`、F1 `0.7982` です。ただし、これは `head` クラスも含む集計なので、YOLO11s Pose や SCRFD + MediaPipe の face bbox detection とは直接比較しません。two-stage の入口として見るべき値は、上の表にある RTMDet の face-only の値です。
+
+keypoint については、現時点では RTMDet + RTMPose-face が YOLO11s Pose と SCRFD + MediaPipe に届いていません。RTMDet + RTMPose-face の two-stage 評価では NME `0.0740`、PCK@0.05 `0.4762`、PCK@0.10 `0.7619` でした。既存の probe では、YOLO11s Pose が NME `0.0352`、PCK@0.05 `0.8086`、PCK@0.10 `0.9522`、SCRFD + MediaPipe が NME `0.0352`、PCK@0.05 `0.8389`、PCK@0.10 `0.9667` です。ただし、この keypoint 比較は完全に同じ evaluator ではなく、既存 probe に基づく参考比較です。
+
+現状の結論としては、総合的な baseline は引き続き YOLO11s Pose です。RTMDet + RTMPose-face は SCRFD + MediaPipe より誤検出を抑えやすい一方で、face recall と keypoint 精度の改善が必要です。次に進めるなら、RTMDet の face class の threshold 最適化、入力解像度、small face の補強、RTMPose の学習 schedule と augmentation を重点的に見直します。
 
 主な観察結果は次のとおりです。
 
