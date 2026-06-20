@@ -1,0 +1,100 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+.agents/
+.codex/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.TMP
+*.log
+*:Zone.Identifier
+
+# Private/local data and generated datasets
+data/
+datasets/
+input/
+output/
+outputs/
+outputs_experiment/
+outputs_exoeriment/
+results/
+runs/
+experiments/
+debug_outputs/
+cache/
+
+# Extracted or raw media directories
+frames/
+videos/
+images/
+
+# Annotation and label exports
+cvat_exports/
+annotations/
+labels/
+*.zip
+
+# Model artifacts and weights
+checkpoints/
+weights/
+models/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.tflite
+
+# Media files
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+
+# Generated prediction/result stores
+*.jsonl
+*.sqlite
+*.db
+
+# Experiment trackers
+wandb/
+mlruns/
+tensorboard/
+
+# Keep documentation, source, examples, and placeholders versionable
+!README.md
+!docs/
+!docs/**
+!tests/
+!tests/**
+!requirements.txt
+!pyproject.toml
+!configs/
+!configs/*.example.yaml
+!.env.example
+!**/.gitkeep
