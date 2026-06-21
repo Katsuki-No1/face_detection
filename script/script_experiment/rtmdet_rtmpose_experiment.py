@@ -778,6 +778,11 @@ def convert_annotations(data_root: Path, output_dir: Path, metadata_path: Path |
 def generate_configs(data_root: Path, output_dir: Path) -> None:
     root = data_root.resolve().as_posix()
     out = output_dir.resolve().as_posix()
+    det_train_ann = repo_rel(output_dir / "data" / "converted" / "detection_coco" / "instances_train.json", data_root)
+    det_test_ann = repo_rel(output_dir / "data" / "converted" / "detection_coco" / "instances_test.json", data_root)
+    kp_train_ann = repo_rel(output_dir / "data" / "converted" / "keypoint_coco" / "person_keypoints_train.json", data_root)
+    kp_val_ann = repo_rel(output_dir / "data" / "converted" / "keypoint_coco" / "person_keypoints_val.json", data_root)
+    kp_test_ann = repo_rel(output_dir / "data" / "converted" / "keypoint_coco" / "person_keypoints_test.json", data_root)
     det_common = f"""
 custom_imports = dict(imports=['mmdet'], allow_failed_imports=False)
 _base_ = 'mmdet::rtmdet/rtmdet_s_8xb32-300e_coco.py'
@@ -804,7 +809,7 @@ train_dataloader = dict(
     dataset=dict(
         type='CocoDataset',
         data_root=data_root,
-        ann_file='output_experiment/data/converted/detection_coco/instances_train.json',
+        ann_file='{det_train_ann}',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         filter_cfg=dict(filter_empty_gt=False, min_size=1)))
@@ -814,11 +819,11 @@ test_dataloader = dict(
     dataset=dict(
         type='CocoDataset',
         data_root=data_root,
-        ann_file='output_experiment/data/converted/detection_coco/instances_test.json',
+        ann_file='{det_test_ann}',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         test_mode=True))
-test_evaluator = dict(type='CocoMetric', ann_file=data_root + 'output_experiment/data/converted/detection_coco/instances_test.json', metric='bbox')
+test_evaluator = dict(type='CocoMetric', ann_file=data_root + '{det_test_ann}', metric='bbox')
 work_dir = output_root + '/logs/rtmdet_head_face_sanity'
 """
     det_tiny = det_common.replace("_base_ = 'mmdet::rtmdet/rtmdet_s_8xb32-300e_coco.py'", "_base_ = 'mmdet::rtmdet/rtmdet_tiny_8xb32-300e_coco.py'").replace(
@@ -946,7 +951,7 @@ train_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file='output_experiment/data/converted/keypoint_coco/person_keypoints_train.json',
+        ann_file='{kp_train_ann}',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         pipeline=train_pipeline))
@@ -960,7 +965,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file='output_experiment/data/converted/keypoint_coco/person_keypoints_val.json',
+        ann_file='{kp_val_ann}',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         test_mode=True,
@@ -975,7 +980,7 @@ test_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
-        ann_file='output_experiment/data/converted/keypoint_coco/person_keypoints_test.json',
+        ann_file='{kp_test_ann}',
         data_prefix=dict(img=''),
         metainfo=metainfo,
         test_mode=True,
@@ -1837,7 +1842,7 @@ def checkpoint_candidates(output_dir: Path, keywords: tuple[str, ...]) -> list[P
         rel_parts = path.relative_to(output_dir).parts if path.is_relative_to(output_dir) else path.parts
         if "cache" in rel_parts:
             continue
-        haystack = path.as_posix().lower()
+        haystack = path.parent.name.lower()
         if any(keyword in haystack for keyword in keywords):
             filtered.append(path)
     return sorted(set(filtered), key=lambda path: (path.stat().st_mtime, path.as_posix()))
