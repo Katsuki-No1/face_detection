@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import math
 import random
 import shutil
 import subprocess
@@ -15,6 +16,10 @@ VIDEO_EXTENSIONS = {
     ".wmv",
     ".webm",
 }
+
+
+class CliError(RuntimeError):
+    pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,12 +63,22 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="JPEG quality for ffmpeg -q:v. Lower is better. Default: 2.",
     )
+    parser.add_argument(
+        "--full-decode-check",
+        action="store_true",
+        help="Run full-video decode validation before extracting. Slow, but catches broken sections.",
+    )
+    parser.add_argument(
+        "--skip-decode-check",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
 def require_command(name: str) -> None:
     if shutil.which(name) is None:
-        raise RuntimeError(f"{name} is not available. Please install ffmpeg.")
+        raise CliError(f"{name} is not available. Please install ffmpeg.")
 
 
 def find_videos(input_dir: Path, recursive: bool) -> list[Path]:
@@ -87,6 +102,17 @@ def frame_prefix(video_path: Path, input_dir: Path) -> str:
     return f"{date_part}_{video_part}_{video_hash}"
 
 
+def command_error_message(result: subprocess.CompletedProcess[str]) -> str:
+    message = (result.stderr or result.stdout).strip()
+    if not message:
+        return f"exit status {result.returncode}"
+
+    lines = message.splitlines()
+    if len(lines) > 8:
+        lines = lines[:8] + ["..."]
+    return "\n".join(lines)
+
+
 def get_duration_seconds(video_path: Path) -> float:
     result = subprocess.run(
         [
@@ -99,11 +125,81 @@ def get_duration_seconds(video_path: Path) -> float:
             "default=noprint_wrappers=1:nokey=1",
             str(video_path),
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
-    return float(result.stdout.strip())
+    if result.returncode != 0:
+        raise CliError(f"ffprobe failed:\n{command_error_message(result)}")
+
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as error:
+        raise CliError(f"ffprobe returned invalid duration: {result.stdout.strip()!r}") from error
+
+    if not math.isfinite(duration) or duration <= 0:
+        raise CliError(f"ffprobe returned invalid duration: {duration}")
+
+    return duration
+
+
+def check_video_decodable(video_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-xerror",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:v:0",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise CliError(f"ffmpeg decode check failed:\n{command_error_message(result)}")
+
+
+def format_video_errors(errors: list[tuple[Path, Exception]]) -> str:
+    detail = "\n\n".join(f"{path.name}\n{error}" for path, error in errors)
+    return f"Broken or unreadable video file(s) found. Stop before extracting frames.\n\n{detail}"
+
+
+def validate_videos(videos: list[Path], decode_check: bool) -> dict[Path, float]:
+    durations: dict[Path, float] = {}
+    metadata_errors: list[tuple[Path, Exception]] = []
+
+    print("Checking video metadata...", flush=True)
+    for video_path in videos:
+        try:
+            durations[video_path] = get_duration_seconds(video_path)
+        except CliError as error:
+            metadata_errors.append((video_path, error))
+
+    if metadata_errors:
+        raise CliError(format_video_errors(metadata_errors))
+
+    if not decode_check:
+        return durations
+
+    decode_errors: list[tuple[Path, Exception]] = []
+    print("Checking full video decode...", flush=True)
+    for video_path in videos:
+        try:
+            check_video_decodable(video_path)
+        except CliError as error:
+            decode_errors.append((video_path, error))
+
+    if decode_errors:
+        raise CliError(format_video_errors(decode_errors))
+
+    return durations
 
 
 def extract_frame(video_path: Path, output_path: Path, time_seconds: float, quality: int) -> None:
@@ -135,9 +231,9 @@ def extract_video_frames(
     output_root: Path,
     frame_count: int,
     quality: int,
+    duration: float,
     rng: random.Random,
 ) -> int:
-    duration = get_duration_seconds(video_path)
     prefix = frame_prefix(video_path, input_dir)
 
     for count in range(1, frame_count + 1):
@@ -165,7 +261,6 @@ def main() -> None:
     project_root = Path(__file__).resolve().parents[2]
     output_dir_name = args.output_dir or input_dir.name
     output_root = project_root / "data" / "output" / output_dir_name
-    output_root.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
 
     videos = find_videos(input_dir, args.recursive)
@@ -173,6 +268,12 @@ def main() -> None:
         print(f"No videos found in {input_dir}")
         return
 
+    durations = validate_videos(
+        videos,
+        decode_check=args.full_decode_check and not args.skip_decode_check,
+    )
+
+    output_root.mkdir(parents=True, exist_ok=True)
     print(f"Output: {output_root}")
     for video_path in videos:
         frame_count = extract_video_frames(
@@ -181,10 +282,14 @@ def main() -> None:
             output_root=output_root,
             frame_count=args.frame_count,
             quality=args.quality,
+            duration=durations[video_path],
             rng=rng,
         )
         print(f"{video_path.name}: extracted {frame_count} frame(s)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (CliError, NotADirectoryError, ValueError) as error:
+        raise SystemExit(f"Error: {error}") from None
