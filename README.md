@@ -34,6 +34,11 @@ scripts_YOLO/
   predict_yolo_pose.py                 # YOLO Pose の推論結果を画像または動画として可視化する
   export_yolo_pose_jsonl.py            # YOLO Pose の推論結果を JSONL で出力する
   evaluate_yolo_pose_f1.py             # bbox detection F1 と threshold を評価する
+  evaluate_yolo_pose_metrics.py        # mAP、固定 threshold、keypoint 品質、失敗種別をまとめて評価する
+  run_yolo_pose_dataset_ablation.py    # 旧データと追加データの YOLO Pose 比較を実行する
+  run_yolo11s_improvement_phase123.py  # 失敗分析、難例抽出、改善用データセット作成を補助する
+  visualize_yolo_pose_predictions.py   # YOLO Pose 推論結果の overlay を生成する
+  export_yolo_pose_failure_details.py  # YOLO Pose の失敗詳細を CSV/画像で確認しやすく出力する
   run_yolo_pose_gpu_compare.py         # 複数の YOLO Pose モデルを GPU で比較する
 
 script/
@@ -268,6 +273,37 @@ YOLO Pose モデルを学習する場合は、次のように実行します。
 
 現時点では YOLO11s Pose を暫定 baseline とします。F1、precision、recall のバランスが最もよく、model size も YOLO11m Pose より扱いやすいためです。ただし、YOLO11s Pose と YOLO11m Pose では失敗するケースが一部異なるため、model ごとの失敗理由の確認は継続します。SCRFD + MediaPipe は比較用 baseline として残しますが、現在の test split では false positive が多く出ています。
 
+### YOLO11s のデータ追加と高解像度比較
+
+`outputs_experiment/yolo_pose_dataset_ablation/` では、旧データ、追加データ、今回の高解像度 YOLO11s を同じ固定 val/test split で比較しています。test split は 30 画像、63 件の face アノテーションです。各行では val split で F1 が最も高い confidence threshold を選び、その threshold を test split に適用しています。評価は IoU threshold `0.5` です。
+
+| model | train data | imgsz / batch | epochs | val threshold | test box mAP50-95 | test pose mAP50-95 | test F1 | precision | recall | TP / FP / FN | keypoint NME | PCK@0.05 | PCK@0.10 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO11s old repro | old | 960 / 32 | 200 | 0.51 | 0.4381 | 0.7476 | 0.8073 | 0.9565 | 0.6984 | 44 / 2 / 19 | 0.0554 | 0.6220 | 0.8804 |
+| YOLO11s modified_50 | old + 50追加 | 960 / 32 | 200 | 0.53 | 0.4737 | 0.7455 | 0.8148 | 0.9778 | 0.6984 | 44 / 1 / 19 | 0.0585 | 0.5545 | 0.8389 |
+| YOLO11s modified_100 | old + 100追加 | 960 / 32 | 104 | 0.40 | 0.5125 | 0.7525 | 0.7500 | 0.8571 | 0.6667 | 42 / 7 / 21 | 0.0634 | 0.5231 | 0.8718 |
+| YOLO11s modified_100 high-res | old + 100追加 | 1280 / 16 | 200 | 0.52 | 0.4984 | 0.7703 | 0.7778 | 0.9333 | 0.6667 | 42 / 3 / 21 | 0.0489 | 0.6650 | 0.9188 |
+
+今回の `imgsz=1280`、`batch=16` の YOLO11s は、同じ `modified_100` データを `imgsz=960` で学習したモデルと比べると、false positive が `7` から `3` に減り、test F1 は `0.7500` から `0.7778` に上がりました。keypoint も改善しており、NME は `0.0634` から `0.0489` に下がり、PCK@0.05 は `0.5231` から `0.6650` に上がっています。
+
+F1 の差は、bbox/keypoint の質そのものよりも TP/FP/FN の差に強く影響されています。高解像度版は検出できた bbox の mean IoU と keypoint NME は良い一方で、旧 baseline より TP が少なく FN が多いため、F1 では不利になっています。
+
+| model | TP | FP | FN | precision | recall | F1 | mean IoU | keypoint NME |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO11s old repro | 44 | 2 | 19 | 0.9565 | 0.6984 | 0.8073 | 0.8008 | 0.0554 |
+| YOLO11s modified_50 | 44 | 1 | 19 | 0.9778 | 0.6984 | 0.8148 | 0.8198 | 0.0585 |
+| YOLO11s modified_100 high-res | 42 | 3 | 21 | 0.9333 | 0.6667 | 0.7778 | 0.8276 | 0.0489 |
+
+test split 上で後追いの threshold 最適化を行うと、高解像度版は `threshold=0.68` で `TP=42`、`FP=0`、`FN=21`、F1 `0.8000` まで上がります。ただし TP は増えません。逆に `threshold=0.01` まで下げると `TP=49` まで拾えますが、`FP=20` まで増えて F1 は `0.7424` に下がります。このため、現状の主な課題は bbox regression や keypoint regression よりも、難しい顔の confidence と false positive の score separation です。
+
+一方で、bbox detection F1 だけを見ると、旧 baseline の `old_repro` と `modified_50` にはまだ届いていません。高解像度化は keypoint 品質には効いていますが、検出漏れは `42 TP / 21 FN` のままなので、総合 baseline を置き換えるには recall 改善が必要です。学習ログ上の val best pose mAP50-95 は `0.6879` at epoch `128` で、`modified_100` の `0.6631` より高くなっています。
+
+関連する成果物は次にあります。
+
+- `outputs_experiment/yolo_pose_dataset_ablation/model_comparison.csv`: 上の比較表の元データ。
+- `outputs_experiment/yolo_pose_dataset_ablation/evaluations/modified_100_imgsz1280_b16/`: 今回追加した高解像度モデルの val threshold sweep と test 評価。
+- `runs/face_pose_dataset_ablation/yolo11s_modified_100_imgsz1280_b16/`: 高解像度 YOLO11s の学習ログ、`results.csv`、`best.pt`、`last.pt`。
+
 ### RTMDet + RTMPose-face の実験結果
 
 YOLO Pose とは別系統の実験として、OpenMMLab の RTMDet と RTMPose を組み合わせた二段構成の fine-tune も行っています。RTMDet は `head` と `face` の 2 クラスを同時に検出し、そのうち `face` bbox だけを RTMPose に渡して 5 点 keypoint を推定します。つまり、現在の構成は「頭を検出してから顔を探す」cascade ではありません。
@@ -297,6 +333,26 @@ RTMDet 単体の `head` と `face` をまとめた参考値は precision `0.9579
 keypoint については、現時点では RTMDet + RTMPose-face が YOLO11s Pose と SCRFD + MediaPipe に届いていません。RTMDet + RTMPose-face の two-stage 評価では NME `0.0740`、PCK@0.05 `0.4762`、PCK@0.10 `0.7619` でした。既存の probe では、YOLO11s Pose が NME `0.0352`、PCK@0.05 `0.8086`、PCK@0.10 `0.9522`、SCRFD + MediaPipe が NME `0.0352`、PCK@0.05 `0.8389`、PCK@0.10 `0.9667` です。ただし、この keypoint 比較は完全に同じ evaluator ではなく、既存 probe に基づく参考比較です。
 
 現状の結論としては、総合的な baseline は引き続き YOLO11s Pose です。RTMDet + RTMPose-face は SCRFD + MediaPipe より誤検出を抑えやすい一方で、face recall と keypoint 精度の改善が必要です。次に進めるなら、RTMDet の face class の threshold 最適化、入力解像度、small face の補強、RTMPose の学習 schedule と augmentation を重点的に見直します。
+
+`outputs_experiment/rtmdet_rtmpose_dataset_ablation/model_comparison.csv` には、RTMDet + RTMPose-face を旧データと追加データで比較した結果も保存されています。test split は同じ 30 画像です。
+
+| model | train images | val threshold | detector F1 | face recall | two-stage NME | two-stage PCK@0.05 | two-stage PCK@0.10 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| old_repro | 260 | 0.43 | 0.7871 | 0.6825 | 0.0334 | 0.8732 | 0.9463 |
+| modified_50 | 280 | 0.46 | 0.8163 | 0.6825 | 0.0259 | 0.9235 | 0.9643 |
+| modified_100 | 560 | 0.42 | 0.8367 | 0.7460 | 0.0324 | 0.8378 | 0.9414 |
+
+RTMDet 側では `modified_100` が detector F1 と face recall を改善しています。一方で、keypoint 品質は `modified_50` が最もよく、追加データを増やすだけでは RTMPose の精度が単調に上がるわけではありません。RTMPose の fixed-100 same-condition 比較は `output_experiment/learning_curves_fixed100_compare/` にあり、同一 trajectory 内では epoch100 / best92 が epoch20 / epoch50 より良いものの、learning rate schedule の見直し余地が残っています。
+
+### データ監査と追加データセット
+
+ローカルの `output_experiment/` と `outputs_experiment/` には、README に未反映だったデータ監査とデータセット作成結果があります。公開 repo には実データを含めない前提なので、数値はローカル成果物がある環境での確認値です。
+
+- `output_experiment/output_data_visual_check/`: 実際に学習へ渡す YOLO/COCO 出力を可視化して確認した結果です。YOLO label は 390 files、non-empty は 346 files、multi-object label は 142 files でした。COCO keypoint は train/val/test が 387 / 100 / 63 annotations です。
+- `output_experiment/annotation_gap_check/`: 元 metadata の監査です。no-face/object records は 44 件で、全て negative sample として空 label が作成されています。non-negative で head 数が face ellipse 数より多い record は 33 件、推定 missing face slots は 47 件です。
+- `output_experiment/02_datasets/dataset_compare.csv`: 改善用データセット候補を保存しています。`exp_yolo11s_base_repro` は train 260 images、`hard_mining_balanced_v1` は train 433 images / hard examples 173、`negative_v1` は train 291 images / negative 55 images です。
+- `output_experiment/01_failure_mining/`: 失敗 mining の中間結果です。主な候補は `keypoint_ng` 69 images、`fn` 42 images、`occluded_candidate` 42 images、`small` 25 images、`edge` 22 images、`fp` 5 images です。
+- `output_experiment/03_yolo_aug/`: keypoint-safe augmentation の YOLO11s 実験ログがあります。`full_train/results.csv` は epoch 38 までの途中ログなので、最終比較表にはまだ入れていません。
 
 主な観察結果は次のとおりです。
 
