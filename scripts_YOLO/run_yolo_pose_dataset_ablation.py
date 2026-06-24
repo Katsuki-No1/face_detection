@@ -6,17 +6,14 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 KEYPOINT_NAMES = ["e1", "e2", "n", "m1", "m2"]
-DEFAULT_MODIFIED_ZIPS = [
-    Path("data/output/2026_06_17_1/task1_mikity.zip"),
-    Path("data/output/2026_06_17_2/task1_yk.zip"),
-    Path("data/output/cvat_upload/test_kita.zip"),
-]
+DEFAULT_MODIFIED_ZIP_ROOT = Path("data/output")
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +30,24 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Modified/current CVAT zip. Can be supplied multiple times.",
+    )
+    parser.add_argument(
+        "--modified-zip-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Text file listing modified/current CVAT zips, one path per line. "
+            "Ignored when --modified-zip is supplied. When omitted, zips are auto-discovered."
+        ),
+    )
+    parser.add_argument(
+        "--modified-zip-root",
+        type=Path,
+        default=DEFAULT_MODIFIED_ZIP_ROOT,
+        help=(
+            "Root directory scanned for CVAT annotation zips when neither --modified-zip nor "
+            "--modified-zip-manifest is supplied."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -127,15 +142,100 @@ def fixed_eval_names(old_root: Path) -> tuple[set[str], set[str]]:
     )
 
 
+def read_modified_zip_manifest(path: Path) -> list[Path]:
+    zips = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        value = line.split("#", 1)[0].strip()
+        if not value:
+            continue
+        zip_path = Path(value)
+        if zip_path.suffix.lower() != ".zip":
+            raise ValueError(f"Expected a .zip path at {path}:{line_number}: {value}")
+        zips.append(zip_path)
+    if not zips:
+        raise ValueError(f"No modified annotation zip paths were found in {path}")
+    return zips
+
+
+def directory_has_images(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    return any(child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS for child in path.iterdir())
+
+
+def zip_contains_annotations_xml(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return any(Path(name).name == "annotations.xml" for name in archive.namelist())
+    except zipfile.BadZipFile:
+        return False
+
+
+def discover_modified_zips(root: Path) -> list[Path]:
+    if not root.exists():
+        raise FileNotFoundError(f"Modified zip root not found: {root}")
+    discovered = []
+    for zip_path in sorted(root.rglob("*.zip")):
+        if not directory_has_images(zip_path.parent):
+            continue
+        if not zip_contains_annotations_xml(zip_path):
+            continue
+        discovered.append(zip_path)
+    if not discovered:
+        raise FileNotFoundError(
+            f"No CVAT annotation zips were found under {root}. "
+            "Place each annotation zip beside its frame images, or use --modified-zip."
+        )
+    return discovered
+
+
+def modified_zip_inputs(args: argparse.Namespace) -> list[Path]:
+    if args.modified_zip:
+        return args.modified_zip
+    if args.modified_zip_manifest is not None:
+        if not args.modified_zip_manifest.exists():
+            raise FileNotFoundError(f"Modified zip manifest not found: {args.modified_zip_manifest}")
+        return read_modified_zip_manifest(args.modified_zip_manifest)
+    return discover_modified_zips(args.modified_zip_root)
+
+
+def write_modified_zip_inputs(path: Path, zips: list[Path]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([str(zip_path) for zip_path in zips], ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def modified_zip_inputs_match(path: Path, zips: list[Path]) -> bool:
+    if not path.exists():
+        return False
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return existing == [str(zip_path) for zip_path in zips]
+
+
 def convert_modified_dataset(args: argparse.Namespace, temp_root: Path) -> None:
-    if temp_root.exists() and args.skip_existing:
+    if temp_root.exists() and args.skip_existing and args.eval_only:
         return
-    if temp_root.exists():
-        raise FileExistsError(f"{temp_root} already exists. Remove it or use --skip-existing.")
-    zips = args.modified_zip or DEFAULT_MODIFIED_ZIPS
+    zips = modified_zip_inputs(args)
+    if temp_root.exists() and args.skip_existing:
+        zip_log = args.output_dir / "logs" / "modified_zip_inputs.json"
+        if modified_zip_inputs_match(zip_log, zips):
+            return
+        raise RuntimeError(
+            "Existing converted modified dataset does not match the current annotation zip inputs, "
+            f"or its source log is missing: {temp_root}. Use a new --output-dir or remove the "
+            "existing converted dataset before preparing again."
+        )
     missing = [path for path in zips if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing modified zip(s): {', '.join(str(path) for path in missing)}")
+    if temp_root.exists():
+        raise FileExistsError(f"{temp_root} already exists. Remove it or use --skip-existing.")
+    write_modified_zip_inputs(args.output_dir / "logs" / "modified_zip_inputs.json", zips)
     command = [
         sys.executable,
         "scripts_YOLO/convert_annotations_to_yolo_pose.py",

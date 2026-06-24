@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         "input_dir",
         type=Path,
         # 対象動画を指定したい場合は、実行時にこの引数へ動画が入ったディレクトリを渡します。
-        # 例: python .\script\script_data\clip_frame.py .\data\input\2026_06_17
+        # 例: python3 ./script/script_data/clip_frame.py ./data/input/2026_06_24
         help="Directory that contains target videos.",
     )
     parser.add_argument(

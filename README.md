@@ -236,6 +236,22 @@ YOLO Pose モデルを学習する場合は、次のように実行します。
   --device 0
 ```
 
+### 追加アノテーションを継続的に学習対象へ入れる
+
+`scripts_YOLO/run_yolo_pose_dataset_ablation.py` は、`--modified-zip` と `--modified-zip-manifest` を指定しない場合、`data/output` 配下を探索し、画像ファイルが直接入っているディレクトリ内の CVAT annotation zip を現在の追加学習データとして読み込みます。zip は中に `annotations.xml` を含むものだけが対象です。
+
+新しいデータを追加する場合は、frame 画像が入っている `data/output/<dataset_name>/` に CVAT annotation zip を置いてから再実行してください。コードや manifest の書き換えは不要です。
+
+```text
+data/output/<dataset_name>/
+  frame_00001.jpg
+  frame_00002.jpg
+  ...
+  task_annotation.zip  # contains annotations.xml
+```
+
+一時的に別の zip 一覧で試したい場合は、従来通り `--modified-zip` を複数回指定すると自動探索より優先されます。探索先を変える場合は `--modified-zip-root <path>`、固定一覧を使う場合は `--modified-zip-manifest <path>` を指定します。
+
 ## YOLO Pose の評価
 
 `scripts_YOLO/evaluate_yolo_pose_f1.py` では、`train`、`val`、`test` のいずれかの split に対して confidence threshold を探索できます。
