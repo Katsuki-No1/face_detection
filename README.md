@@ -622,6 +622,46 @@ SCRFD と MediaPipe の処理段階を出力し、必要に応じて overlay も
 
 処理段階の出力には、`raw_scrfd.jsonl`、`raw_mediapipe.jsonl`、`merged_candidates.jsonl`、`postprocessed.jsonl`、`removed_detections.jsonl`、`summary.csv`、`skipped.csv`、および任意の `overlays/` が含まれます。
 
+## YOLO11s Pose augmentation ablation
+
+YOLO11s Pose の train-time augmentation を比較しました。ここでの augmentation は学習時の前処理であり、train/val/test split は変更していません。val/test には augmentation を入れず、評価時の `conf=0.25`、`iou=0.7` は固定です。cutmix は全条件で `0` にしています。
+
+共通条件は `model=yolo11s-pose.pt`、`imgsz=960`、`batch=8`、`epochs=200`、`patience=50`、`seed=42`、`device=0` です。dataset yaml は `outputs_experiment/yolo_pose_dataset_ablation_20260624_task2/datasets/modified_100/face_pose.yaml` を使いました。
+
+主な出力先は次のとおりです。
+
+- 学習結果: `runs/pose_aug_ablation/<experiment>/`
+- test 評価: `outputs/aug_ablation_test_eval/<experiment>/`
+- 集計: `outputs/aug_ablation_test_eval/summary_metrics.csv`
+- mosaic 比較: `outputs/aug_ablation_test_eval/mosaic_epoch100_comparison.csv`
+- review HTML: `outputs/aug_ablation_test_eval/<experiment>/review_report.html`
+
+test split の固定閾値評価では、次の結果になりました。
+
+| experiment | box recall | box mAP50-95 | pose recall | pose mAP50-95 | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| E0_current_control | 0.7143 | 0.4642 | 0.7302 | 0.7094 | baseline |
+| E1_photo_light | 0.7302 | 0.4125 | 0.7460 | 0.7154 | light photometric |
+| E2_photo_mid | 0.7619 | 0.4373 | 0.7778 | 0.7403 | medium photometric |
+| E3_geo_mid | 0.7460 | 0.4515 | 0.7778 | 0.7460 | medium geometry |
+| E4_mosaic_mid | 0.6984 | 0.4099 | 0.7619 | 0.7342 | interrupted after epoch 112 was saved |
+| E5_combined_best | | | | | not run |
+
+E2 と E3 は E0 より pose recall と pose mAP50-95 が改善しました。E1 は recall は上がりましたが、box mAP50-95 の低下が大きめです。E4 は pose recall と pose mAP50-95 は改善しましたが、box recall と box mAP50-95 は下がりました。
+
+E4 は、mosaic を弱めにするか中程度にするかを早めに判断するため、100 epoch 付近で停止しました。厳密な epoch 100 の weight は保存していないため、epoch 100 の直接比較は `results.csv` の validation 行で行い、test は保存済み `best.pt` と停止時点の `last.pt` を補助的に評価しています。
+
+| comparison | metric | E0 mosaic=0.2 | E4 mosaic=0.4 | delta |
+| --- | --- | ---: | ---: | ---: |
+| val epoch100 | box recall | 0.7085 | 0.7400 | +0.0315 |
+| val epoch100 | pose recall | 0.6886 | 0.7500 | +0.0614 |
+| val epoch100 | pose mAP50-95 | 0.6350 | 0.6840 | +0.0490 |
+| test best | pose recall | 0.7302 | 0.7619 | +0.0317 |
+| test best | pose mAP50-95 | 0.7094 | 0.7342 | +0.0248 |
+| test best | box mAP50-95 | 0.4642 | 0.4099 | -0.0543 |
+
+現時点では、keypoint と recall を優先するなら `mosaic=0.4, close_mosaic=30` は有効候補です。一方で box mAP50-95 が下がるため、次は `mosaic=0.3` または `mosaic=0.4, close_mosaic=20` のように中間条件を確認するのが妥当です。combined 条件を試す場合は、E2 の photometric と E3 の geometry を基準にし、mosaic は E4 より少し弱める候補を残します。
+
 ## Git に含めないもの
 
 次のファイルやディレクトリは、Git に含めない運用にしてください。
