@@ -15,6 +15,7 @@
 - OpenMMLab の RTMDet と RTMPose を使い、顔検出と 5 点ランドマーク推定を二段構成で fine-tune できます。
 - SCRFD による顔検出と、必要に応じた MediaPipe による目のランドマーク抽出を実行できます。
 - ラベルの確認、YOLO Pose の推論結果、SCRFD と MediaPipe の処理段階、検出エラーの確認用に overlay 画像を生成できます。
+- DINOv3 / DINOv2 を fine-tune せず frozen backbone として使い、顔・頭・背景・hard negative・patch similarity の特徴分離を Phase 1 として診断できます。
 
 ## このリポジトリではできないこと
 
@@ -44,17 +45,31 @@ scripts_YOLO/
 script/
   script_data/                         # アノテーションとフレームに関する補助スクリプト
   script_model/                        # SCRFD/MediaPipe の推論とデバッグ用スクリプト
+    run_dinov3.py                      # DINOv3 の画像特徴量を JSONL に出力する
   script_experiment/                   # 評価、可視化、確認用の補助スクリプト
     rtmdet_rtmpose_experiment.py       # RTMDet + RTMPose の変換、学習、推論、評価をまとめた CLI
   script_process/                      # 前処理と後処理の補助スクリプト
 
+src/
+  phase1_dino/                         # frozen DINO feature analysis 用の crop 生成、特徴抽出、数値解析、HTML report
+
+configs/
+  dino_phase1_feature_analysis.yaml    # Phase 1 DINO 特徴診断の default config
+
 docs/
   detector_stage_dump.md               # SCRFD/MediaPipe の debug 出力に関する説明
+  phase1_dino_feature_analysis.md      # DINO Phase 1 の目的、CLI、成果物、解釈のメモ
+
+scripts/
+  run_phase1_dino_feature_analysis.sh  # Phase 1 DINO 特徴診断の一括実行ラッパー
+  analyze_dinov3_cpu_features.py       # DINOv3 image-level embedding の可視化と近傍解析
+  visualize_dinov3_crop_patch_cpu.py   # 実 DINOv3 CPU で crop gallery と patch similarity map を生成する
+
+tests/
+  test_dino_phase1_*.py                # DINO Phase 1 の crop/metrics/report の軽量 unittest
 
 requirements.txt                       # Python の依存パッケージ
 ```
-
-現時点では、`src/`、`configs/`、`tests/`、`pyproject.toml` は存在しません。
 
 ## セットアップ
 
@@ -79,9 +94,116 @@ GPU で学習や推論を行う場合は、使用している NVIDIA driver と�
 ```text
 models/scrfd/<scrfd_model>.onnx
 weights/<face_pose_model>.pt
+script/script_model/DINO/<dinov3_checkpoint>.pth
 ```
 
-`models/` と `weights/` は `.gitignore` によって除外されます。実行時には、`--model` または `--weights` にローカルのパスを指定してください。
+`models/`、`weights/`、DINO checkpoint、実験出力は Git に含めない運用です。実行時には、`--model` または `--weights` にローカルのパスを指定してください。
+
+## DINO の導入と現在の段階
+
+このリポジトリでは、DINO を **fine-tune せず frozen backbone** として使うための入口を追加しています。目的は、DINO 単体の特徴量が顔検出や keypoint 検出の前段として使えそうかを、学習前に確認することです。
+
+現時点の位置づけは **Phase 1: DINO 特徴量診断** です。以下はまだ行っていません。
+
+- DINO backbone の fine-tune
+- detection head の学習
+- keypoint head の学習
+- YOLO 学習
+- face detection の Precision / Recall / mAP 評価
+
+そのため、DINO 関連の現在の出力は「検出性能」ではなく、特徴空間の分離傾向を見るための診断結果です。実際の Precision / Recall / mAP を評価するには、次の Phase 2 で frozen DINO backbone に detection head / keypoint head を接続して評価する必要があります。
+
+### DINOv3 の画像特徴量抽出
+
+`script/script_model/run_dinov3.py` は、DINOv3 公式 repo の PyTorch Hub entrypoint を使って画像ごとの CLS embedding を JSONL に出力します。ローカルに DINOv3 公式 repo の cache または clone がある場合は、それを `--dinov3-repo` に指定できます。
+
+GPU を使わず CPU で確認する場合は、GPU 学習に干渉しないように `CUDA_VISIBLE_DEVICES=` と `--device cpu` を明示してください。
+
+```bash
+CUDA_VISIBLE_DEVICES= .venv/bin/python script/script_model/run_dinov3.py \
+  --source path/to/images \
+  --output outputs/dinov3_cpu_features.jsonl \
+  --dinov3-repo /path/to/facebookresearch_dinov3 \
+  --weights script/script_model/DINO/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth \
+  --model-name dinov3_vitb16 \
+  --device cpu \
+  --batch-size 2 \
+  --resize-size 256 \
+  --include-patch-mean
+```
+
+30 枚程度の smoke test であれば CPU でも完了可能です。ただし、DINOv3 ViT-B/16 は CPU では軽くないため、全データへ広げる場合は実行時間に注意してください。
+
+### Phase 1 DINO 特徴診断
+
+`src/phase1_dino/` は、アノテーションから `face`、`head`、`eye_region`、`background`、`hard_negative` crop を作成し、DINO の frozen feature を抽出して数値解析と HTML report を出力します。
+
+default config は次にあります。
+
+```text
+configs/dino_phase1_feature_analysis.yaml
+```
+
+一括実行は次のコマンドです。
+
+```bash
+.venv/bin/python -m src.phase1_dino.run_phase1 \
+  --config configs/dino_phase1_feature_analysis.yaml \
+  --max-images 50
+```
+
+実 DINO を使わずに pipeline だけ確認する場合は、mock feature で軽く実行できます。
+
+```bash
+.venv/bin/python -m src.phase1_dino.run_phase1 \
+  --config configs/dino_phase1_feature_analysis.yaml \
+  --max-images 3 \
+  --mock-features \
+  --output-dir outputs/phase1_dino_feature_analysis_smoke
+```
+
+主な成果物は次のとおりです。
+
+```text
+outputs/phase1_dino_feature_analysis/
+  crops/
+  features/crop_features.npy
+  features/crop_features_meta.csv
+  features/patch_features_sample.npz
+  metrics/knn_metrics.json
+  metrics/similarity_metrics.csv
+  metrics/patch_similarity_metrics.csv
+  figures/pca_by_crop_type.png
+  figures/pca_by_label.png
+  figures/pca_by_face_size.png
+  retrieval/knn_retrieval.html
+  overlays/similarity_map_samples/
+  report.html
+```
+
+`hard_negative` は現時点では、GT face bbox とほぼ重ならない、顔サイズに近い random background crop として生成しています。より顔らしい hard negative 候補の抽出は、Phase 2 以降の改善候補です。
+
+### 実 DINOv3 CPU での目視確認
+
+`scripts/visualize_dinov3_crop_patch_cpu.py` は、manifest で指定したサンプルに対して実 DINOv3 を CPU で実行し、次の目視確認用ファイルを出力します。
+
+- `face crop`
+- `head crop`
+- `background crop`
+- `hard negative crop`
+- face crop prototype に対する `patch similarity map`
+
+```bash
+CUDA_VISIBLE_DEVICES= .venv/bin/python scripts/visualize_dinov3_crop_patch_cpu.py \
+  --manifest outputs/dinov3_cpu_stratified_30_20260625/sample_manifest.csv \
+  --output-dir outputs/dinov3_cpu_stratified_30_20260625/crop_patch_analysis \
+  --metadata outputs_experiment/yolo_pose_dataset_ablation_20260625_all_zips/datasets/_modified_all_train/metadata/conversion_metadata.json \
+  --dinov3-repo /home/katsuki/.cache/torch/hub/facebookresearch_dinov3_main \
+  --weights script/script_model/DINO/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+```
+
+この可視化では、`crop_patch_gallery.html` を開いて、crop が意図通りか、patch similarity の高反応領域が GT face bbox 周辺に出ているかを目視確認します。数値としては `patch_similarity_metrics.csv` に bbox 内外の similarity 平均と margin を保存します。
+
 
 ## YOLO Pose の推論
 
