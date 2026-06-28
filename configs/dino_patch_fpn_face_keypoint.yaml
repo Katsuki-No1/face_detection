@@ -1,0 +1,26 @@
+model:
+  name: dino_patch_fpn_face_keypoint
+  backbone:
+    type: dino
+    variant: dinov3
+    freeze: true
+    patch_size: 14
+    embed_dim: 768
+    num_prefix_tokens: 1
+    token_key: null
+  adapter:
+    out_channels: 256
+    num_layers: 2
+    norm: gn
+    activation: silu
+  fpn:
+    out_channels: 256
+    levels: ["p2", "p3", "p4", "p5"]
+  head:
+    num_classes: 2
+    class_names: ["head", "face"]
+    num_keypoints: 5
+    keypoint_names: ["left_eye", "right_eye", "nose", "mouth_left", "mouth_right"]
+    keypoint_dims: 3
+    flip_idx: [1, 0, 2, 4, 3]
+    use_ellipse: false

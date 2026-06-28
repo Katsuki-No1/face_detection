@@ -91,6 +91,11 @@ tensorboard/
 !README.md
 !docs/
 !docs/**
+!src/
+!src/data/
+!src/data/**
+!src/models/
+!src/models/**
 !tests/
 !tests/**
 !requirements.txt

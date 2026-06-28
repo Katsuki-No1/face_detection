@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+FACE_KEYPOINT_NAMES = ("left_eye", "right_eye", "nose", "left_mouth", "right_mouth")
+YOLO_KEYPOINT_NAMES = ("e1", "e2", "n", "m1", "m2")
+
+
+def ellipse_to_xyxy(ellipse: dict[str, Any]) -> list[float]:
+    cx = float(ellipse.get("cx", ellipse.get("center", {}).get("x", 0.0)))
+    cy = float(ellipse.get("cy", ellipse.get("center", {}).get("y", 0.0)))
+    rx = float(ellipse.get("rx", ellipse.get("radius", {}).get("x", 0.0)))
+    ry = float(ellipse.get("ry", ellipse.get("radius", {}).get("y", 0.0)))
+    rotation = float(ellipse.get("rotation", 0.0))
+    theta = math.radians(rotation)
+    cos_theta = math.cos(theta)
+    sin_theta = math.sin(theta)
+    half_width = math.sqrt((rx * cos_theta) ** 2 + (ry * sin_theta) ** 2)
+    half_height = math.sqrt((rx * sin_theta) ** 2 + (ry * cos_theta) ** 2)
+    return [cx - half_width, cy - half_height, cx + half_width, cy + half_height]
+
+
+def clip_xyxy(box: list[float], width: int, height: int) -> list[float] | None:
+    x1 = max(0.0, min(float(width), float(box[0])))
+    y1 = max(0.0, min(float(height), float(box[1])))
+    x2 = max(0.0, min(float(width), float(box[2])))
+    y2 = max(0.0, min(float(height), float(box[3])))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _bbox_dict_to_xyxy(bbox: dict[str, Any]) -> list[float]:
+    if {"xtl", "ytl", "xbr", "ybr"}.issubset(bbox):
+        return [float(bbox["xtl"]), float(bbox["ytl"]), float(bbox["xbr"]), float(bbox["ybr"])]
+    if {"x", "y", "w", "h"}.issubset(bbox):
+        x = float(bbox["x"])
+        y = float(bbox["y"])
+        return [x, y, x + float(bbox["w"]), y + float(bbox["h"])]
+    if {"x", "y", "width", "height"}.issubset(bbox):
+        x = float(bbox["x"])
+        y = float(bbox["y"])
+        return [x, y, x + float(bbox["width"]), y + float(bbox["height"])]
+    raise ValueError(f"Unsupported bbox dict keys: {sorted(bbox.keys())}")
+
+
+def _image_to_tensor(image: Image.Image) -> torch.Tensor:
+    array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def _resize_image_and_target(
+    image: Image.Image,
+    target: dict[str, Any],
+    image_size: int | tuple[int, int] | None,
+) -> tuple[Image.Image, dict[str, Any]]:
+    if image_size is None:
+        return image, target
+    if isinstance(image_size, int):
+        new_h = new_w = int(image_size)
+    else:
+        new_h, new_w = int(image_size[0]), int(image_size[1])
+    old_w, old_h = image.size
+    image = image.resize((new_w, new_h), Image.BILINEAR)
+    scale_x = new_w / float(old_w)
+    scale_y = new_h / float(old_h)
+    updated = dict(target)
+    boxes = updated["boxes"].clone()
+    if boxes.numel() > 0:
+        boxes[:, 0::2] *= scale_x
+        boxes[:, 1::2] *= scale_y
+    keypoints = updated["keypoints"].clone()
+    if keypoints.numel() > 0:
+        keypoints[..., 0] *= scale_x
+        keypoints[..., 1] *= scale_y
+    updated["boxes"] = boxes
+    updated["keypoints"] = keypoints
+    updated["orig_size"] = (old_h, old_w)
+    updated["size"] = (new_h, new_w)
+    return image, updated
+
+
+def _tensor_target(
+    *,
+    boxes: list[list[float]],
+    keypoints: list[list[list[float]]],
+    keypoint_mask: list[list[bool]],
+    image_id: str,
+    height: int,
+    width: int,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    box_tensor = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+    kpt_tensor = torch.as_tensor(keypoints, dtype=torch.float32).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES), 2)
+    mask_tensor = torch.as_tensor(keypoint_mask, dtype=torch.bool).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES))
+    return {
+        "boxes": box_tensor,
+        "labels": torch.ones((box_tensor.shape[0],), dtype=torch.long),
+        "keypoints": kpt_tensor,
+        "keypoint_mask": mask_tensor,
+        "image_id": str(image_id),
+        "orig_size": (int(height), int(width)),
+        "size": (int(height), int(width)),
+        "metadata": metadata or {},
+    }
+
+
+def _empty_target(image_id: str, height: int, width: int, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _tensor_target(
+        boxes=[],
+        keypoints=[],
+        keypoint_mask=[],
+        image_id=image_id,
+        height=height,
+        width=width,
+        metadata=metadata,
+    )
+
+
+def _load_metadata_index(data_root: Path, metadata_path: str | Path | None) -> dict[str, dict[str, Any]]:
+    candidates: list[Path] = []
+    if metadata_path:
+        candidates.append(Path(metadata_path))
+    candidates.append(data_root / "metadata" / "conversion_metadata.json")
+    index: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+        for record in data.get("records", []):
+            keys = set()
+            for field in ("image_name", "output_image", "image_path", "image"):
+                value = record.get(field)
+                if isinstance(value, str) and value:
+                    keys.add(value)
+                    keys.add(Path(value).name)
+                    keys.add(Path(value).stem)
+            for key in keys:
+                index[key] = record
+        break
+    return index
+
+
+def _metadata_for_image(index: dict[str, dict[str, Any]], image_path: Path) -> dict[str, Any] | None:
+    return index.get(str(image_path)) or index.get(image_path.name) or index.get(image_path.stem)
+
+
+def _parse_yolo_label(label_path: Path, width: int, height: int) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]]]:
+    boxes: list[list[float]] = []
+    keypoints: list[list[list[float]]] = []
+    keypoint_mask: list[list[bool]] = []
+    if not label_path.exists():
+        return boxes, keypoints, keypoint_mask
+    for line in label_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        values = [float(value) for value in line.split()]
+        if len(values) < 5:
+            continue
+        cx, cy, bw, bh = values[1:5]
+        box_w = bw * width
+        box_h = bh * height
+        x = cx * width
+        y = cy * height
+        clipped = clip_xyxy([x - box_w / 2.0, y - box_h / 2.0, x + box_w / 2.0, y + box_h / 2.0], width, height)
+        if clipped is None:
+            continue
+        boxes.append(clipped)
+        raw_keypoints = values[5:]
+        sample_keypoints: list[list[float]] = []
+        sample_mask: list[bool] = []
+        for index in range(len(FACE_KEYPOINT_NAMES)):
+            offset = index * 3
+            if offset + 2 >= len(raw_keypoints) or raw_keypoints[offset + 2] <= 0:
+                sample_keypoints.append([0.0, 0.0])
+                sample_mask.append(False)
+                continue
+            sample_keypoints.append([raw_keypoints[offset] * width, raw_keypoints[offset + 1] * height])
+            sample_mask.append(True)
+        keypoints.append(sample_keypoints)
+        keypoint_mask.append(sample_mask)
+    return boxes, keypoints, keypoint_mask
+
+
+def _record_image_path(record: dict[str, Any], image_root: Path | None) -> Path:
+    if record.get("image_path"):
+        path = Path(record["image_path"])
+        if path.is_file():
+            return path
+    if image_root is not None:
+        return image_root / str(record.get("image_name", ""))
+    return Path(str(record.get("image_path", record.get("image_name", ""))))
+
+
+def _object_keypoints_from_metadata(meta_object: dict[str, Any] | None) -> tuple[list[list[float]], list[bool]]:
+    sample_keypoints = [[0.0, 0.0] for _ in FACE_KEYPOINT_NAMES]
+    sample_mask = [False for _ in FACE_KEYPOINT_NAMES]
+    if not meta_object:
+        return sample_keypoints, sample_mask
+    source_names = YOLO_KEYPOINT_NAMES
+    points = meta_object.get("keypoints", {})
+    for target_index, source_name in enumerate(source_names):
+        point = points.get(source_name) or points.get(FACE_KEYPOINT_NAMES[target_index])
+        if not point or int(point.get("v", 0)) <= 0:
+            continue
+        sample_keypoints[target_index] = [float(point.get("x", 0.0)), float(point.get("y", 0.0))]
+        sample_mask[target_index] = True
+    return sample_keypoints, sample_mask
+
+
+class FaceKeypointDataset(Dataset):
+    """Face bbox + 5-keypoint dataset over YOLO Pose, COCO-like, or CVAT JSON."""
+
+    def __init__(
+        self,
+        *,
+        data_root: str | Path | None = None,
+        split: str = "train",
+        annotation_path: str | Path | None = None,
+        annotation_format: str = "auto",
+        image_root: str | Path | None = None,
+        metadata_path: str | Path | None = None,
+        image_size: int | tuple[int, int] | None = None,
+        include_negative: bool = True,
+    ) -> None:
+        self.data_root = Path(data_root) if data_root else None
+        self.split = split
+        self.annotation_path = Path(annotation_path) if annotation_path else None
+        self.annotation_format = annotation_format
+        self.image_root = Path(image_root) if image_root else None
+        self.image_size = image_size
+        self.include_negative = bool(include_negative)
+        self.samples = self._build_samples(metadata_path)
+
+    def _build_samples(self, metadata_path: str | Path | None) -> list[dict[str, Any]]:
+        if self.annotation_path is not None:
+            data = json.loads(self.annotation_path.read_text(encoding="utf-8"))
+            fmt = self.annotation_format
+            if fmt == "auto":
+                fmt = "coco" if "images" in data and "annotations" in data else "cvat"
+            if fmt == "coco":
+                return self._samples_from_coco(data)
+            if fmt in {"cvat", "cvat_json", "converted_cvat"}:
+                return self._samples_from_cvat_records(data)
+            raise ValueError(f"Unsupported annotation_format: {self.annotation_format}")
+
+        if self.data_root is None:
+            raise ValueError("data_root or annotation_path must be provided")
+        return self._samples_from_yolo(metadata_path)
+
+    def _samples_from_yolo(self, metadata_path: str | Path | None) -> list[dict[str, Any]]:
+        assert self.data_root is not None
+        image_dir = self.data_root / "images" / self.split
+        label_dir = self.data_root / "labels" / self.split
+        metadata_index = _load_metadata_index(self.data_root, metadata_path)
+        samples = []
+        for image_path in sorted(path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS):
+            samples.append(
+                {
+                    "format": "yolo",
+                    "image_path": image_path,
+                    "label_path": label_dir / f"{image_path.stem}.txt",
+                    "metadata": _metadata_for_image(metadata_index, image_path) or {},
+                    "image_id": image_path.stem,
+                }
+            )
+        return samples
+
+    def _samples_from_coco(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        image_root = self.image_root or self.data_root
+        images = {int(item["id"]): item for item in data.get("images", [])}
+        annotations_by_image: dict[int, list[dict[str, Any]]] = {image_id: [] for image_id in images}
+        for annotation in data.get("annotations", []):
+            annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
+        samples = []
+        for image_id, image in images.items():
+            path = Path(image.get("file_name", ""))
+            if image_root is not None and not path.is_absolute():
+                path = Path(image_root) / path
+            annotations = annotations_by_image.get(image_id, [])
+            if annotations or self.include_negative:
+                samples.append({"format": "coco", "image_path": path, "image": image, "annotations": annotations, "image_id": image_id})
+        return samples
+
+    def _samples_from_cvat_records(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        samples = []
+        for record in data.get("records", []):
+            path = _record_image_path(record, self.image_root or self.data_root)
+            faces = record.get("faces", [])
+            objects = record.get("objects", [])
+            if faces or objects or self.include_negative:
+                samples.append({"format": "cvat", "image_path": path, "record": record, "image_id": record.get("image_name", path.stem)})
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, Any]]:
+        sample = self.samples[index]
+        image = Image.open(sample["image_path"]).convert("RGB")
+        width, height = image.size
+        if sample["format"] == "yolo":
+            boxes, keypoints, keypoint_mask = _parse_yolo_label(sample["label_path"], width, height)
+            target = _tensor_target(
+                boxes=boxes,
+                keypoints=keypoints,
+                keypoint_mask=keypoint_mask,
+                image_id=sample["image_id"],
+                height=height,
+                width=width,
+                metadata=sample["metadata"],
+            )
+        elif sample["format"] == "coco":
+            target = self._target_from_coco_sample(sample, width, height)
+        else:
+            target = self._target_from_cvat_sample(sample, width, height)
+
+        image, target = _resize_image_and_target(image, target, self.image_size)
+        return _image_to_tensor(image), target
+
+    def _target_from_coco_sample(self, sample: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+        boxes: list[list[float]] = []
+        keypoints: list[list[list[float]]] = []
+        keypoint_mask: list[list[bool]] = []
+        metadata = {"annotations": sample.get("annotations", [])}
+        for annotation in sample.get("annotations", []):
+            bbox = annotation.get("bbox")
+            if not bbox:
+                continue
+            clipped = clip_xyxy([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]], width, height)
+            if clipped is None:
+                continue
+            boxes.append(clipped)
+            raw = annotation.get("keypoints", [])
+            sample_keypoints = []
+            sample_mask = []
+            for point_index in range(len(FACE_KEYPOINT_NAMES)):
+                offset = point_index * 3
+                if offset + 2 >= len(raw) or raw[offset + 2] <= 0:
+                    sample_keypoints.append([0.0, 0.0])
+                    sample_mask.append(False)
+                    continue
+                sample_keypoints.append([float(raw[offset]), float(raw[offset + 1])])
+                sample_mask.append(True)
+            keypoints.append(sample_keypoints)
+            keypoint_mask.append(sample_mask)
+        return _tensor_target(
+            boxes=boxes,
+            keypoints=keypoints,
+            keypoint_mask=keypoint_mask,
+            image_id=str(sample["image_id"]),
+            height=height,
+            width=width,
+            metadata=metadata,
+        )
+
+    def _target_from_cvat_sample(self, sample: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+        record = sample["record"]
+        boxes: list[list[float]] = []
+        keypoints: list[list[list[float]]] = []
+        keypoint_mask: list[list[bool]] = []
+        ellipse_metadata: list[dict[str, Any] | None] = []
+
+        objects = record.get("objects", [])
+        faces = record.get("faces", [])
+        source_items = objects if objects else faces
+        for item_index, item in enumerate(source_items):
+            if objects:
+                bbox = item.get("training_bbox") or item.get("raw_bbox") or item.get("bbox")
+                face_meta = item.get("face", {})
+                ellipse_meta = item.get("cvat_ellipse") or face_meta.get("cvat_ellipse")
+            else:
+                bbox = item.get("bbox")
+                ellipse_meta = item.get("cvat_ellipse")
+            if not bbox and ellipse_meta:
+                raw_box = ellipse_to_xyxy(ellipse_meta)
+            elif isinstance(bbox, dict):
+                raw_box = _bbox_dict_to_xyxy(bbox)
+            elif isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                raw_box = [float(value) for value in bbox]
+            else:
+                continue
+            clipped = clip_xyxy(raw_box, width, height)
+            if clipped is None:
+                continue
+            boxes.append(clipped)
+            sample_keypoints, sample_mask = _object_keypoints_from_metadata(item if objects else None)
+            keypoints.append(sample_keypoints)
+            keypoint_mask.append(sample_mask)
+            ellipse_metadata.append(ellipse_meta)
+
+        if not boxes and not self.include_negative:
+            return _empty_target(str(sample["image_id"]), height, width, metadata={"record": record})
+        return _tensor_target(
+            boxes=boxes,
+            keypoints=keypoints,
+            keypoint_mask=keypoint_mask,
+            image_id=str(sample["image_id"]),
+            height=height,
+            width=width,
+            metadata={
+                "record": record,
+                "ellipse_metadata": ellipse_metadata,
+                "head_boxes": record.get("heads", []),
+            },
+        )
+
+
+class SyntheticFaceKeypointDataset(Dataset):
+    """Tiny in-memory dataset for smoke tests when real data is unavailable."""
+
+    def __init__(self, *, length: int = 2, image_size: int = 56, positive: bool = True) -> None:
+        self.length = int(length)
+        self.image_size = int(image_size)
+        self.positive = bool(positive)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, Any]]:
+        image = torch.zeros((3, self.image_size, self.image_size), dtype=torch.float32)
+        if not self.positive or index % 2 == 1:
+            return image, _empty_target(f"synthetic_{index}", self.image_size, self.image_size)
+        box = [[self.image_size * 0.3, self.image_size * 0.25, self.image_size * 0.7, self.image_size * 0.75]]
+        keypoints = [
+            [
+                [self.image_size * 0.42, self.image_size * 0.43],
+                [self.image_size * 0.58, self.image_size * 0.43],
+                [self.image_size * 0.50, self.image_size * 0.53],
+                [self.image_size * 0.44, self.image_size * 0.63],
+                [self.image_size * 0.56, self.image_size * 0.63],
+            ]
+        ]
+        return image, _tensor_target(
+            boxes=box,
+            keypoints=keypoints,
+            keypoint_mask=[[True, True, True, True, True]],
+            image_id=f"synthetic_{index}",
+            height=self.image_size,
+            width=self.image_size,
+            metadata={"synthetic": True},
+        )
+
+
+def collate_face_keypoint_batch(batch: list[tuple[torch.Tensor, dict[str, Any]]]) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    images, targets = zip(*batch)
+    return torch.stack(list(images), dim=0), list(targets)

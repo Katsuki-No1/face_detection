@@ -1,0 +1,65 @@
+model:
+  type: dino_scrfd
+  backbone:
+    name: dinov2_vits14
+    patch_size: 14
+    embed_dim: 384
+    hub_repo: null
+    hub_model: null
+    weights: null
+    pretrained: false
+    dummy: true
+    freeze: true
+    unfreeze_last_n_blocks: 0
+    num_prefix_tokens: 1
+    token_key: null
+    call_method: auto
+  adapter:
+    out_channels: 256
+    norm: gn
+    activation: silu
+  neck:
+    out_channels: 256
+    num_levels: 3
+    norm: gn
+    activation: silu
+  head:
+    num_classes: 1
+    num_keypoints: 5
+    head_channels: 256
+    num_convs: 2
+
+loss:
+  cls_weight: 1.0
+  bbox_weight: 2.0
+  kpt_weight: 1.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  center_sampling_radius: 0
+
+postprocess:
+  score_threshold: 0.05
+  nms_threshold: 0.4
+  topk: 1000
+  detections_per_image: 300
+
+data:
+  format: yolo
+  data_root: outputs_experiment/latest_yolo_pose_dataset_refresh/datasets/modified_100
+  annotation_path: null
+  image_root: null
+  metadata_path: outputs_experiment/latest_yolo_pose_dataset_refresh/datasets/_modified_all_train/metadata/conversion_metadata.json
+  split: train
+  image_size: 896
+  include_negative: true
+  synthetic_if_missing: false
+
+train:
+  imgsz: 896
+  batch_size: 4
+  lr_head: 1.0e-4
+  lr_backbone: 0.0
+  epochs: 100
+  weight_decay: 0.05
+  num_workers: 0
+  device: cuda
