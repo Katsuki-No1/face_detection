@@ -487,6 +487,7 @@ def yolo_line_for_face(
     bbox_values = normalize_bbox(clipped_bbox, width, height)
     if bbox_values[2] <= 0.0 or bbox_values[3] <= 0.0:
         metadata["warnings"].append("invalid_clipped_face_bbox")
+        metadata["exclusion_reason"] = "invalid_clipped_face_bbox"
         return None, metadata
 
     keypoints = assign_keypoints(record, face_bboxes, face_index)
@@ -652,6 +653,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         "written_objects": 0,
         "skipped_records": 0,
         "skipped_faces": 0,
+        "excluded_faces": 0,
         "splits": {"train": 0, "val": 0, "test": 0},
     }
     metadata_records = []
@@ -668,6 +670,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "heads": record.get("heads", []),
             "faces": record.get("faces", []),
             "objects": [],
+            "excluded_faces": [],
             "skipped": [],
         }
         if image_path is None:
@@ -700,7 +703,8 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             object_meta["face_index"] = face_index
             if line is None:
                 summary["skipped_faces"] += 1
-                record_meta["objects"].append(object_meta)
+                summary["excluded_faces"] += 1
+                record_meta["excluded_faces"].append(object_meta)
                 continue
             lines.append(line)
             record_meta["objects"].append(object_meta)

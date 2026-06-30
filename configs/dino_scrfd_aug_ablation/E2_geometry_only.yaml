@@ -1,0 +1,15 @@
+extends: base.yaml
+
+experiment:
+  name: E2_geometry_only
+
+train:
+  name: E2_geometry_only
+
+augmentation:
+  degrees: 10.0
+  translate: 0.08
+  scale: 0.30
+  shear: 2.0
+  perspective: 0.0005
+  fliplr: 0.5

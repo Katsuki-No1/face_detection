@@ -5,6 +5,8 @@ from pathlib import Path
 
 import torch
 
+from .geometry import feature_strides, grid_centers, grid_indices
+
 
 def _box_iou(box: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
     x1 = torch.maximum(box[0], boxes[:, 0])
@@ -42,12 +44,14 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torc
 
 
 def _centers_for_prediction(prediction: torch.Tensor, image_size: tuple[int, int]) -> torch.Tensor:
-    height, width = prediction.shape[-2:]
-    image_h, image_w = float(image_size[0]), float(image_size[1])
-    ys = (torch.arange(height, device=prediction.device, dtype=prediction.dtype) + 0.5) * (image_h / float(height))
-    xs = (torch.arange(width, device=prediction.device, dtype=prediction.dtype) + 0.5) * (image_w / float(width))
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    return torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+    return grid_centers(
+        int(prediction.shape[-2]),
+        int(prediction.shape[-1]),
+        image_size,
+        device=prediction.device,
+        dtype=prediction.dtype,
+        flatten=True,
+    )
 
 
 class DinoSCRFDPostProcessor:
@@ -70,6 +74,7 @@ class DinoSCRFDPostProcessor:
         image_size: tuple[int, int],
     ) -> list[dict[str, torch.Tensor]]:
         cls_logits = predictions["cls_logits"]
+        center_offset = predictions.get("center_offset")
         bbox_reg = predictions["bbox_reg"]
         kpt_reg = predictions["kpt_reg"]
         batch_size = cls_logits[0].shape[0]
@@ -80,8 +85,21 @@ class DinoSCRFDPostProcessor:
             scores_per_level: list[torch.Tensor] = []
             kpts_per_level: list[torch.Tensor] = []
 
-            for level_logits, level_boxes, level_kpts in zip(cls_logits, bbox_reg, kpt_reg):
-                centers = _centers_for_prediction(level_logits, image_size)
+            for level_index, (level_logits, level_boxes, level_kpts) in enumerate(zip(cls_logits, bbox_reg, kpt_reg)):
+                height, width = level_logits.shape[-2:]
+                stride_x, stride_y = feature_strides(height, width, image_size)
+                if center_offset is None:
+                    offsets = level_logits.new_full((height * width, 2), 0.5)
+                else:
+                    offsets = center_offset[level_index][batch_index].permute(1, 2, 0).reshape(-1, 2).clamp(0.0, 1.0)
+                grid = grid_indices(height, width, device=level_logits.device, dtype=level_logits.dtype)
+                centers = torch.stack(
+                    [
+                        (grid[:, 0] + offsets[:, 0]) * stride_x,
+                        (grid[:, 1] + offsets[:, 1]) * stride_y,
+                    ],
+                    dim=1,
+                )
                 scores = level_logits[batch_index].sigmoid().reshape(-1)
                 keep = scores >= self.score_threshold
                 if not bool(keep.any().item()):

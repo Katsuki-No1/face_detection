@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.data import FaceKeypointDataset, ellipse_to_xyxy
+from src.data import FaceKeypointDataset, ellipse_params_to_xyxy, ellipse_to_xyxy
 
 
 class FaceKeypointDatasetTest(unittest.TestCase):
@@ -25,9 +25,11 @@ class FaceKeypointDatasetTest(unittest.TestCase):
             positive = next(target for target in targets if target["boxes"].shape[0] == 1)
             negative = next(target for target in targets if target["boxes"].shape[0] == 0)
             self.assertEqual(tuple(positive["boxes"].shape), (1, 4))
+            self.assertEqual(tuple(positive["ellipses"].shape), (1, 5))
             self.assertEqual(tuple(positive["keypoints"].shape), (1, 5, 2))
             self.assertTrue(bool(positive["keypoint_mask"].all().item()))
             self.assertEqual(tuple(negative["boxes"].shape), (0, 4))
+            self.assertEqual(tuple(negative["ellipses"].shape), (0, 5))
 
     def test_cvat_ellipse_becomes_bbox_and_keeps_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -55,6 +57,7 @@ class FaceKeypointDatasetTest(unittest.TestCase):
             dataset = FaceKeypointDataset(annotation_path=path, annotation_format="cvat")
             _image, target = dataset[0]
             self.assertEqual(target["boxes"].tolist(), [[30.0, 35.0, 70.0, 55.0]])
+            self.assertEqual(target["ellipses"].tolist(), [[50.0, 45.0, 20.0, 10.0, 0.0]])
             self.assertEqual(target["metadata"]["ellipse_metadata"][0]["cx"], 50.0)
             self.assertEqual(len(target["metadata"]["head_boxes"]), 1)
 
@@ -62,6 +65,33 @@ class FaceKeypointDatasetTest(unittest.TestCase):
         box = ellipse_to_xyxy({"cx": 0.0, "cy": 0.0, "rx": 10.0, "ry": 20.0, "rotation": 90.0})
         self.assertAlmostEqual(box[0], -20.0, places=5)
         self.assertAlmostEqual(box[2], 20.0, places=5)
+
+    def test_non_uniform_resize_recomputes_rotated_ellipse_bbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Image.new("RGB", (1280, 720)).save(root / "ellipse.jpg")
+            annotation = {
+                "records": [
+                    {
+                        "image_name": "ellipse.jpg",
+                        "image_path": str(root / "ellipse.jpg"),
+                        "objects": [
+                            {
+                                "cvat_ellipse": {"cx": 720.0, "cy": 300.0, "rx": 120.0, "ry": 220.0, "rotation": 70.0},
+                                "keypoints": {},
+                            }
+                        ],
+                    }
+                ]
+            }
+            path = root / "annotations.json"
+            path.write_text(json.dumps(annotation), encoding="utf-8")
+            dataset = FaceKeypointDataset(annotation_path=path, annotation_format="cvat", image_size=896)
+            _image, target = dataset[0]
+            expected = ellipse_params_to_xyxy(target["ellipses"][0].tolist())
+            actual = target["boxes"][0].tolist()
+            for observed, wanted in zip(actual, expected):
+                self.assertAlmostEqual(observed, wanted, places=3)
 
 
 if __name__ == "__main__":

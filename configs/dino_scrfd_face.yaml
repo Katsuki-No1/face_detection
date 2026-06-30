@@ -31,6 +31,7 @@ model:
 
 loss:
   cls_weight: 1.0
+  center_offset_weight: 1.0
   bbox_weight: 2.0
   kpt_weight: 1.0
   focal_alpha: 0.25
@@ -61,5 +62,26 @@ train:
   lr_backbone: 0.0
   epochs: 100
   weight_decay: 0.05
-  num_workers: 0
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  fused_optimizer: true
+  torch_compile:
+    enabled: false
+    mode: reduce-overhead
+    fullgraph: false
+    dynamic: false
+  feature_cache:
+    enabled: false
+    dtype: float16
+    reuse_existing: true
+  progressive_resizing:
+    enabled: false
+    start_size: 672
+    end_size: 896
+    warmup_epochs: 20
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
   device: cuda

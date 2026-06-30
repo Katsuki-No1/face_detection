@@ -52,6 +52,7 @@ class DinoSCRFDLoss(nn.Module):
         *,
         assigner: CenterFaceTargetAssigner | None = None,
         cls_weight: float = 1.0,
+        center_offset_weight: float = 1.0,
         bbox_weight: float = 2.0,
         kpt_weight: float = 1.0,
         focal_alpha: float = 0.25,
@@ -60,6 +61,7 @@ class DinoSCRFDLoss(nn.Module):
         super().__init__()
         self.assigner = assigner or CenterFaceTargetAssigner()
         self.cls_weight = float(cls_weight)
+        self.center_offset_weight = float(center_offset_weight)
         self.bbox_weight = float(bbox_weight)
         self.kpt_weight = float(kpt_weight)
         self.focal_alpha = float(focal_alpha)
@@ -78,15 +80,18 @@ class DinoSCRFDLoss(nn.Module):
         assert isinstance(visible_kpt_count, torch.Tensor)
 
         loss_cls = predictions["cls_logits"][0].sum() * 0.0
+        loss_center_offset = predictions["center_offset"][0].sum() * 0.0
         loss_bbox = predictions["bbox_reg"][0].sum() * 0.0
         loss_kpt = predictions["kpt_reg"][0].sum() * 0.0
 
         cls_targets = assignments["cls_targets"]
+        center_offset_targets = assignments["center_offset_targets"]
         bbox_targets = assignments["bbox_targets"]
         kpt_targets = assignments["kpt_targets"]
         positive_masks = assignments["positive_masks"]
         kpt_masks = assignments["kpt_masks"]
         assert isinstance(cls_targets, list)
+        assert isinstance(center_offset_targets, list)
         assert isinstance(bbox_targets, list)
         assert isinstance(kpt_targets, list)
         assert isinstance(positive_masks, list)
@@ -101,6 +106,9 @@ class DinoSCRFDLoss(nn.Module):
                 normalizer=positive_count,
             )
 
+        for pred_center, target_center, pos_mask in zip(predictions["center_offset"], center_offset_targets, positive_masks):
+            loss_center_offset = loss_center_offset + _masked_smooth_l1(pred_center, target_center, pos_mask, positive_count)
+
         for pred_bbox, target_bbox, pos_mask in zip(predictions["bbox_reg"], bbox_targets, positive_masks):
             loss_bbox = loss_bbox + _masked_smooth_l1(pred_bbox, target_bbox, pos_mask, positive_count)
 
@@ -109,11 +117,18 @@ class DinoSCRFDLoss(nn.Module):
 
         level_count = max(1, len(predictions["cls_logits"]))
         loss_cls = loss_cls / level_count
+        loss_center_offset = loss_center_offset / level_count
         loss_bbox = loss_bbox / level_count
         loss_kpt = loss_kpt / level_count
-        loss_total = self.cls_weight * loss_cls + self.bbox_weight * loss_bbox + self.kpt_weight * loss_kpt
+        loss_total = (
+            self.cls_weight * loss_cls
+            + self.center_offset_weight * loss_center_offset
+            + self.bbox_weight * loss_bbox
+            + self.kpt_weight * loss_kpt
+        )
         return {
             "loss_cls": loss_cls,
+            "loss_center_offset": loss_center_offset,
             "loss_bbox": loss_bbox,
             "loss_kpt": loss_kpt,
             "loss_total": loss_total,

@@ -1,0 +1,19 @@
+extends: base.yaml
+
+experiment:
+  name: E5_mosaic_photometric
+
+train:
+  name: E5_mosaic_photometric
+
+augmentation:
+  mosaic: 0.3
+  close_mosaic: 20
+  hsv_h: 0.015
+  hsv_s: 0.50
+  hsv_v: 0.35
+  brightness: 0.25
+  contrast: 0.25
+  gamma: 0.20
+  blur: 0.05
+  noise: 0.03

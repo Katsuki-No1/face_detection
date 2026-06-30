@@ -1,0 +1,17 @@
+extends: base.yaml
+
+experiment:
+  name: E4_mosaic_geometry
+
+train:
+  name: E4_mosaic_geometry
+
+augmentation:
+  mosaic: 0.3
+  close_mosaic: 20
+  degrees: 10.0
+  translate: 0.08
+  scale: 0.30
+  shear: 2.0
+  perspective: 0.0005
+  fliplr: 0.5

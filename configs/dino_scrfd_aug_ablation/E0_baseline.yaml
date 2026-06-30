@@ -1,0 +1,25 @@
+extends: base.yaml
+
+experiment:
+  name: E0_baseline
+
+train:
+  name: E0_baseline
+
+augmentation:
+  mosaic: 0.0
+  close_mosaic: 0
+  degrees: 0.0
+  translate: 0.0
+  scale: 0.0
+  shear: 0.0
+  perspective: 0.0
+  fliplr: 0.0
+  hsv_h: 0.0
+  hsv_s: 0.0
+  hsv_v: 0.0
+  brightness: 0.0
+  contrast: 0.0
+  gamma: 0.0
+  blur: 0.0
+  noise: 0.0

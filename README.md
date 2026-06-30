@@ -30,6 +30,8 @@
 scripts_YOLO/
   convert_annotations_to_yolo_pose.py  # CVAT/JSON から YOLO Pose データセットを作成する
   check_yolo_pose_dataset.py           # YOLO Pose のラベルを検査する
+  audit_yolo_pose_dataset.py           # 学習前の Phase 0 dataset audit と class-balanced train list を生成する
+  refresh_yolo_pose_dataset_audit.py   # data/output 配下の CVAT zip を再探索し、dataset/audit を更新する
   visualize_yolo_pose_labels.py        # ラベル確認用の overlay 画像を生成する
   train_yolo_pose.py                   # Ultralytics YOLO Pose の学習を実行する
   predict_yolo_pose.py                 # YOLO Pose の推論結果を画像または動画として可視化する
@@ -38,6 +40,7 @@ scripts_YOLO/
   evaluate_yolo_pose_metrics.py        # mAP、固定 threshold、keypoint 品質、失敗種別をまとめて評価する
   run_yolo_pose_dataset_ablation.py    # 旧データと追加データの YOLO Pose 比較を実行する
   run_yolo11s_improvement_phase123.py  # 失敗分析、難例抽出、改善用データセット作成を補助する
+  run_yolo11s_aug_phase1.py            # YOLO11s Pose の train-time augmentation 比較を実行する
   visualize_yolo_pose_predictions.py   # YOLO Pose 推論結果の overlay を生成する
   export_yolo_pose_failure_details.py  # YOLO Pose の失敗詳細を CSV/画像で確認しやすく出力する
   run_yolo_pose_gpu_compare.py         # 複数の YOLO Pose モデルを GPU で比較する
@@ -64,6 +67,7 @@ scripts/
   run_phase1_dino_feature_analysis.sh  # Phase 1 DINO 特徴診断の一括実行ラッパー
   analyze_dinov3_cpu_features.py       # DINOv3 image-level embedding の可視化と近傍解析
   visualize_dinov3_crop_patch_cpu.py   # 実 DINOv3 CPU で crop gallery と patch similarity map を生成する
+  profile_training_speed.py            # GPU 空き待ち、1 epoch 学習、nvidia-smi 計測をまとめて実行する
 
 tests/
   test_dino_phase1_*.py                # DINO Phase 1 の crop/metrics/report の軽量 unittest
@@ -204,6 +208,68 @@ CUDA_VISIBLE_DEVICES= .venv/bin/python scripts/visualize_dinov3_crop_patch_cpu.p
 
 この可視化では、`crop_patch_gallery.html` を開いて、crop が意図通りか、patch similarity の高反応領域が GT face bbox 周辺に出ているかを目視確認します。数値としては `patch_similarity_metrics.csv` に bbox 内外の similarity 平均と margin を保存します。
 
+### DINO detector 学習高速化の Priority B
+
+`scripts/train_dino_scrfd_face.py` は、DINO-SCRFD 系と DINO-CenterFace ellipse 系の学習を同じ入口で扱います。学習は GPU 前提です。`--device cpu` を指定した full training は拒否されます。
+
+Priority A として、AMP/TF32、DataLoader の `num_workers`、`persistent_workers`、`prefetch_factor`、batch size 調整、validation 頻度見直しを先に確認します。Priority B は条件付きで次を使います。
+
+- `fused_optimizer`: CUDA 上の AdamW で `fused=True` を試します。失敗した場合は通常 AdamW に fallback し、`run_meta.json` に理由を残します。
+- `torch.compile`: DINO backbone ではなく、学習対象の `adapter`、`fpn`、`head` だけを compile します。shape が安定し、複数 epoch 回す実験で効果を見ます。
+- `feature_cache`: frozen DINO backbone の出力を `.pt` として保存し、以降は backbone forward を省略します。train-time augmentation、progressive resizing、backbone fine-tune とは同時に使いません。
+- `progressive_resizing`: 序盤を小さい画像サイズで回し、warmup 中に最終サイズへ近づけます。feature cache とは同時に使いません。
+
+config では次の項目で管理します。
+
+```yaml
+train:
+  fused_optimizer: true
+  torch_compile:
+    enabled: false
+    mode: reduce-overhead
+    fullgraph: false
+    dynamic: false
+  feature_cache:
+    enabled: false
+    dtype: float16
+    reuse_existing: true
+  progressive_resizing:
+    enabled: false
+    start_size: 672
+    end_size: 896
+    warmup_epochs: 20
+```
+
+GPU が空いたタイミングで 1 epoch だけ計測する場合は、次の profiler を使います。`--wait-for-free-gpu` は、GPU util と VRAM 使用量が連続して閾値以下になるまで待ってから学習を開始します。
+
+```bash
+.venv/bin/python scripts/profile_training_speed.py \
+  --config configs/dino_centerface_ellipse_aug_ablation/E0_baseline.yaml \
+  --name centerface_e0_b8_priority_b_fused_wait_20260630_0905 \
+  --batch-size 8 \
+  --epochs 1 \
+  --device cuda:0 \
+  --wait-for-free-gpu \
+  --free-gpu-util 10 \
+  --free-memory-used-mib 3000 \
+  --free-samples 5 \
+  --fused-optimizer \
+  --no-torch-compile \
+  --no-feature-cache \
+  --no-progressive-resizing
+```
+
+出力は `outputs/gpu_profiles/<name>/` に保存されます。主に `gpu_profile_summary.json`、`gpu_samples.csv`、`train.log`、`train/run_meta.json`、`train/metrics.csv` を確認します。
+
+2026-06-30 の batch size 8 計測では、既存GPUジョブが終了してから計測を開始するため、profiler の空き待ち条件を使いました。比較時は GPU util よりも、`epoch_seconds`、`images_per_second`、最大VRAM、loss が finite であることを優先して読みます。
+
+実測結果は次のとおりです。
+
+| profile | status | batch | epoch seconds | images/sec | active GPU util mean / max | active VRAM max | optimizer | loss finite |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `outputs/gpu_profiles/centerface_e0_b8_priority_b_fused_wait_20260630_0905` | 0 | 8 | 62.447 | 23.38 | 90.24% / 93% | 5280 MiB | AdamW fused | yes |
+
+この計測では `torch.compile`、`feature_cache`、`progressive_resizing` はOFFにし、常用しやすい `fused_optimizer` だけをONにしています。`run_meta.json` では `optimizer.fused=true`、`amp=true`、`tf32=true`、`num_workers=4`、`persistent_workers=true`、`prefetch_factor=4` を確認できます。
 
 ## YOLO Pose の推論
 
@@ -466,6 +532,49 @@ test split 上で後追いの threshold 最適化を行うと、高解像度版�
 | test | 0.7405 | 0.7476 | 0.0640 | 0.0554 | 0.5467 | 0.6220 | 0.8257 | 0.8073 | 41 | 39 |
 
 test の fixed F1 は `0.8073` から `0.8257` に少し改善しました。一方で、keypoint-first の重要指標は val/test ともに悪化しています。NME は val で `0.0780` から `0.0977`、test で `0.0554` から `0.0640` に上がり、PCK@0.05 は val で `0.3750` から `0.2623`、test で `0.6220` から `0.5467` に下がりました。この条件は、現時点では採用候補として弱いです。次に試すなら、失敗可視化を確認したうえで、hard example の比率または augmentation のどちらか一方だけを弱めた条件を切り分けます。
+
+### YOLO11s の train-time augmentation Phase 1
+
+`scripts_YOLO/run_yolo11s_aug_phase1.py` は、YOLO11s Pose に対して Ultralytics 標準の train-time augmentation だけを比較するための実験 runner です。Phase 0 としてデータセット監査を行い、その後 `E0_current_control`、`E1_cutmix_light`、`E2_mosaic_mid`、`E3_viewpoint_light` の 4 条件を同じデータ、同じ model、同じ学習条件で比較します。
+
+監査だけを行う場合は次のように実行します。
+
+```bash
+.venv/bin/python scripts_YOLO/run_yolo11s_aug_phase1.py \
+  --data-root outputs_experiment/yolo_pose_dataset_ablation_20260624_task2/datasets/modified_100 \
+  --output-dir output_experiment/05_yolo_aug_phase1 \
+  --manual-tags-csv output_experiment/01_failure_mining/failures_review.csv \
+  --audit-only
+```
+
+4 条件の学習と評価をまとめて行う場合は次のように実行します。
+
+```bash
+.venv/bin/python scripts_YOLO/run_yolo11s_aug_phase1.py \
+  --data-root outputs_experiment/yolo_pose_dataset_ablation_20260624_task2/datasets/modified_100 \
+  --output-dir output_experiment/05_yolo_aug_phase1 \
+  --manual-tags-csv output_experiment/01_failure_mining/failures_review.csv \
+  --model yolo11s-pose.pt \
+  --imgsz 960 \
+  --epochs 200 \
+  --batch 8 \
+  --patience 50 \
+  --device 0 \
+  --save-error-images
+```
+
+主な出力は次のとおりです。
+
+- `phase0_dataset_audit.json`: 画像数、instance 数、positive/negative 数、split 重複、近接 frame、bbox 分布、keypoint visibility、`flip_idx` をまとめた監査結果。
+- `phase1_model_comparison.csv`: val で選んだ confidence threshold を test に適用した全体指標。
+- `phase1_tag_fn_recall.csv`: `angle`、`occlusion`、`pixelated_blur`、`small`、`crowded`、`edge` のタグ別 FN/recall 集計。
+- `phase1_adoption_check.csv`: E0 比での F1、NME、PCK@0.05 の変化と採用候補判定。
+- `evaluations/<experiment>/`: threshold sweep、val/test metrics、失敗分析 CSV、推論可視化。
+- `runs/<experiment>/`: Ultralytics の学習ログ、`args.yaml`、`results.csv`、`train_batch` 画像、`weights/best.pt`。
+
+`small`、`crowded`、`edge` は bbox と画像内 object 数から自動集計されます。`angle`、`occlusion`、`pixelated_blur` は `--manual-tags-csv` に `image` または `image_path` と、`tags` / `manual_failure_type` / `auto_failure_type` などの列を持つ CSV を渡した場合に集計されます。
+
+`mosaic` は Ultralytics YOLO の 4 画像合成 augmentation であり、pixelated / blur とは別問題として扱います。横顔や俯瞰などの yaw / pitch 問題も、2D 回転だけで作れるものとしては扱わず、Phase 1 では軽い viewpoint 耐性の確認に留めます。遮蔽や pixelated / blur を人工的に作る offline augmentation は、Phase 1 後に失敗タグとして残った場合の Phase 2 候補です。
 
 ### RTMDet + RTMPose-face の実験結果
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,99 @@ def _load_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
                 clean_key = clean_key[len("module.") :]
             state_dict[clean_key] = value
     return state_dict
+
+
+def _patch_torch_for_dinov3_backbone() -> None:
+    """Provide small Torch 2.0 compatibility shims needed by local DINOv3 backbones."""
+
+    try:
+        import torch._dynamo as torch_dynamo  # type: ignore[attr-defined]
+    except Exception:
+        torch_dynamo = None
+    if torch_dynamo is not None:
+        if not hasattr(torch, "_dynamo"):
+            setattr(torch, "_dynamo", torch_dynamo)
+        if not hasattr(torch_dynamo, "reset_code_caches"):
+            setattr(torch_dynamo, "reset_code_caches", lambda: None)
+        config = getattr(torch_dynamo, "config", None)
+        allowed_keys = getattr(config, "_allowed_keys", None)
+        config_values = getattr(config, "_config", None)
+        if isinstance(allowed_keys, set) and isinstance(config_values, dict):
+            for key, default in {
+                "automatic_dynamic_shapes": False,
+                "accumulated_cache_size_limit": 1024,
+            }.items():
+                allowed_keys.add(key)
+                config_values.setdefault(key, default)
+
+    if not hasattr(torch, "compiler"):
+
+        class _CompilerShim:
+            @staticmethod
+            def allow_in_graph(function):
+                return function
+
+        setattr(torch, "compiler", _CompilerShim())
+
+
+def _load_local_entrypoint(
+    *,
+    repo: str | Path,
+    entrypoint: str,
+    module_name: str,
+    pretrained: bool = False,
+) -> nn.Module:
+    repo_path = Path(repo).expanduser().resolve()
+    if not repo_path.exists():
+        raise FileNotFoundError(f"Local DINO repo was not found: {repo_path}")
+    repo_str = str(repo_path)
+    inserted = False
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+        inserted = True
+    try:
+        if module_name.startswith("dinov3."):
+            _patch_torch_for_dinov3_backbone()
+        module = importlib.import_module(module_name)
+        factory = getattr(module, entrypoint)
+        model = factory(pretrained=pretrained)
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(repo_str)
+            except ValueError:
+                pass
+    if not isinstance(model, nn.Module):
+        raise TypeError(f"Local DINO entrypoint {module_name}.{entrypoint} did not return nn.Module: {type(model)!r}")
+    return model
+
+
+def _load_local_hub_model(
+    *,
+    repo: str | Path,
+    entrypoint: str,
+    pretrained: bool = False,
+    module_name: str | None = None,
+) -> nn.Module:
+    if module_name:
+        return _load_local_entrypoint(repo=repo, entrypoint=entrypoint, module_name=module_name, pretrained=pretrained)
+
+    try:
+        return torch.hub.load(
+            str(repo),
+            entrypoint,
+            source="local",
+            pretrained=pretrained,
+        )
+    except ImportError:
+        if str(entrypoint).startswith("dinov3_"):
+            return _load_local_entrypoint(
+                repo=repo,
+                entrypoint=entrypoint,
+                module_name="dinov3.hub.backbones",
+                pretrained=pretrained,
+            )
+        raise
 
 
 def _extract_token_tensor(output: Any, token_key: str | None) -> tuple[torch.Tensor, bool]:
@@ -182,8 +277,8 @@ class DinoBackbone(nn.Module):
     """DINOv2-style patch-token wrapper that returns a 2D feature map.
 
     This wrapper never downloads weights. Pass a local DINO module through
-    ``backbone=`` for real training, or use ``dummy=True`` / ``pretrained=False``
-    for local shape tests.
+    ``backbone=`` for real training, or use ``dummy=True`` explicitly for
+    local shape tests.
     """
 
     def __init__(
@@ -195,6 +290,7 @@ class DinoBackbone(nn.Module):
         backbone: nn.Module | None = None,
         hub_repo: str | Path | None = None,
         hub_model: str | None = None,
+        hub_module: str | None = None,
         weights: str | Path | None = None,
         pretrained: bool = False,
         dummy: bool = False,
@@ -217,15 +313,14 @@ class DinoBackbone(nn.Module):
         self.allow_non_divisible = bool(allow_non_divisible)
 
         if backbone is None:
-            use_dummy = dummy or (not pretrained and weights is None)
             if hub_repo is not None:
-                backbone = torch.hub.load(
-                    str(hub_repo),
-                    hub_model or name,
-                    source="local",
+                backbone = _load_local_hub_model(
+                    repo=hub_repo,
+                    entrypoint=hub_model or name,
                     pretrained=False,
+                    module_name=hub_module,
                 )
-            elif use_dummy:
+            elif dummy:
                 backbone = DummyDinoBackbone(
                     embed_dim=self.embed_dim,
                     patch_size=self.patch_size,
@@ -235,7 +330,7 @@ class DinoBackbone(nn.Module):
             else:
                 raise ValueError(
                     "Automatic DINO downloads are disabled. Pass backbone=, configure a local hub_repo, "
-                    "or set pretrained=False/dummy=True for smoke tests."
+                    "or set dummy=True explicitly for smoke tests."
                 )
         self.backbone = backbone
 
@@ -312,9 +407,10 @@ def build_dino_backbone(config: Mapping[str, Any] | None = None, *, backbone: nn
         backbone=backbone,
         hub_repo=cfg.get("hub_repo"),
         hub_model=cfg.get("hub_model"),
+        hub_module=cfg.get("hub_module"),
         weights=cfg.get("weights"),
         pretrained=bool(cfg.get("pretrained", False)),
-        dummy=bool(cfg.get("dummy", not cfg.get("pretrained", False) and backbone is None and cfg.get("weights") is None)),
+        dummy=bool(cfg.get("dummy", False)),
         token_key=cfg.get("token_key"),
         num_prefix_tokens=int(cfg.get("num_prefix_tokens", 1)),
         call_method=str(cfg.get("call_method", "auto")),

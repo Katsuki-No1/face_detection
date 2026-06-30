@@ -53,17 +53,23 @@ class SCRFDHead(nn.Module):
         self.box_tower = tower()
         self.kpt_tower = tower()
         self.cls_logits = nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1)
+        self.center_offset = nn.Conv2d(hidden_channels, 2, kernel_size=3, padding=1)
         self.bbox_reg = nn.Conv2d(hidden_channels, 4, kernel_size=3, padding=1)
         self.kpt_reg = nn.Conv2d(hidden_channels, self.num_keypoints * 2, kernel_size=3, padding=1)
 
         nn.init.constant_(self.cls_logits.bias, -4.595)
+        nn.init.zeros_(self.center_offset.weight)
+        nn.init.zeros_(self.center_offset.bias)
 
     def forward(self, features: list[torch.Tensor]) -> dict[str, list[torch.Tensor]]:
         cls_logits: list[torch.Tensor] = []
+        center_offset: list[torch.Tensor] = []
         bbox_reg: list[torch.Tensor] = []
         kpt_reg: list[torch.Tensor] = []
         for feature in features:
             cls_logits.append(self.cls_logits(self.cls_tower(feature)))
-            bbox_reg.append(F.softplus(self.bbox_reg(self.box_tower(feature))))
+            box_feature = self.box_tower(feature)
+            center_offset.append(torch.sigmoid(self.center_offset(box_feature)))
+            bbox_reg.append(F.softplus(self.bbox_reg(box_feature)))
             kpt_reg.append(self.kpt_reg(self.kpt_tower(feature)))
-        return {"cls_logits": cls_logits, "bbox_reg": bbox_reg, "kpt_reg": kpt_reg}
+        return {"cls_logits": cls_logits, "center_offset": center_offset, "bbox_reg": bbox_reg, "kpt_reg": kpt_reg}

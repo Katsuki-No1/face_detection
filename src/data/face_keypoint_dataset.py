@@ -16,18 +16,73 @@ FACE_KEYPOINT_NAMES = ("left_eye", "right_eye", "nose", "left_mouth", "right_mou
 YOLO_KEYPOINT_NAMES = ("e1", "e2", "n", "m1", "m2")
 
 
+def ellipse_to_params(ellipse: dict[str, Any]) -> list[float]:
+    """Return [cx, cy, rx, ry, theta_rad] from CVAT-like ellipse metadata."""
+
+    if {"xtl", "ytl", "xbr", "ybr"}.issubset(ellipse):
+        x1 = float(ellipse["xtl"])
+        y1 = float(ellipse["ytl"])
+        x2 = float(ellipse["xbr"])
+        y2 = float(ellipse["ybr"])
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        rx = abs(x2 - x1) * 0.5
+        ry = abs(y2 - y1) * 0.5
+    else:
+        cx = float(ellipse.get("cx", ellipse.get("center", {}).get("x", 0.0)))
+        cy = float(ellipse.get("cy", ellipse.get("center", {}).get("y", 0.0)))
+        rx = float(ellipse.get("rx", ellipse.get("radius", {}).get("x", 0.0)))
+        ry = float(ellipse.get("ry", ellipse.get("radius", {}).get("y", 0.0)))
+
+    if "theta" in ellipse:
+        theta = float(ellipse["theta"])
+    else:
+        theta = math.radians(float(ellipse.get("rotation", ellipse.get("angle", 0.0))))
+    return [cx, cy, max(0.0, rx), max(0.0, ry), theta]
+
+
 def ellipse_to_xyxy(ellipse: dict[str, Any]) -> list[float]:
-    cx = float(ellipse.get("cx", ellipse.get("center", {}).get("x", 0.0)))
-    cy = float(ellipse.get("cy", ellipse.get("center", {}).get("y", 0.0)))
-    rx = float(ellipse.get("rx", ellipse.get("radius", {}).get("x", 0.0)))
-    ry = float(ellipse.get("ry", ellipse.get("radius", {}).get("y", 0.0)))
-    rotation = float(ellipse.get("rotation", 0.0))
-    theta = math.radians(rotation)
+    cx, cy, rx, ry, theta = ellipse_to_params(ellipse)
+    return ellipse_params_to_xyxy([cx, cy, rx, ry, theta])
+
+
+def ellipse_params_to_xyxy(ellipse: list[float] | tuple[float, float, float, float, float]) -> list[float]:
+    cx, cy, rx, ry, theta = [float(value) for value in ellipse]
     cos_theta = math.cos(theta)
     sin_theta = math.sin(theta)
     half_width = math.sqrt((rx * cos_theta) ** 2 + (ry * sin_theta) ** 2)
     half_height = math.sqrt((rx * sin_theta) ** 2 + (ry * cos_theta) ** 2)
     return [cx - half_width, cy - half_height, cx + half_width, cy + half_height]
+
+
+def _ellipse_points(cx: float, cy: float, rx: float, ry: float, theta: float, *, steps: int = 96) -> np.ndarray:
+    angles = np.linspace(0.0, 2.0 * math.pi, steps, endpoint=False)
+    cos_theta = math.cos(theta)
+    sin_theta = math.sin(theta)
+    xs = rx * np.cos(angles)
+    ys = ry * np.sin(angles)
+    return np.stack([cx + xs * cos_theta - ys * sin_theta, cy + xs * sin_theta + ys * cos_theta], axis=1)
+
+
+def _ellipse_from_points(points: np.ndarray) -> list[float]:
+    center = points.mean(axis=0)
+    centered = points - center[None, :]
+    covariance = centered.T @ centered / max(1, points.shape[0])
+    values, vectors = np.linalg.eigh(covariance)
+    order = np.argsort(values)[::-1]
+    values = np.clip(values[order], 1e-9, None)
+    vectors = vectors[:, order]
+    radii = np.sqrt(values * 2.0)
+    theta = math.atan2(float(vectors[1, 0]), float(vectors[0, 0]))
+    return [float(center[0]), float(center[1]), float(radii[0]), float(radii[1]), theta]
+
+
+def _resize_ellipse_params(ellipse: list[float], scale_x: float, scale_y: float) -> list[float]:
+    cx, cy, rx, ry, theta = [float(value) for value in ellipse]
+    points = _ellipse_points(cx, cy, rx, ry, theta)
+    points[:, 0] *= scale_x
+    points[:, 1] *= scale_y
+    return _ellipse_from_points(points)
 
 
 def clip_xyxy(box: list[float], width: int, height: int) -> list[float] | None:
@@ -76,13 +131,29 @@ def _resize_image_and_target(
     scale_y = new_h / float(old_h)
     updated = dict(target)
     boxes = updated["boxes"].clone()
-    if boxes.numel() > 0:
-        boxes[:, 0::2] *= scale_x
-        boxes[:, 1::2] *= scale_y
     keypoints = updated["keypoints"].clone()
     if keypoints.numel() > 0:
         keypoints[..., 0] *= scale_x
         keypoints[..., 1] *= scale_y
+    ellipses = updated.get("ellipses")
+    if isinstance(ellipses, torch.Tensor) and ellipses.numel() > 0:
+        resized_ellipses = [_resize_ellipse_params(item, scale_x, scale_y) for item in ellipses.detach().cpu().tolist()]
+        ellipses = torch.as_tensor(resized_ellipses, dtype=ellipses.dtype, device=ellipses.device)
+        resized_boxes = []
+        for item in resized_ellipses:
+            clipped = clip_xyxy(ellipse_params_to_xyxy(item), new_w, new_h)
+            if clipped is None:
+                clipped = [0.0, 0.0, 0.0, 0.0]
+            resized_boxes.append(clipped)
+        boxes = torch.as_tensor(
+            resized_boxes,
+            dtype=boxes.dtype,
+            device=boxes.device,
+        ).reshape(-1, 4)
+        updated["ellipses"] = ellipses
+    elif boxes.numel() > 0:
+        boxes[:, 0::2] *= scale_x
+        boxes[:, 1::2] *= scale_y
     updated["boxes"] = boxes
     updated["keypoints"] = keypoints
     updated["orig_size"] = (old_h, old_w)
@@ -93,6 +164,7 @@ def _resize_image_and_target(
 def _tensor_target(
     *,
     boxes: list[list[float]],
+    ellipses: list[list[float]] | None = None,
     keypoints: list[list[list[float]]],
     keypoint_mask: list[list[bool]],
     image_id: str,
@@ -101,10 +173,19 @@ def _tensor_target(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     box_tensor = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+    if ellipses is None:
+        ellipse_values = []
+        for box in box_tensor.tolist():
+            x1, y1, x2, y2 = box
+            ellipse_values.append([(x1 + x2) * 0.5, (y1 + y2) * 0.5, (x2 - x1) * 0.5, (y2 - y1) * 0.5, 0.0])
+    else:
+        ellipse_values = ellipses
+    ellipse_tensor = torch.as_tensor(ellipse_values, dtype=torch.float32).reshape(box_tensor.shape[0], 5)
     kpt_tensor = torch.as_tensor(keypoints, dtype=torch.float32).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES), 2)
     mask_tensor = torch.as_tensor(keypoint_mask, dtype=torch.bool).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES))
     return {
         "boxes": box_tensor,
+        "ellipses": ellipse_tensor,
         "labels": torch.ones((box_tensor.shape[0],), dtype=torch.long),
         "keypoints": kpt_tensor,
         "keypoint_mask": mask_tensor,
@@ -118,6 +199,7 @@ def _tensor_target(
 def _empty_target(image_id: str, height: int, width: int, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     return _tensor_target(
         boxes=[],
+        ellipses=[],
         keypoints=[],
         keypoint_mask=[],
         image_id=image_id,
@@ -155,12 +237,17 @@ def _metadata_for_image(index: dict[str, dict[str, Any]], image_path: Path) -> d
     return index.get(str(image_path)) or index.get(image_path.name) or index.get(image_path.stem)
 
 
-def _parse_yolo_label(label_path: Path, width: int, height: int) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]]]:
+def _parse_yolo_label(
+    label_path: Path,
+    width: int,
+    height: int,
+) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]], list[list[float]]]:
     boxes: list[list[float]] = []
     keypoints: list[list[list[float]]] = []
     keypoint_mask: list[list[bool]] = []
+    ellipses: list[list[float]] = []
     if not label_path.exists():
-        return boxes, keypoints, keypoint_mask
+        return boxes, keypoints, keypoint_mask, ellipses
     for line in label_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -176,6 +263,7 @@ def _parse_yolo_label(label_path: Path, width: int, height: int) -> tuple[list[l
         if clipped is None:
             continue
         boxes.append(clipped)
+        ellipses.append([x, y, box_w * 0.5, box_h * 0.5, 0.0])
         raw_keypoints = values[5:]
         sample_keypoints: list[list[float]] = []
         sample_mask: list[bool] = []
@@ -189,7 +277,7 @@ def _parse_yolo_label(label_path: Path, width: int, height: int) -> tuple[list[l
             sample_mask.append(True)
         keypoints.append(sample_keypoints)
         keypoint_mask.append(sample_mask)
-    return boxes, keypoints, keypoint_mask
+    return boxes, keypoints, keypoint_mask, ellipses
 
 
 def _record_image_path(record: dict[str, Any], image_root: Path | None) -> Path:
@@ -216,6 +304,47 @@ def _object_keypoints_from_metadata(meta_object: dict[str, Any] | None) -> tuple
         sample_keypoints[target_index] = [float(point.get("x", 0.0)), float(point.get("y", 0.0))]
         sample_mask[target_index] = True
     return sample_keypoints, sample_mask
+
+
+def _metadata_objects_to_targets(
+    metadata: dict[str, Any] | None,
+    width: int,
+    height: int,
+) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]], list[list[float]]] | None:
+    if not metadata:
+        return None
+    objects = metadata.get("objects", [])
+    if not isinstance(objects, list) or not objects:
+        return None
+    boxes: list[list[float]] = []
+    keypoints: list[list[list[float]]] = []
+    keypoint_mask: list[list[bool]] = []
+    ellipses: list[list[float]] = []
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+        ellipse_meta = item.get("cvat_ellipse") or item.get("face", {}).get("cvat_ellipse")
+        bbox = item.get("training_bbox") or item.get("raw_bbox") or item.get("bbox") or item.get("face", {}).get("bbox")
+        if ellipse_meta:
+            raw_box = ellipse_to_xyxy(ellipse_meta)
+            ellipse = ellipse_to_params(ellipse_meta)
+        elif isinstance(bbox, dict):
+            raw_box = _bbox_dict_to_xyxy(bbox)
+            x1, y1, x2, y2 = raw_box
+            ellipse = [(x1 + x2) * 0.5, (y1 + y2) * 0.5, abs(x2 - x1) * 0.5, abs(y2 - y1) * 0.5, 0.0]
+        else:
+            continue
+        clipped = clip_xyxy(raw_box, width, height)
+        if clipped is None:
+            continue
+        sample_keypoints, sample_mask = _object_keypoints_from_metadata(item)
+        boxes.append(clipped)
+        ellipses.append(ellipse)
+        keypoints.append(sample_keypoints)
+        keypoint_mask.append(sample_mask)
+    if not boxes:
+        return None
+    return boxes, keypoints, keypoint_mask, ellipses
 
 
 class FaceKeypointDataset(Dataset):
@@ -310,9 +439,13 @@ class FaceKeypointDataset(Dataset):
         image = Image.open(sample["image_path"]).convert("RGB")
         width, height = image.size
         if sample["format"] == "yolo":
-            boxes, keypoints, keypoint_mask = _parse_yolo_label(sample["label_path"], width, height)
+            boxes, keypoints, keypoint_mask, ellipses = _parse_yolo_label(sample["label_path"], width, height)
+            metadata_targets = _metadata_objects_to_targets(sample.get("metadata"), width, height)
+            if metadata_targets is not None and len(metadata_targets[0]) == len(boxes):
+                boxes, keypoints, keypoint_mask, ellipses = metadata_targets
             target = _tensor_target(
                 boxes=boxes,
+                ellipses=ellipses,
                 keypoints=keypoints,
                 keypoint_mask=keypoint_mask,
                 image_id=sample["image_id"],
@@ -367,6 +500,7 @@ class FaceKeypointDataset(Dataset):
     def _target_from_cvat_sample(self, sample: dict[str, Any], width: int, height: int) -> dict[str, Any]:
         record = sample["record"]
         boxes: list[list[float]] = []
+        ellipses: list[list[float]] = []
         keypoints: list[list[list[float]]] = []
         keypoint_mask: list[list[bool]] = []
         ellipse_metadata: list[dict[str, Any] | None] = []
@@ -394,6 +528,11 @@ class FaceKeypointDataset(Dataset):
             if clipped is None:
                 continue
             boxes.append(clipped)
+            if ellipse_meta:
+                ellipses.append(ellipse_to_params(ellipse_meta))
+            else:
+                x1, y1, x2, y2 = raw_box
+                ellipses.append([(x1 + x2) * 0.5, (y1 + y2) * 0.5, abs(x2 - x1) * 0.5, abs(y2 - y1) * 0.5, 0.0])
             sample_keypoints, sample_mask = _object_keypoints_from_metadata(item if objects else None)
             keypoints.append(sample_keypoints)
             keypoint_mask.append(sample_mask)
@@ -403,6 +542,7 @@ class FaceKeypointDataset(Dataset):
             return _empty_target(str(sample["image_id"]), height, width, metadata={"record": record})
         return _tensor_target(
             boxes=boxes,
+            ellipses=ellipses,
             keypoints=keypoints,
             keypoint_mask=keypoint_mask,
             image_id=str(sample["image_id"]),

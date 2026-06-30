@@ -104,3 +104,7 @@ tensorboard/
 !configs/*.example.yaml
 !.env.example
 !**/.gitkeep
+
+# Re-apply generated Python cache ignores after source-directory allow rules.
+**/__pycache__/
+**/*.py[cod]

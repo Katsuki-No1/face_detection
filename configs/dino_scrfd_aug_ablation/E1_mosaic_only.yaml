@@ -1,0 +1,11 @@
+extends: base.yaml
+
+experiment:
+  name: E1_mosaic_only
+
+train:
+  name: E1_mosaic_only
+
+augmentation:
+  mosaic: 0.3
+  close_mosaic: 20

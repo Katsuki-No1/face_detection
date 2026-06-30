@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.models import build_dino_scrfd_face_detector
+from src.models import build_detector_from_config, draw_ellipse_detections
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -73,19 +73,22 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path | None) -> Non
 
 
 def result_records(image_id: str, detections: dict[str, torch.Tensor]) -> list[dict[str, Any]]:
-    boxes = detections["boxes"].detach().cpu()
+    boxes = detections.get("bboxes", detections["boxes"]).detach().cpu()
     scores = detections["scores"].detach().cpu()
     keypoints = detections["keypoints"].detach().cpu()
+    ellipses = detections.get("ellipses")
+    ellipses = ellipses.detach().cpu() if isinstance(ellipses, torch.Tensor) else None
     records = []
     for index in range(boxes.shape[0]):
-        records.append(
-            {
-                "image_id": image_id,
-                "score": float(scores[index]),
-                "bbox": [float(value) for value in boxes[index].tolist()],
-                "keypoints": [[float(value) for value in point] for point in keypoints[index].tolist()],
-            }
-        )
+        record = {
+            "image_id": image_id,
+            "score": float(scores[index]),
+            "bbox": [float(value) for value in boxes[index].tolist()],
+            "keypoints": [[float(value) for value in point] for point in keypoints[index].tolist()],
+        }
+        if ellipses is not None:
+            record["ellipse"] = [float(value) for value in ellipses[index].tolist()]
+        records.append(record)
     return records
 
 
@@ -95,7 +98,7 @@ def save_records(path: Path, records: list[dict[str, Any]], fmt: str) -> None:
         path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
     with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=["image_id", "score", "x1", "y1", "x2", "y2", "keypoints"])
+        writer = csv.DictWriter(file, fieldnames=["image_id", "score", "x1", "y1", "x2", "y2", "ellipse", "keypoints"])
         writer.writeheader()
         for record in records:
             x1, y1, x2, y2 = record["bbox"]
@@ -107,6 +110,7 @@ def save_records(path: Path, records: list[dict[str, Any]], fmt: str) -> None:
                     "y1": y1,
                     "x2": x2,
                     "y2": y2,
+                    "ellipse": json.dumps(record.get("ellipse", [])),
                     "keypoints": json.dumps(record["keypoints"]),
                 }
             )
@@ -114,6 +118,9 @@ def save_records(path: Path, records: list[dict[str, Any]], fmt: str) -> None:
 
 def save_overlay(path: Path, image: Image.Image, detections: dict[str, torch.Tensor]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if "ellipses" in detections:
+        draw_ellipse_detections(image, detections).save(path)
+        return
     draw = ImageDraw.Draw(image)
     for box, keypoints in zip(detections["boxes"].cpu(), detections["keypoints"].cpu()):
         x1, y1, x2, y2 = [float(value) for value in box.tolist()]
@@ -127,7 +134,7 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     image_size = args.image_size or config.get("data", {}).get("image_size") or config.get("train", {}).get("imgsz")
-    model = build_dino_scrfd_face_detector(config).to(args.device)
+    model = build_detector_from_config(config).to(args.device)
     load_checkpoint(model, args.checkpoint)
     model.eval()
 

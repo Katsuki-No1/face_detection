@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+#コマンド：python script/script_data/count_head_annotations.py data/output/2026_06_21_1/task2_yk.zip
 
 @dataclass
 class ImageHeadCount:

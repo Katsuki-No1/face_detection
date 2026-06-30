@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from src.models import build_dino_scrfd_face_detector
+from src.models.dino_scrfd import _validate_scrfd_predictions
 
 
 def small_config() -> dict:
@@ -47,6 +48,8 @@ class DinoSCRFDModelTest(unittest.TestCase):
         outputs = model.forward_raw(torch.zeros(2, 3, 56, 56))
         self.assertEqual(len(outputs["cls_logits"]), 3)
         self.assertEqual(tuple(outputs["cls_logits"][0].shape), (2, 1, 8, 8))
+        self.assertEqual(tuple(outputs["center_offset"][0].shape), (2, 2, 8, 8))
+        self.assertTrue(torch.allclose(outputs["center_offset"][0], torch.full_like(outputs["center_offset"][0], 0.5)))
         self.assertEqual(tuple(outputs["bbox_reg"][1].shape), (2, 4, 4, 4))
         self.assertEqual(tuple(outputs["kpt_reg"][2].shape), (2, 10, 2, 2))
 
@@ -56,7 +59,19 @@ class DinoSCRFDModelTest(unittest.TestCase):
         losses = model(torch.zeros(1, 3, 56, 56), [positive_target()])
         self.assertIn("loss_total", losses)
         self.assertTrue(torch.isfinite(losses["loss_total"]))
+        self.assertIn("loss_center_offset", losses)
         self.assertGreaterEqual(float(losses["num_pos"]), 1.0)
+
+    def test_forward_from_dino_feature_returns_loss_dict(self) -> None:
+        model = build_dino_scrfd_face_detector(small_config())
+        model.train()
+        images = torch.zeros(1, 3, 56, 56)
+        with torch.no_grad():
+            dino_feature = model.backbone(images)
+        losses = model.forward_from_dino_feature(dino_feature, image_size=(56, 56), targets=[positive_target()])
+        self.assertIn("loss_total", losses)
+        self.assertTrue(torch.isfinite(losses["loss_total"]))
+        self.assertIn("loss_center_offset", losses)
 
     def test_inference_forward_returns_decoded_detections(self) -> None:
         model = build_dino_scrfd_face_detector(small_config())
@@ -66,6 +81,17 @@ class DinoSCRFDModelTest(unittest.TestCase):
         self.assertEqual(len(detections), 1)
         self.assertEqual(detections[0]["boxes"].shape[-1], 4)
         self.assertEqual(detections[0]["keypoints"].shape[-2:], (5, 2))
+
+    def test_prediction_format_validation_names_bad_level_shape(self) -> None:
+        pyramid = [torch.zeros(1, 8, 4, 4)]
+        predictions = {
+            "cls_logits": [torch.zeros(1, 1, 4, 4)],
+            "center_offset": [torch.zeros(1, 3, 4, 4)],
+            "bbox_reg": [torch.zeros(1, 4, 4, 4)],
+            "kpt_reg": [torch.zeros(1, 10, 4, 4)],
+        }
+        with self.assertRaisesRegex(ValueError, "center_offset"):
+            _validate_scrfd_predictions(predictions, pyramid=pyramid, num_keypoints=5)
 
     def test_negative_sample_loss_is_finite(self) -> None:
         model = build_dino_scrfd_face_detector(small_config())
@@ -79,6 +105,7 @@ class DinoSCRFDModelTest(unittest.TestCase):
         }
         losses = model(torch.zeros(1, 3, 56, 56), [empty_target])
         self.assertTrue(torch.isfinite(losses["loss_total"]))
+        self.assertEqual(float(losses["loss_center_offset"].detach()), 0.0)
         self.assertEqual(float(losses["num_pos"]), 0.0)
 
     def test_missing_keypoints_skip_landmark_loss(self) -> None:
