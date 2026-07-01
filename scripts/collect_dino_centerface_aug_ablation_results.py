@@ -51,11 +51,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("outputs_experiment/dino_scrfd_vs_yolo11s_20260628/comparison_summary.json"),
     )
+    parser.add_argument("--include-inactive", action="store_true", help="Include configs marked experiment.active: false.")
     return parser.parse_args()
 
 
-def config_paths(config_dir: Path) -> list[Path]:
-    return sorted(path for path in config_dir.glob("E*.yaml") if path.is_file())
+def config_paths(config_dir: Path, *, include_inactive: bool = False) -> list[Path]:
+    paths = []
+    for path in sorted(config_dir.glob("E*.yaml")):
+        if not path.is_file():
+            continue
+        if not include_inactive and load_yaml_config(path).get("experiment", {}).get("active", True) is False:
+            continue
+        paths.append(path)
+    return paths
 
 
 def experiment_name(path: Path) -> str:
@@ -188,7 +196,7 @@ def write_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_args()
-    rows = [dino_row(path, args.eval_root) for path in config_paths(args.config_dir)]
+    rows = [dino_row(path, args.eval_root) for path in config_paths(args.config_dir, include_inactive=bool(args.include_inactive))]
     baseline = yolo_row(args.yolo11s_summary)
     if baseline is not None:
         rows.append(baseline)
@@ -205,4 +213,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

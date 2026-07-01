@@ -261,6 +261,26 @@ GPU が空いたタイミングで 1 epoch だけ計測する場合は、次の 
 
 出力は `outputs/gpu_profiles/<name>/` に保存されます。主に `gpu_profile_summary.json`、`gpu_samples.csv`、`train.log`、`train/run_meta.json`、`train/metrics.csv` を確認します。
 
+### DINO augmentation ablation の blur 方針
+
+DINO-SCRFD 系と DINO-CenterFace ellipse 系では、blur を他の photometric augmentation から分けて評価します。学習時の標準方針は **blur-only を medium 固定** とし、`E9_blur_medium` だけを blur 専用条件として使います。
+
+- `E3_photometric_only`、`E5_mosaic_photometric`、`E6_geometry_photometric`、`E7_all` は HSV、brightness、contrast、gamma、noise を見る条件で、`blur: 0.0` にしています。
+- `E9_blur_medium` は `blur: 0.20`、`blur_radius_min: 0.3`、`blur_radius_max: 1.5` の blur-only 条件です。
+- `E8_blur_weak` と `E10_blur_strong` は archive 扱いで、`experiment.active: false` にしています。通常の manifest、preview、collect では対象から外れます。
+
+学習前には、使用する config と manifest で blur 方針を確認してください。
+
+```bash
+.venv/bin/python scripts/run_dino_centerface_aug_ablation.py \
+  --config-dir configs/dino_centerface_ellipse_aug_ablation \
+  --manifest outputs_experiment/dino_centerface_ellipse_aug_ablation_manifest/commands.json
+```
+
+生成された manifest に `E9_blur_medium` が含まれ、`E8_blur_weak` と `E10_blur_strong` が含まれないことを確認します。学習後は各 run の `config_resolved.yaml` でも、photometric 系の `blur: 0.0` と `E9_blur_medium` の medium 設定を確認できます。
+
+2026-07-01 時点の DINO-CenterFace ellipse `E9_blur_medium` 評価は `outputs_experiment/dino_centerface_ellipse_blur_ablation_real_dinov3_20260701_eval/E9_blur_medium/summary.json` に保存しています。test split 30 images / 63 instances で、best threshold `0.31`、precision `0.8600`、recall `0.6825`、F1 `0.7611`、bbox mAP `0.3159`、AP50 `0.6917` でした。既存の古い photometric checkpoint は blur `0.05` を含む設定で学習されているため、新方針で厳密に比較する場合は photometric no-blur 条件を再学習します。
+
 2026-06-30 の batch size 8 計測では、既存GPUジョブが終了してから計測を開始するため、profiler の空き待ち条件を使いました。比較時は GPU util よりも、`epoch_seconds`、`images_per_second`、最大VRAM、loss が finite であることを優先して読みます。
 
 実測結果は次のとおりです。

@@ -1,4 +1,5 @@
 import unittest
+import random
 from pathlib import Path
 
 import torch
@@ -9,6 +10,7 @@ from src.data.ellipse_augmentation import (
     AugmentedFaceKeypointDataset,
     apply_horizontal_flip,
     apply_mosaic,
+    apply_photometric,
 )
 from src.models.ellipse_target_assigner import CenterFaceEllipseTargetAssigner
 
@@ -80,6 +82,22 @@ class DinoCenterFaceAugmentationTest(unittest.TestCase):
         self.assertGreaterEqual(int(assignments["positive_count"].item()), 1)
         self.assertGreater(float(assignments["center_targets"][0].max()), 0.0)
 
+    def test_blur_photometric_augmentation_changes_image_only(self) -> None:
+        image = torch.zeros((3, 56, 56), dtype=torch.float32)
+        image[:, :, ::2] = 1.0
+        blurred = apply_photometric(image, {"blur": 1.0}, rng=random.Random(0))
+        self.assertEqual(tuple(blurred.shape), tuple(image.shape))
+        self.assertGreater(float((blurred - image).abs().mean()), 0.01)
+
+    def test_blur_strength_controls_radius(self) -> None:
+        image = torch.zeros((3, 56, 56), dtype=torch.float32)
+        image[:, :, ::2] = 1.0
+        weak = apply_photometric(image, {"blur": 1.0, "blur_radius_min": 0.1, "blur_radius_max": 0.1}, rng=random.Random(0))
+        strong = apply_photometric(image, {"blur": 1.0, "blur_radius_min": 2.0, "blur_radius_max": 2.0}, rng=random.Random(0))
+        weak_delta = float((weak - image).abs().mean())
+        strong_delta = float((strong - image).abs().mean())
+        self.assertGreater(strong_delta, weak_delta)
+
     def test_ablation_configs_keep_fixed_training_conditions(self) -> None:
         base = load_yaml_config(CONFIG_DIR / "E0_baseline.yaml")
         fixed_keys = ("model", "loss", "inference", "data", "train")
@@ -94,6 +112,12 @@ class DinoCenterFaceAugmentationTest(unittest.TestCase):
                 self.assertEqual(left, right, f"{path.name} changed fixed key {key}")
         self.assertEqual(load_yaml_config(CONFIG_DIR / "E7_all.yaml")["augmentation"]["mosaic"], 0.3)
         self.assertEqual(load_yaml_config(CONFIG_DIR / "E7_all.yaml")["augmentation"]["fliplr"], 0.5)
+        for name in ("E3_photometric_only", "E5_mosaic_photometric", "E6_geometry_photometric", "E7_all"):
+            self.assertEqual(load_yaml_config(CONFIG_DIR / f"{name}.yaml")["augmentation"]["blur"], 0.0)
+        self.assertFalse(load_yaml_config(CONFIG_DIR / "E8_blur_weak.yaml")["experiment"]["active"])
+        self.assertEqual(load_yaml_config(CONFIG_DIR / "E9_blur_medium.yaml")["augmentation"]["blur_radius_max"], 1.5)
+        self.assertEqual(load_yaml_config(CONFIG_DIR / "E9_blur_medium.yaml")["augmentation"]["blur"], 0.20)
+        self.assertFalse(load_yaml_config(CONFIG_DIR / "E10_blur_strong.yaml")["experiment"]["active"])
 
 
 if __name__ == "__main__":

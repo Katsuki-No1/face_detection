@@ -36,9 +36,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def config_paths(config_dir: Path) -> list[Path]:
-    paths = sorted(path for path in config_dir.glob("E*.yaml") if path.is_file())
+    paths = [
+        path
+        for path in sorted(config_dir.glob("E*.yaml"))
+        if path.is_file() and load_yaml_config(path).get("experiment", {}).get("active", True) is not False
+    ]
     if not paths:
-        raise FileNotFoundError(f"No E*.yaml configs found under {config_dir}")
+        raise FileNotFoundError(f"No active E*.yaml configs found under {config_dir}")
     return paths
 
 

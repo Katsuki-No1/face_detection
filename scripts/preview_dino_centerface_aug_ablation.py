@@ -45,7 +45,11 @@ def config_paths(args: argparse.Namespace) -> list[Path]:
     if args.config:
         return [args.config]
     if args.config_dir:
-        return sorted(path for path in args.config_dir.glob("E*.yaml") if path.is_file())
+        return [
+            path
+            for path in sorted(args.config_dir.glob("E*.yaml"))
+            if path.is_file() and load_yaml_config(path).get("experiment", {}).get("active", True) is not False
+        ]
     raise ValueError("--config or --config-dir is required")
 
 

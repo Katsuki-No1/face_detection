@@ -15,5 +15,5 @@ augmentation:
   brightness: 0.25
   contrast: 0.25
   gamma: 0.20
-  blur: 0.05
+  blur: 0.0  # Blur is evaluated separately by E9_blur_medium.
   noise: 0.03

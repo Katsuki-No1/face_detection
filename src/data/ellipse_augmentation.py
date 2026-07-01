@@ -51,6 +51,21 @@ def _image_to_tensor(image: Image.Image) -> torch.Tensor:
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
+def _blur_radius_range(cfg: Mapping[str, Any]) -> tuple[float, float]:
+    radius = cfg.get("blur_radius")
+    if isinstance(radius, (list, tuple)) and len(radius) == 2:
+        low = float(radius[0])
+        high = float(radius[1])
+    elif radius is not None:
+        low = high = float(radius)
+    else:
+        low = float(cfg.get("blur_radius_min", 0.1) or 0.1)
+        high = float(cfg.get("blur_radius_max", 1.5) or 1.5)
+    low = max(0.0, low)
+    high = max(low, high)
+    return low, high
+
+
 def _clone_target(target: Mapping[str, Any]) -> dict[str, Any]:
     cloned: dict[str, Any] = {}
     for key, value in target.items():
@@ -484,7 +499,8 @@ def apply_photometric(
     if contrast > 0:
         image = ImageEnhance.Contrast(image).enhance(rng.uniform(1.0 - contrast, 1.0 + contrast))
     if blur > 0 and rng.random() < blur:
-        image = image.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.1, 1.5)))
+        blur_radius_min, blur_radius_max = _blur_radius_range(cfg)
+        image = image.filter(ImageFilter.GaussianBlur(radius=rng.uniform(blur_radius_min, blur_radius_max)))
 
     array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
     if hsv_h > 0 or hsv_s > 0 or hsv_v > 0:
