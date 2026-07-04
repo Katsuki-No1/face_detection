@@ -101,7 +101,7 @@ def profile_dir(args: argparse.Namespace) -> Path:
 def train_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
     command = [
         sys.executable,
-        "scripts/train_dino_scrfd_face.py",
+        "scripts/train_dino.py",
         "--config",
         str(args.config),
         "--output-dir",

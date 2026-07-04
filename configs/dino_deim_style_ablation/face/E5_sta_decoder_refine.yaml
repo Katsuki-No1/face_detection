@@ -1,0 +1,19 @@
+extends: E4_mal.yaml
+
+experiment:
+  active: true
+  name: E5_dino_deim_style_face_sta_decoder_refine
+  description: E4 plus DEIMv2-style STA/decoder refinement toggles. This is the strongest experimental variant.
+
+model:
+  adapter:
+    refine_layers: 2
+    cross_scale_fusion: true
+  decoder:
+    num_queries: 150
+    num_layers: 4
+    refine_boxes: true
+    box_refine_steps: 2
+
+train:
+  name: E5_dino_deim_style_face_sta_decoder_refine

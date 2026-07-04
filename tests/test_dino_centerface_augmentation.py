@@ -9,6 +9,7 @@ from src.data import SyntheticFaceKeypointDataset, ellipse_params_to_xyxy
 from src.data.ellipse_augmentation import (
     AugmentedFaceKeypointDataset,
     apply_horizontal_flip,
+    apply_mixup,
     apply_mosaic,
     apply_photometric,
 )
@@ -55,6 +56,14 @@ class DinoCenterFaceAugmentationTest(unittest.TestCase):
         self.assertTrue(bool((centers[:, 0] <= 56).all()))
         self.assertTrue(bool((centers[:, 1] >= 0).all()))
         self.assertTrue(bool((centers[:, 1] <= 56).all()))
+
+    def test_mixup_concatenates_instances(self) -> None:
+        dataset = SyntheticFaceKeypointDataset(length=1, image_size=56, positive=True)
+        image, target = apply_mixup(dataset[0], dataset[0], rng=random.Random(0))
+        self.assertEqual(tuple(image.shape), (3, 56, 56))
+        self.assertEqual(tuple(target["boxes"].shape), (2, 4))
+        self.assertEqual(tuple(target["ellipses"].shape), (2, 5))
+        self.assertIn("mixup_lambda", target["metadata"])
 
     def test_geometry_augmented_sample_assigns_positive_heatmap(self) -> None:
         base = SyntheticFaceKeypointDataset(length=4, image_size=56, positive=True)

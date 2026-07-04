@@ -361,6 +361,7 @@ class FaceKeypointDataset(Dataset):
         metadata_path: str | Path | None = None,
         image_size: int | tuple[int, int] | None = None,
         include_negative: bool = True,
+        category_ids: list[int] | tuple[int, ...] | None = None,
     ) -> None:
         self.data_root = Path(data_root) if data_root else None
         self.split = split
@@ -369,6 +370,7 @@ class FaceKeypointDataset(Dataset):
         self.image_root = Path(image_root) if image_root else None
         self.image_size = image_size
         self.include_negative = bool(include_negative)
+        self.category_ids = {int(value) for value in category_ids} if category_ids is not None else None
         self.samples = self._build_samples(metadata_path)
 
     def _build_samples(self, metadata_path: str | Path | None) -> list[dict[str, Any]]:
@@ -410,6 +412,8 @@ class FaceKeypointDataset(Dataset):
         images = {int(item["id"]): item for item in data.get("images", [])}
         annotations_by_image: dict[int, list[dict[str, Any]]] = {image_id: [] for image_id in images}
         for annotation in data.get("annotations", []):
+            if self.category_ids is not None and int(annotation.get("category_id", -1)) not in self.category_ids:
+                continue
             annotations_by_image.setdefault(int(annotation["image_id"]), []).append(annotation)
         samples = []
         for image_id, image in images.items():

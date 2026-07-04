@@ -57,7 +57,7 @@ def command_row(path: Path, args: argparse.Namespace) -> dict[str, Any]:
     eval_dir = args.eval_root / name
     train_cmd = [
         sys.executable,
-        "scripts/train_dino_scrfd_face.py",
+        "scripts/train_dino.py",
         "--config",
         str(path),
         "--output-dir",
@@ -67,7 +67,7 @@ def command_row(path: Path, args: argparse.Namespace) -> dict[str, Any]:
     ]
     dry_run_cmd = [
         sys.executable,
-        "scripts/train_dino_scrfd_face.py",
+        "scripts/train_dino.py",
         "--config",
         str(path),
         "--dry-run",

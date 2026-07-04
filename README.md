@@ -210,7 +210,7 @@ CUDA_VISIBLE_DEVICES= .venv/bin/python scripts/visualize_dinov3_crop_patch_cpu.p
 
 ### DINO detector 学習高速化の Priority B
 
-`scripts/train_dino_scrfd_face.py` は、DINO-SCRFD 系と DINO-CenterFace ellipse 系の学習を同じ入口で扱います。学習は GPU 前提です。`--device cpu` を指定した full training は拒否されます。
+`scripts/train_dino.py` は、DINO-SCRFD 系、DINO-CenterFace ellipse 系、DINO-DEIM-style 系の学習を同じ入口で扱います。学習は GPU 前提です。`--device cpu` を指定した full training は拒否されます。
 
 Priority A として、AMP/TF32、DataLoader の `num_workers`、`persistent_workers`、`prefetch_factor`、batch size 調整、validation 頻度見直しを先に確認します。Priority B は条件付きで次を使います。
 
@@ -218,6 +218,73 @@ Priority A として、AMP/TF32、DataLoader の `num_workers`、`persistent_wor
 - `torch.compile`: DINO backbone ではなく、学習対象の `adapter`、`fpn`、`head` だけを compile します。shape が安定し、複数 epoch 回す実験で効果を見ます。
 - `feature_cache`: frozen DINO backbone の出力を `.pt` として保存し、以降は backbone forward を省略します。train-time augmentation、progressive resizing、backbone fine-tune とは同時に使いません。
 - `progressive_resizing`: 序盤を小さい画像サイズで回し、warmup 中に最終サイズへ近づけます。feature cache とは同時に使いません。
+
+### DINO-DEIM-style bbox detector
+
+CenterFace-style head より強い DINO 主体の bbox detector を比較するため、
+DEIMv2 / RT-DETR に inspired された実験用 detector を追加しています。完全な
+DEIMv2 再現ではありません。
+
+この実装の目的は、DINOv3 を特徴抽出 backbone として使った場合に、
+`head` / `face` の bbox 検出性能を stage ごとに改善できるかを検証することです。
+特に HFDP の流れである `image -> head detection -> head crop -> face detection -> face crop -> keypoint detection`
+のうち、今回の DINO-DEIM-style は `head detection` と `face detection` の bbox detector を担当します。
+keypoint 検出はこのモデルには含めず、既存の RTMPose などの下流 keypoint detector が担当します。
+
+現在の結果は検証中です。E1〜E5 の smoke test では forward / loss 計算と
+Dense O2O-style positive 増加が動作することを確認していますが、実データでの bbox 精度、
+HFDP/GTHFDP に組み込んだ keypoint 指標、RTMDet 系 baseline との優劣はまだ確定していません。
+そのため、この節の内容は「実装済みの実験条件」と「これから比較する仮説」を示すものであり、
+性能改善を保証する結果ではありません。
+
+```text
+DINO backbone
+  -> Spatial Tuning Adapter風 multi-scale adapter
+  -> lightweight hybrid encoder
+  -> DETR-style decoder
+  -> bbox prediction
+```
+
+設定ファイルは次です。
+
+```text
+configs/dino_deim_style_head.yaml
+configs/dino_deim_style_face.yaml
+configs/dino_deim_style_ablation/head/E1_baseline.yaml
+configs/dino_deim_style_ablation/head/E2_stronger_aug.yaml
+configs/dino_deim_style_ablation/head/E3_dense_o2o.yaml
+configs/dino_deim_style_ablation/head/E4_mal.yaml
+configs/dino_deim_style_ablation/head/E5_sta_decoder_refine.yaml
+configs/dino_deim_style_ablation/face/E1_baseline.yaml
+configs/dino_deim_style_ablation/face/E2_stronger_aug.yaml
+configs/dino_deim_style_ablation/face/E3_dense_o2o.yaml
+configs/dino_deim_style_ablation/face/E4_mal.yaml
+configs/dino_deim_style_ablation/face/E5_sta_decoder_refine.yaml
+```
+
+E1〜E5 は次の段階比較です。
+
+```text
+E1: DINO + adapter + RT-DETR-style detector
+E2: E1 + stronger augmentation
+E3: E2 + Dense O2O-style extra positives
+E4: E3 + MAL-style quality-aware matching loss
+E5: E4 + STA/decoder refinement style toggles
+```
+
+一括実験のコマンド表は次で生成します。デフォルトでは実学習は走らず、manifest だけを書きます。
+
+```bash
+.venv/bin/python scripts/run_dino_deim_style_ablation.py --target face
+
+.venv/bin/python scripts/run_dino_deim_style_ablation.py \
+  --target all \
+  --execute \
+  --allow-training \
+  --device cuda:0
+```
+
+詳細は `docs/dino_deim_style_detector.md` を参照してください。
 
 config では次の項目で管理します。
 
@@ -635,6 +702,34 @@ keypoint については、現時点では RTMDet + RTMPose-face が YOLO11s Pos
 | modified_100 | 560 | 0.42 | 0.8367 | 0.7460 | 0.0324 | 0.8378 | 0.9414 |
 
 RTMDet 側では `modified_100` が detector F1 と face recall を改善しています。一方で、keypoint 品質は `modified_50` が最もよく、追加データを増やすだけでは RTMPose の精度が単調に上がるわけではありません。RTMPose の fixed-100 same-condition 比較は `output_experiment/learning_curves_fixed100_compare/` にあり、同一 trajectory 内では epoch100 / best92 が epoch20 / epoch50 より良いものの、learning rate schedule の見直し余地が残っています。
+
+### RTMDet + RTMPose の stage 数比較
+
+2026-07-04 に、DINO 系ではなく RTMDet / RTMPose 系のモデルで FDP 系列の stage 数比較を行いました。backbone は RTMDet / RTMPose の CSPNeXt 系であり、DINOv3 backbone はこの比較には含めていません。
+
+比較した構成は次の通りです。
+
+| alias | stage | pipeline |
+| --- | --- | --- |
+| FDP | 1stage | image -> RTMDet-HF(face on full image) -> RTMPose(face) |
+| HDP | 2stage | image -> RTMDet-HF(head on full image) -> head crop -> RTMPose(head) |
+| GTFP | 2stage_GT | GT face bbox -> RTMPose(face) |
+| HFDP | 3stage | image -> RTMDet-HF(head on full image) -> head crop -> RTMDet-headcrop-face(face on crop) -> RTMPose(face) |
+| GTHFDP | 3stage_GT | GT head bbox -> head crop -> RTMDet-headcrop-face(face on crop) -> RTMPose(face) |
+
+test split は 30 画像、63 face instances です。今回の主比較では、1stage の `FDP` より、head crop を挟んで face detection と keypoint 推定を行う 3stage の `HFDP` の方が keypoint 精度は改善しました。
+
+| stage | NME | PCK@0.05 | PCK@0.10 | missed |
+| --- | ---: | ---: | ---: | ---: |
+| FDP | 0.0489 | 0.8209 | 0.9005 | 20 |
+| HDP | 0.0563 | 0.8390 | 0.9195 | 9 |
+| GTFP | 0.0702 | 0.7148 | 0.8242 | 0 |
+| HFDP | 0.0458 | 0.8482 | 0.9215 | 23 |
+| GTHFDP | 0.0574 | 0.7982 | 0.8807 | 14 |
+
+`HFDP` は `FDP` に対して NME が `0.0489 -> 0.0458` に下がり、PCK@0.05 が `0.8209 -> 0.8482` に上がりました。したがって、今回の RTMDet 系条件では stage を分け、head 検出から head crop 内の face 検出へ進む構成が keypoint の位置精度に有効でした。一方で missed instances は `20 -> 23` に増えているため、head 検出または crop 内 face 検出で落ちるケースの改善はまだ必要です。
+
+今回の結果、checkpoint、学習曲線、推論時間は `outsput/experience/reports/rtm_hfdp_20260704_170447_summary.md`、学習曲線は `outsput/experience/reports/curves_rtm_hfdp_20260704_170447/` に保存しています。次の検証では、同じ FDP / HDP / GTFP / HFDP / GTHFDP の stage 比較を DINO 系モデルでも行い、RTMDet / RTMPose 系で得られた stage 分割の効果が DINO backbone でも再現するかを確認します。
 
 ### データ監査と追加データセット
 

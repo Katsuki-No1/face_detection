@@ -23,6 +23,7 @@ def has_active_augmentation(config: Mapping[str, Any] | None) -> bool:
         return False
     numeric_keys = (
         "mosaic",
+        "mixup",
         "degrees",
         "translate",
         "scale",
@@ -187,6 +188,36 @@ def apply_mosaic(
         )
     image_id = "mosaic__" + "__".join(str(target.get("image_id", index)) for index, (_image, target) in enumerate(samples))
     return _image_to_tensor(canvas), _concat_targets(transformed_targets, image_id=image_id, height=height, width=width)
+
+
+def apply_mixup(
+    first: tuple[torch.Tensor, Mapping[str, Any]],
+    second: tuple[torch.Tensor, Mapping[str, Any]],
+    *,
+    alpha: float = 0.2,
+    rng: random.Random | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Blend two same-size training images and concatenate detection targets."""
+
+    rng = rng or random.Random()
+    image_a, target_a = first
+    image_b, target_b = second
+    if tuple(image_a.shape) != tuple(image_b.shape):
+        raise ValueError(f"mixup images must have the same shape, got {tuple(image_a.shape)} and {tuple(image_b.shape)}")
+    alpha = max(1e-3, float(alpha))
+    lam = rng.betavariate(alpha, alpha)
+    mixed_image = (image_a * lam + image_b * (1.0 - lam)).clamp(0.0, 1.0)
+    height, width = int(image_a.shape[-2]), int(image_a.shape[-1])
+    target = _concat_targets(
+        [target_a, target_b],
+        image_id=f"mixup__{target_a.get('image_id', 'a')}__{target_b.get('image_id', 'b')}",
+        height=height,
+        width=width,
+    )
+    metadata = dict(target.get("metadata", {}) if isinstance(target.get("metadata"), Mapping) else {})
+    metadata["mixup_lambda"] = float(lam)
+    target["metadata"] = metadata
+    return mixed_image, target
 
 
 def _homography_from_points(source: np.ndarray, destination: np.ndarray) -> np.ndarray:
@@ -536,6 +567,7 @@ class AugmentedFaceKeypointDataset(Dataset):
         self.epoch = 1
         self.total_epochs: int | None = None
         self.mosaic_enabled = bool(float(self.augmentation.get("mosaic", 0.0) or 0.0) > 0.0)
+        self.mixup_enabled = bool(float(self.augmentation.get("mixup", 0.0) or 0.0) > 0.0)
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -565,6 +597,15 @@ class AugmentedFaceKeypointDataset(Dataset):
             extra_indices = [rng.randrange(len(self.base_dataset)) for _ in range(3)]
             samples = [(image, target)] + [self.base_dataset[item] for item in extra_indices]
             image, target = apply_mosaic(samples, rng=rng)
+
+        if self.mixup_enabled and rng.random() < float(self.augmentation.get("mixup", 0.0) or 0.0) and len(self.base_dataset) >= 2:
+            other = self.base_dataset[rng.randrange(len(self.base_dataset))]
+            image, target = apply_mixup(
+                (image, target),
+                other,
+                alpha=float(self.augmentation.get("mixup_alpha", 0.2) or 0.2),
+                rng=rng,
+            )
 
         geometry_keys = ("degrees", "translate", "scale", "shear", "perspective")
         if any(float(self.augmentation.get(key, 0.0) or 0.0) > 0.0 for key in geometry_keys):

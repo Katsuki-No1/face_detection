@@ -1,0 +1,18 @@
+extends: ../../dino_deim_style_face.yaml
+
+experiment:
+  active: true
+  name: E1_dino_deim_style_face_baseline
+  description: DINO + adapter + RT-DETR-style detector with standard Hungarian matching and cls/L1/GIoU loss.
+
+train:
+  name: E1_dino_deim_style_face_baseline
+
+loss:
+  dense_o2o:
+    enabled: false
+  mal:
+    enabled: false
+
+augmentation:
+  enabled: false

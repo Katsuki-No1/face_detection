@@ -1,0 +1,17 @@
+extends: E2_stronger_aug.yaml
+
+experiment:
+  active: true
+  name: E3_dino_deim_style_face_dense_o2o
+  description: E2 plus Dense O2O-style extra positive query-target matches.
+
+train:
+  name: E3_dino_deim_style_face_dense_o2o
+
+loss:
+  dense_o2o:
+    enabled: true
+    extra_matches_per_gt: 2
+    min_iou: 0.0
+  mal:
+    enabled: false

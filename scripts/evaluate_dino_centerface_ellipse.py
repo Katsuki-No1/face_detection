@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-visualizations", type=int, default=30)
     parser.add_argument("--max-samples", type=int, default=0, help="Limit evaluated samples for smoke/debug runs.")
+    parser.add_argument(
+        "--save-input-overlays",
+        action="store_true",
+        help="Also save overlays in the resized model-input coordinate space.",
+    )
     return parser.parse_args()
 
 
@@ -369,27 +374,57 @@ def evaluate_threshold(rows: list[dict[str, Any]], threshold: float, iou_thresho
     return metrics
 
 
-def draw_overlay(image: Image.Image, row: dict[str, Any], threshold: float) -> Image.Image:
+def scale_box(box: list[float], scale_x: float, scale_y: float) -> tuple[float, float, float, float]:
+    return (
+        float(box[0]) * scale_x,
+        float(box[1]) * scale_y,
+        float(box[2]) * scale_x,
+        float(box[3]) * scale_y,
+    )
+
+
+def scale_polygon(points: list[tuple[float, float]], scale_x: float, scale_y: float) -> list[tuple[float, float]]:
+    return [(float(x) * scale_x, float(y) * scale_y) for x, y in points]
+
+
+def draw_overlay(
+    image: Image.Image,
+    row: dict[str, Any],
+    threshold: float,
+    *,
+    coordinate_scale: tuple[float, float] = (1.0, 1.0),
+) -> Image.Image:
     image = image.convert("RGB")
     draw = ImageDraw.Draw(image)
+    scale_x, scale_y = coordinate_scale
     for gt_index, gt in enumerate(row["ground_truth"]):
-        draw.line(ellipse_polygon(gt["ellipse"]) + [ellipse_polygon(gt["ellipse"])[0]], fill=(0, 220, 0), width=2)
-        x1, y1, x2, y2 = gt["bbox"]
+        polygon = scale_polygon(ellipse_polygon(gt["ellipse"]), scale_x, scale_y)
+        draw.line(polygon + [polygon[0]], fill=(0, 220, 0), width=2)
+        x1, y1, x2, y2 = scale_box(gt["bbox"], scale_x, scale_y)
         draw.rectangle((x1, y1, x2, y2), outline=(0, 170, 0), width=1)
         draw.text((x1, max(0, y1 - 12)), f"GT {gt_index}", fill=(0, 220, 0))
     for pred_index, prediction in enumerate([item for item in row["predictions"] if item["score"] >= threshold]):
         color = (255, 0, 0)
         if prediction.get("ellipse"):
-            polygon = ellipse_polygon(prediction["ellipse"])
+            polygon = scale_polygon(ellipse_polygon(prediction["ellipse"]), scale_x, scale_y)
             draw.line(polygon + [polygon[0]], fill=color, width=2)
-        x1, y1, x2, y2 = prediction["bbox"]
+        x1, y1, x2, y2 = scale_box(prediction["bbox"], scale_x, scale_y)
         draw.rectangle((x1, y1, x2, y2), outline=(255, 180, 0), width=1)
         for point in prediction.get("keypoints", []):
-            x = float(point["x"])
-            y = float(point["y"])
+            x = float(point["x"]) * scale_x
+            y = float(point["y"]) * scale_y
             draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(255, 255, 0))
         draw.text((x1, y2 + 2), f"P {pred_index} {prediction['score']:.2f}", fill=color)
     return image
+
+
+def original_overlay_image(row: dict[str, Any]) -> tuple[Image.Image, tuple[float, float]]:
+    image_path = Path(row["image_path"])
+    image = Image.open(image_path).convert("RGB")
+    input_h, input_w = row["input_size"]
+    scale_x = image.width / max(1.0, float(input_w))
+    scale_y = image.height / max(1.0, float(input_h))
+    return image, (scale_x, scale_y)
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -430,9 +465,10 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     prediction_rows: list[dict[str, Any]] = []
-    for image_tensor, targets in loader:
+    for sample_index, (image_tensor, targets) in enumerate(loader):
         if args.max_samples > 0 and len(rows) >= args.max_samples:
             break
+        sample = dataset.samples[sample_index]
         image_tensor = image_tensor.to(args.device)
         with torch.no_grad():
             detections = model(image_tensor)[0]
@@ -442,6 +478,9 @@ def main() -> int:
             "ground_truth": target_to_ground_truth(target, image_tensor[0].detach().cpu()),
             "predictions": detections_to_predictions(detections),
             "image_tensor": image_tensor[0].detach().cpu(),
+            "image_path": str(sample["image_path"]),
+            "orig_size": tuple(int(value) for value in target.get("orig_size", image_tensor.shape[-2:])),
+            "input_size": tuple(int(value) for value in image_tensor.shape[-2:]),
         }
         rows.append(row)
         for prediction in row["predictions"]:
@@ -493,8 +532,23 @@ def main() -> int:
     for index, row in enumerate(rows[: args.max_visualizations]):
         overlay_path = args.output_dir / "overlays" / f"{index:03d}_{safe_name(row['image_id'])}.jpg"
         overlay_path.parent.mkdir(parents=True, exist_ok=True)
-        draw_overlay(tensor_to_pil(row["image_tensor"]), row, float(best["threshold"])).save(overlay_path)
-        overlay_rows.append({"image_id": row["image_id"], "overlay": str(overlay_path), "gt": len(row["ground_truth"])})
+        original_image, coordinate_scale = original_overlay_image(row)
+        draw_overlay(original_image, row, float(best["threshold"]), coordinate_scale=coordinate_scale).save(overlay_path)
+        overlay_row = {
+            "image_id": row["image_id"],
+            "overlay": str(overlay_path),
+            "image_path": row["image_path"],
+            "gt": len(row["ground_truth"]),
+            "overlay_coordinate_space": "original_image",
+            "input_size": json.dumps(row["input_size"]),
+            "orig_size": json.dumps(row["orig_size"]),
+        }
+        if args.save_input_overlays:
+            input_overlay_path = args.output_dir / "overlays_input_896" / f"{index:03d}_{safe_name(row['image_id'])}.jpg"
+            input_overlay_path.parent.mkdir(parents=True, exist_ok=True)
+            draw_overlay(tensor_to_pil(row["image_tensor"]), row, float(best["threshold"])).save(input_overlay_path)
+            overlay_row["input_overlay"] = str(input_overlay_path)
+        overlay_rows.append(overlay_row)
     write_csv(args.output_dir / "visualization_index.csv", overlay_rows)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

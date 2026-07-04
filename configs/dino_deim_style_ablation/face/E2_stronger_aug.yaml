@@ -1,0 +1,30 @@
+extends: E1_baseline.yaml
+
+experiment:
+  active: true
+  name: E2_dino_deim_style_face_stronger_aug
+  description: E1 plus controlled mosaic/mixup and moderate geometry/photometric augmentation.
+
+train:
+  name: E2_dino_deim_style_face_stronger_aug
+  feature_cache:
+    enabled: false
+
+augmentation:
+  enabled: true
+  mosaic: 0.30
+  mixup: 0.15
+  mixup_alpha: 0.20
+  close_mosaic: 10
+  degrees: 8.0
+  translate: 0.05
+  scale: 0.15
+  shear: 1.0
+  perspective: 0.0
+  fliplr: 0.5
+  brightness: 0.15
+  contrast: 0.15
+  blur: 0.10
+  blur_radius_min: 0.1
+  blur_radius_max: 1.2
+  noise: 0.01

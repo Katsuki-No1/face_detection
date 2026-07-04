@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,72 @@ def image_to_tensor(image: Image.Image, image_size: int | None) -> tuple[torch.T
     return tensor, (orig_h, orig_w)
 
 
+def _ellipse_points(cx: float, cy: float, rx: float, ry: float, theta: float, *, steps: int = 96) -> np.ndarray:
+    angles = np.linspace(0.0, 2.0 * math.pi, steps, endpoint=False)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    xs = rx * np.cos(angles)
+    ys = ry * np.sin(angles)
+    return np.stack([cx + xs * cos_t - ys * sin_t, cy + xs * sin_t + ys * cos_t], axis=1)
+
+
+def _ellipse_from_points(points: np.ndarray) -> list[float]:
+    center = points.mean(axis=0)
+    centered = points - center[None, :]
+    covariance = centered.T @ centered / max(1, points.shape[0])
+    values, vectors = np.linalg.eigh(covariance)
+    order = np.argsort(values)[::-1]
+    values = np.clip(values[order], 1e-9, None)
+    vectors = vectors[:, order]
+    radii = np.sqrt(values * 2.0)
+    theta = math.atan2(float(vectors[1, 0]), float(vectors[0, 0]))
+    return [float(center[0]), float(center[1]), float(radii[0]), float(radii[1]), theta]
+
+
+def _scale_ellipses(ellipses: torch.Tensor, scale_x: float, scale_y: float) -> torch.Tensor:
+    if ellipses.numel() == 0:
+        return ellipses.clone()
+    scaled = []
+    for ellipse in ellipses.detach().cpu().tolist():
+        cx, cy, rx, ry, theta = [float(value) for value in ellipse]
+        points = _ellipse_points(cx, cy, rx, ry, theta)
+        points[:, 0] *= scale_x
+        points[:, 1] *= scale_y
+        scaled.append(_ellipse_from_points(points))
+    return torch.as_tensor(scaled, dtype=ellipses.dtype, device=ellipses.device)
+
+
+def scale_detections_to_original(
+    detections: dict[str, torch.Tensor],
+    *,
+    input_hw: tuple[int, int],
+    original_hw: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    input_h, input_w = int(input_hw[0]), int(input_hw[1])
+    orig_h, orig_w = int(original_hw[0]), int(original_hw[1])
+    if input_h == orig_h and input_w == orig_w:
+        return {key: value.clone() if isinstance(value, torch.Tensor) else value for key, value in detections.items()}
+
+    scale_x = orig_w / float(input_w)
+    scale_y = orig_h / float(input_h)
+    scaled: dict[str, torch.Tensor] = {}
+    for key, value in detections.items():
+        if not isinstance(value, torch.Tensor):
+            scaled[key] = value
+            continue
+        updated = value.clone()
+        if key in {"boxes", "bboxes"} and updated.numel() > 0:
+            updated[:, 0::2] *= scale_x
+            updated[:, 1::2] *= scale_y
+        elif key == "keypoints" and updated.numel() > 0:
+            updated[..., 0] *= scale_x
+            updated[..., 1] *= scale_y
+        elif key == "ellipses" and updated.numel() > 0:
+            updated = _scale_ellipses(updated, scale_x, scale_y)
+        scaled[key] = updated
+    return scaled
+
+
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path | None) -> None:
     if checkpoint_path is None:
         return
@@ -73,7 +140,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path | None) -> Non
 
 
 def result_records(image_id: str, detections: dict[str, torch.Tensor]) -> list[dict[str, Any]]:
-    boxes = detections.get("bboxes", detections["boxes"]).detach().cpu()
+    boxes = detections["bboxes" if "bboxes" in detections else "boxes"].detach().cpu()
     scores = detections["scores"].detach().cpu()
     keypoints = detections["keypoints"].detach().cpu()
     ellipses = detections.get("ellipses")
@@ -148,9 +215,11 @@ def main() -> int:
         for path in image_paths(args.source, smoke_dummy=False):
             image = Image.open(path).convert("RGB")
             tensor, _orig_size = image_to_tensor(image, int(image_size) if image_size else None)
+            input_hw = (int(tensor.shape[-2]), int(tensor.shape[-1]))
             tensor = tensor.to(args.device)
             with torch.no_grad():
                 detections = model(tensor)[0]
+            detections = scale_detections_to_original(detections, input_hw=input_hw, original_hw=_orig_size)
             all_records.extend(result_records(path.name, detections))
             if args.save_overlay_dir is not None:
                 save_overlay(args.save_overlay_dir / path.name, image.copy(), detections)

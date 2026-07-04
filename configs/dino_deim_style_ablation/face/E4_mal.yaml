@@ -1,0 +1,16 @@
+extends: E3_dense_o2o.yaml
+
+experiment:
+  active: true
+  name: E4_dino_deim_style_face_mal
+  description: E3 plus MAL-style quality-aware positive loss weighting for low-quality matches.
+
+train:
+  name: E4_dino_deim_style_face_mal
+
+loss:
+  mal:
+    enabled: true
+    quality_power: 1.0
+    min_quality: 0.25
+    cls_quality_target: true

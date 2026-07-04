@@ -1,0 +1,105 @@
+experiment_name: dino_deim_style_head_v1
+
+model:
+  type: dino_deim_style
+  num_classes: 1
+  class_names: ["head"]
+  backbone:
+    name: dinov3_vitb16
+    patch_size: 16
+    embed_dim: 768
+    hub_repo: /home/katsuki/.cache/torch/hub/facebookresearch_dinov3_main
+    hub_model: dinov3_vitb16
+    hub_module: dinov3.hub.backbones
+    weights: /home/katsuki/projects/face_detection/script/script_model/DINO/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+    pretrained: false
+    freeze: true
+    unfreeze_last_n_blocks: 0
+    strict_weights: true
+    num_prefix_tokens: 0
+    token_key: x_norm_patchtokens
+    call_method: forward_features
+    allow_non_divisible: false
+  adapter:
+    type: spatial_tuning_adapter
+    hidden_dim: 256
+    out_scales: ["p3", "p4", "p5"]
+    norm: gn
+    activation: silu
+  encoder:
+    type: identity
+    num_layers: 0
+    num_heads: 8
+    hidden_dim: 256
+    dropout: 0.0
+  decoder:
+    num_queries: 100
+    num_layers: 3
+    num_heads: 8
+    hidden_dim: 256
+    dropout: 0.0
+  ellipse:
+    enabled: false
+
+loss:
+  cls_weight: 2.0
+  bbox_l1_weight: 5.0
+  giou_weight: 2.0
+  no_object_weight: 0.1
+  use_focal_loss: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+data:
+  format: coco
+  annotation_path: outputs_experiment/fdp_hfdp_cascade_ablation/data/mmdet_hf/train.json
+  image_root: outputs_experiment/fdp_hfdp_cascade_ablation/data/mmdet_hf
+  split: train
+  image_size: 960
+  include_negative: true
+  category_ids: [1]
+  synthetic_if_missing: false
+
+train:
+  name: dino_deim_style_head_v1
+  imgsz: 960
+  batch_size: 4
+  epochs: 100
+  lr_head: 1.0e-4
+  lr_backbone: 0.0
+  weight_decay: 0.0001
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  fused_optimizer: true
+  torch_compile:
+    enabled: false
+    mode: reduce-overhead
+    fullgraph: false
+    dynamic: false
+  feature_cache:
+    enabled: true
+    dtype: float16
+    reuse_existing: true
+  progressive_resizing:
+    enabled: false
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  device: cuda
+  output_root: runs/dino_deim_style
+
+inference:
+  score_thr: 0.3
+  use_nms: false
+  nms_iou_thr: 0.5
+  topk: 300
+  detections_per_image: 100
+
+output:
+  root: outputs_experiment
+  experiment_group: dino_deim_style
+
+augmentation:
+  enabled: false
