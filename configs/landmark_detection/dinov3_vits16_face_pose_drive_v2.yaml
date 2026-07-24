@@ -1,0 +1,182 @@
+schema_version: 1
+experiment_name: dinov3_vits16_face_landmarks_face_pose_drive_v2
+
+# A/B/C/D/E are evaluation conditions, not five separately trained models.
+# A/C share vitpose, B/D share query, and E uses query_refinement initialized
+# from query. All three heads use the same DINOv3 initialization and crop recipe.
+data:
+  dataset_version: face_pose_drive_v2
+  root: datasets/face_pose_drive_v2
+  annotations:
+    train: datasets/face_pose_drive_v2/annotations/rtmpose/person_keypoints_train.json
+    val: datasets/face_pose_drive_v2/annotations/rtmpose/person_keypoints_val.json
+    test: datasets/face_pose_drive_v2/annotations/rtmpose/person_keypoints_test.json
+  expected:
+    train:
+      images: 4235
+      annotations: 6542
+      usable_instances: 6126
+      sha256: ba59dba03c94361ece2ca4a59682bd52a9e25a272f9ab515e3f4b92c3a3c24cc
+    val:
+      images: 530
+      annotations: 784
+      usable_instances: 710
+      sha256: 10208048c607ce32daea2715a73920c32ef9ca432e7080b6b34496c047ddf2d6
+    test:
+      images: 530
+      annotations: 812
+      usable_instances: 755
+      sha256: 5e02ae76ac564f9bf4ee0cbecab623bba6f23ff790a5072a12cf13d6432e7894
+  category_ids: [1]
+  input_size: 256
+  # The source DEIMv2-L normalizes [0,1] RGB with these values before DINOv3.
+  # Applying them in the crop dataset preserves the trained backbone input domain.
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  augmentation:
+    scale_factor: 1.30
+    scale_jitter: 0.20
+    center_jitter: 0.08
+    rotation_deg: 20.0
+    horizontal_flip_probability: 0.50
+    brightness: 0.20
+    contrast: 0.20
+    saturation: 0.15
+    blur_probability: 0.10
+    blur_kernel_max: 5
+    occlusion_probability: 0.10
+    occlusion_area: [0.02, 0.12]
+  leakage_audit:
+    enabled: true
+    splits: [train, val, test]
+    fail_on_external_overlap: true
+  evaluation_sets:
+    v2_test:
+      root: datasets/face_pose_drive_v2
+      annotation: datasets/face_pose_drive_v2/annotations/rtmpose/person_keypoints_test.json
+      category_ids: [1]
+      sha256: 5e02ae76ac564f9bf4ee0cbecab623bba6f23ff790a5072a12cf13d6432e7894
+    external_v1_v2:
+      root: datasets/testdata_for_v1-2
+      annotation: datasets/testdata_for_v1-2/annotations/rtmpose/person_keypoints_test.json
+      category_ids: [1]
+      sha256: 98161a5a3e9ccaa18c34d24f5926b89aaba602b330cc8ab642b26a02bb703de6
+      must_be_disjoint_from_training: true
+
+model:
+  num_landmarks: 5
+  landmark_names: [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]
+  backbone:
+    name: dinov3_vits16
+    patch_size: 16
+    embed_dim: 384
+    hub_repo: models/source/dinov3
+    hub_model: dinov3_vits16
+    hub_module: dinov3.hub.backbones
+    pretrained: false
+    weights: null
+    freeze: false
+    num_prefix_tokens: 0
+    token_key: x_norm_patchtokens
+    call_method: forward_features
+    allow_non_divisible: false
+    initialize_from_deim_checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full/checkpoints/best_val_map.pt
+    strict_detector_initialization: true
+  variants:
+    vitpose:
+      hidden_channels: 256
+      deconv_layers: 2
+      deconv_kernel: 4
+      softargmax_temperature: 0.10
+    query:
+      dimension: 256
+      decoder_layers: 4
+      heads: 8
+      feedforward: 1024
+      dropout: 0.0
+      auxiliary_supervision: true
+    query_refinement:
+      dimension: 256
+      decoder_layers: 4
+      heads: 8
+      feedforward: 1024
+      dropout: 0.0
+      auxiliary_supervision: true
+      stages:
+        - {radius_in_feature_cells: 2.0, maximum_delta: 0.08, samples_per_axis: 3}
+        - {radius_in_feature_cells: 1.0, maximum_delta: 0.04, samples_per_axis: 3}
+
+detector:
+  name: deimv2_l_dinov3_vits16_unfreeze_face_pose_drive_v2
+  config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full.yaml
+  checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full/checkpoints/best_val_map.pt
+  image_size: 960
+  # Selected only on v2 validation: maximum recall while precision >= 0.90
+  # (P=0.9026, R=0.8750 at IoU 0.50). It is fixed for both test sets.
+  score_threshold: 0.33
+  maximum_detections: 100
+  matching_iou_threshold: 0.50
+
+loss:
+  heatmap_weight: 1.0
+  coordinate_weight: 2.0
+  visibility_weight: 0.10
+  auxiliary_weight: 0.50
+  refinement_auxiliary_weight: 0.75
+  heatmap_sigma: 1.5
+  wing_width: 0.10
+  wing_curvature: 0.02
+
+train:
+  production_mode: true
+  minimum_epochs: 100
+  epochs: 150
+  batch_size: 32
+  gradient_accumulation_steps: 2
+  fraction: 1.0
+  seed: 42
+  lr_backbone: 1.25e-5
+  lr_head: 5.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  warmup_epochs: 5
+  minimum_lr_ratio: 0.01
+  freeze_backbone_epochs: 5
+  max_grad_norm: 1.0
+  amp: true
+  tf32: true
+  fused_optimizer: true
+  num_workers: 8
+  prefetch_factor: 4
+  checkpoint_every: 5
+  # Keep the A-E architecture ablation on the same 150-epoch budget. Enabling
+  # warm-start would give E all of B's training plus another complete run and
+  # confound the measured refinement gain.
+  refinement_initialize_from_query: false
+  ema:
+    enabled: true
+    decay: 0.9998
+  early_stopping:
+    enabled: true
+    minimum_epoch: 100
+    patience: 25
+    min_delta: 0.0001
+
+evaluation:
+  default_sets: [v2_test, external_v1_v2]
+  batch_size: 64
+  num_workers: 8
+  attention_batches: 4
+  interference_batch_size: 8
+  interference_maximum_parameters: 2000000
+  save_predictions: true
+
+outputs:
+  root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2
+
+wandb:
+  enabled: true
+  entity: sato-waseda-university
+  project: face_detection
+  group: face_pose_drive_v2_landmark_heads
+  mode: online
