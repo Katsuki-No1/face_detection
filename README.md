@@ -886,6 +886,54 @@ E4 は、mosaic を弱めにするか中程度にするかを早めに判断す�
 
 現時点では、keypoint と recall を優先するなら `mosaic=0.4, close_mosaic=30` は有効候補です。一方で box mAP50-95 が下がるため、次は `mosaic=0.3` または `mosaic=0.4, close_mosaic=20` のように中間条件を確認するのが妥当です。combined 条件を試す場合は、E2 の photometric と E3 の geometry を基準にし、mosaic は E4 より少し弱める候補を残します。
 
+## DINOv3 face landmark A–E 学習・評価結果（2026-07-24）
+
+`face_pose_drive_v2`の5点顔ランドマークを用い、共通のDINOv3 ViT-S/16 backboneに
+ViTPose-style head、Landmark Query head、Landmark Query + coordinate-conditioned refinementを
+接続して比較しました。学習には6,126 instance、validationには710 instanceを使用し、
+各variantはvalidation NMEでcheckpointを選択しています。
+
+| variant | parameters | best epoch | validation NME |
+| --- | ---: | ---: | ---: |
+| ViTPose-style | 24,226,826 | 73 | 0.035038 |
+| Landmark Query | 26,180,233 | 82 | 0.024031 |
+| Landmark Query + refinement | 29,068,943 | 83 | **0.022516** |
+
+固定したv2 test 755 instanceのA–E評価結果は次のとおりです。NMEは低いほどよく、
+PCKは高いほどよい指標です。DEIM bbox条件のend-to-end PCKは、顔detectorの見逃しも失敗として
+含めています。
+
+| condition | input bbox | keypoint head | NME | PCK@0.05 | PCK@0.10 | coverage | end-to-end PCK@0.05 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| A | GT | ViTPose-style | 0.038335 | 0.858555 | 0.943792 | 1.000000 | 0.858555 |
+| B | GT | Landmark Query | 0.027286 | 0.890673 | 0.951822 | 1.000000 | 0.890673 |
+| C | DEIM予測 | ViTPose-style | 0.035600 | 0.874713 | 0.953755 | 0.941631 | 0.823657 |
+| D | DEIM予測 | Landmark Query | 0.024754 | 0.906855 | 0.960643 | 0.941631 | 0.853922 |
+| E | DEIM予測 | Query + refinement | **0.022853** | **0.918006** | **0.962283** | 0.941631 | **0.864422** |
+
+GT bboxを固定したA→Bでは、Query化によってNMEが`0.038335 → 0.027286`、
+PCK@0.05が`+0.032119`改善しました。実運用条件のC→DでもNMEが約30.5%低下し、
+PCK@0.05が`+0.032142`、end-to-end PCK@0.05が`+0.030266`改善しています。
+したがって、性能差の主因はViTPose-styleからLandmark Queryへの変更です。
+
+D→Eのrefinement追加では、NMEがさらに約7.7%低下し、PCK@0.05が`+0.011151`、
+end-to-end PCK@0.05が`+0.010500`改善しました。PCK@0.10の増加は`+0.001640`に留まるため、
+refinementは大きな失敗の回復よりも、すでに検出できているランドマークの精密な座標補正に
+主に寄与していると解釈します。
+
+別のexternal v1/v2 828 instanceでも順位は同じで、DEIM予測bbox条件のPCK@0.05は
+ViTPose-style `0.828514`、Landmark Query `0.869867`、Query + refinement `0.885194`でした。
+結論は`ViTPose-style < Landmark Query < Landmark Query + refinement`です。ただし、
+refinement modelはQuery modelより2,888,710 parameters多いため、その追加利益には
+refinement設計だけでなくmodel容量の増加も含まれます。
+
+機械可読な結果は
+`outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2/evaluation/v2_test/comparison.json`と
+`outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2/evaluation/external_v1_v2/comparison.json`、
+学習結果は同directoryの`training_summary.json`に保存しています。実験条件と指標定義は
+[`keypoint_comparison1/docs/dinov3_face_landmark_ablation.md`](keypoint_comparison1/docs/dinov3_face_landmark_ablation.md)
+を参照してください。
+
 ## Git に含めないもの
 
 次のファイルやディレクトリは、Git に含めない運用にしてください。
