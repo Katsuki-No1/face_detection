@@ -55,11 +55,13 @@ labels/
 *.zip
 
 # Model artifacts and weights
+checkpoint/
 checkpoints/
 weights/
 models/
 *.pt
 *.pth
+*.safetensors
 *.ckpt
 *.onnx
 *.engine

@@ -24,6 +24,7 @@ def has_active_augmentation(config: Mapping[str, Any] | None) -> bool:
     numeric_keys = (
         "mosaic",
         "mixup",
+        "ellipse_border_crop",
         "degrees",
         "translate",
         "scale",
@@ -328,6 +329,248 @@ def _ellipse_to_bbox(ellipse: list[float], width: int, height: int) -> tuple[lis
     return clipped, clipped != raw
 
 
+def _configured_range(
+    cfg: Mapping[str, Any],
+    key: str,
+    default: tuple[float, float],
+) -> tuple[float, float]:
+    value = cfg.get(key)
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        low, high = float(value[0]), float(value[1])
+    elif value is not None:
+        low = high = float(value)
+    else:
+        low, high = default
+    low = max(0.0, low)
+    high = max(low, high)
+    return low, high
+
+
+def _ellipse_border_crop_candidate(
+    ellipse: list[float],
+    *,
+    instance_index: int,
+    side: str,
+    mode: str,
+    margin_fraction: float,
+    width: int,
+    height: int,
+    min_crop_scale: float,
+) -> dict[str, Any] | None:
+    cx, cy, rx, ry, theta = [float(value) for value in ellipse]
+    cos_theta = math.cos(theta)
+    sin_theta = math.sin(theta)
+    extent_x = math.sqrt((rx * cos_theta) ** 2 + (ry * sin_theta) ** 2)
+    extent_y = math.sqrt((rx * sin_theta) ** 2 + (ry * cos_theta) ** 2)
+    if extent_x <= 0.0 or extent_y <= 0.0:
+        return None
+
+    if side in {"left", "right"}:
+        center = cx
+        extent = extent_x
+        primary_size = width
+        cross_center = cy
+        cross_size = height
+    else:
+        center = cy
+        extent = extent_y
+        primary_size = height
+        cross_center = cx
+        cross_size = width
+
+    if mode == "center":
+        boundary = center + margin_fraction * extent if side in {"left", "top"} else center - margin_fraction * extent
+    else:
+        boundary = (
+            center - extent + margin_fraction * extent
+            if side in {"left", "top"}
+            else center + extent - margin_fraction * extent
+        )
+
+    needs_greater_than_center = (mode == "center") == (side in {"left", "top"})
+    boundary_px = int(round(boundary))
+    if needs_greater_than_center:
+        boundary_px = max(boundary_px, math.floor(center) + 1)
+    else:
+        boundary_px = min(boundary_px, math.ceil(center) - 1)
+    if boundary_px <= 0 or boundary_px >= primary_size:
+        return None
+
+    if side in {"left", "top"}:
+        primary_start = boundary_px
+        primary_end = primary_size
+    else:
+        primary_start = 0
+        primary_end = boundary_px
+    primary_crop_size = primary_end - primary_start
+    crop_scale = primary_crop_size / float(primary_size)
+    if crop_scale < min_crop_scale:
+        return None
+
+    # Use the same relative crop in the cross-axis so resizing back to the
+    # training canvas is isotropic even for non-square input tensors.
+    cross_crop_size = max(2, min(cross_size, int(round(cross_size * crop_scale))))
+    cross_start = int(round(cross_center - cross_crop_size * 0.5))
+    cross_start = max(0, min(cross_size - cross_crop_size, cross_start))
+    cross_end = cross_start + cross_crop_size
+
+    if side in {"left", "right"}:
+        crop_xyxy = (primary_start, cross_start, primary_end, cross_end)
+    else:
+        crop_xyxy = (cross_start, primary_start, cross_end, primary_end)
+    x0, y0, x1, y1 = crop_xyxy
+    selected_center_x = cx - x0
+    selected_center_y = cy - y0
+    selected_center_outside = not (0.0 <= selected_center_x < x1 - x0 and 0.0 <= selected_center_y < y1 - y0)
+    raw_box = [cx - extent_x - x0, cy - extent_y - y0, cx + extent_x - x0, cy + extent_y - y0]
+    selected_contour_outside = raw_box[0] < 0.0 or raw_box[1] < 0.0 or raw_box[2] > x1 - x0 or raw_box[3] > y1 - y0
+    if not selected_contour_outside or selected_center_outside != (mode == "center"):
+        return None
+    if _ellipse_to_bbox([selected_center_x, selected_center_y, rx, ry, theta], x1 - x0, y1 - y0)[0] is None:
+        return None
+    return {
+        "instance_index": int(instance_index),
+        "mode": mode,
+        "side": side,
+        "margin_fraction": float(margin_fraction),
+        "crop_xyxy": crop_xyxy,
+        "crop_scale": float(crop_scale),
+    }
+
+
+def apply_ellipse_border_crop(
+    image_tensor: torch.Tensor,
+    target: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    *,
+    rng: random.Random,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Crop through a selected ellipse contour or center and retain its amodal target."""
+
+    count = _target_instance_count(target)
+    ellipses_value = target.get("ellipses")
+    if count == 0 or not isinstance(ellipses_value, torch.Tensor) or ellipses_value.numel() == 0:
+        return image_tensor, _clone_target(target)
+
+    height, width = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
+    selected = select_ellipse_border_crop(
+        ellipses_value,
+        cfg,
+        width=width,
+        height=height,
+        rng=rng,
+    )
+    if selected is None:
+        return image_tensor, _clone_target(target)
+
+    x0, y0, x1, y1 = selected["crop_xyxy"]
+    crop_width = x1 - x0
+    crop_height = y1 - y0
+    scale_x = width / float(crop_width)
+    scale_y = height / float(crop_height)
+    matrix = np.array(
+        [
+            [scale_x, 0.0, -x0 * scale_x],
+            [0.0, scale_y, -y0 * scale_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    image = _tensor_to_image(image_tensor)
+    cropped_image = image.crop((x0, y0, x1, y1)).resize((width, height), Image.BILINEAR)
+    transformed_target = transform_target_homography(
+        target,
+        matrix,
+        width=width,
+        height=height,
+        min_ellipse_radius=float(cfg.get("min_ellipse_radius", 2.0) or 2.0),
+        allow_outside_center=True,
+    )
+
+    source_ellipse = [float(value) for value in ellipses_value[selected["instance_index"]].detach().cpu().tolist()]
+    transformed_points = _apply_homography(_ellipse_points(*source_ellipse), matrix)
+    selected_ellipse = _ellipse_from_points(transformed_points)
+    tcx, tcy, trx, try_, ttheta = selected_ellipse
+    selected_box, _ = _ellipse_to_bbox([tcx, tcy, trx, try_, ttheta], width, height)
+    if selected_box is None:
+        return image_tensor, _clone_target(target)
+    center_outside = tcx < 0.0 or tcx >= float(width) or tcy < 0.0 or tcy >= float(height)
+    if center_outside != (selected["mode"] == "center"):
+        return image_tensor, _clone_target(target)
+
+    metadata = dict(
+        transformed_target.get("metadata", {})
+        if isinstance(transformed_target.get("metadata"), Mapping)
+        else {}
+    )
+    debug = dict(
+        metadata.get("augmentation_debug", {})
+        if isinstance(metadata.get("augmentation_debug"), Mapping)
+        else {}
+    )
+    debug["ellipse_border_crop"] = {
+        **selected,
+        "crop_xyxy": [int(x0), int(y0), int(x1), int(y1)],
+        "selected_ellipse": [float(value) for value in selected_ellipse],
+        "center_outside": bool(center_outside),
+        "contour_outside": True,
+    }
+    metadata["augmentation_debug"] = debug
+    transformed_target["metadata"] = metadata
+    return _image_to_tensor(cropped_image), transformed_target
+
+
+def select_ellipse_border_crop(
+    ellipses: torch.Tensor,
+    cfg: Mapping[str, Any],
+    *,
+    width: int,
+    height: int,
+    rng: random.Random,
+) -> dict[str, Any] | None:
+    """Select a crop guaranteed to put one ellipse contour or center outside."""
+
+    if ellipses.numel() == 0:
+        return None
+    min_crop_scale = min(0.99, max(0.05, float(cfg.get("ellipse_border_crop_min_scale", 0.50) or 0.50)))
+    center_probability = min(
+        1.0,
+        max(0.0, float(cfg.get("ellipse_border_crop_center_outside_probability", 0.50) or 0.0)),
+    )
+    mode = "center" if rng.random() < center_probability else "contour"
+    margin_key = (
+        "ellipse_border_crop_center_margin"
+        if mode == "center"
+        else "ellipse_border_crop_contour_margin"
+    )
+    default_margin = (0.02, 0.20) if mode == "center" else (0.10, 0.50)
+    margin_low, margin_high = _configured_range(cfg, margin_key, default_margin)
+
+    candidates: list[dict[str, Any]] = []
+    for instance_index, ellipse_tensor in enumerate(ellipses.detach().cpu()):
+        ellipse = [float(value) for value in ellipse_tensor.tolist()]
+        if not all(math.isfinite(value) for value in ellipse) or ellipse[2] <= 0.0 or ellipse[3] <= 0.0:
+            continue
+        if _ellipse_to_bbox(ellipse, width, height)[0] is None:
+            continue
+        for side in ("left", "right", "top", "bottom"):
+            candidate = _ellipse_border_crop_candidate(
+                ellipse,
+                instance_index=instance_index,
+                side=side,
+                mode=mode,
+                margin_fraction=rng.uniform(margin_low, margin_high),
+                width=width,
+                height=height,
+                min_crop_scale=min_crop_scale,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    if not candidates:
+        return None
+    return rng.choice(candidates)
+
+
 def transform_target_homography(
     target: Mapping[str, Any],
     matrix: np.ndarray,
@@ -335,6 +578,7 @@ def transform_target_homography(
     width: int,
     height: int,
     min_ellipse_radius: float = 2.0,
+    allow_outside_center: bool = False,
 ) -> dict[str, Any]:
     count = _target_instance_count(target)
     if count == 0:
@@ -366,10 +610,10 @@ def transform_target_homography(
         box, clipped = _ellipse_to_bbox([tcx, tcy, trx, try_, ttheta], width, height)
         if (
             box is None
-            or tcx < 0.0
-            or tcx >= float(width)
-            or tcy < 0.0
-            or tcy >= float(height)
+            or (
+                not allow_outside_center
+                and (tcx < 0.0 or tcx >= float(width) or tcy < 0.0 or tcy >= float(height))
+            )
             or trx < min_ellipse_radius
             or try_ < min_ellipse_radius
         ):
@@ -457,6 +701,10 @@ def apply_geometry(
         width=width,
         height=height,
         min_ellipse_radius=float(cfg.get("min_ellipse_radius", 2.0) or 2.0),
+        allow_outside_center=bool(
+            cfg.get("preserve_outside_ellipse_center", False)
+            or float(cfg.get("ellipse_border_crop", 0.0) or 0.0) > 0.0
+        ),
     )
     return _image_to_tensor(transformed_image), transformed_target
 
@@ -564,13 +812,34 @@ class AugmentedFaceKeypointDataset(Dataset):
         self.base_dataset = base_dataset
         self.augmentation = dict(augmentation or {})
         self.seed = int(seed)
-        self.epoch = 1
-        self.total_epochs: int | None = None
+        # DataLoader persistent workers keep their own Dataset object, so plain
+        # Python attributes changed by the parent process are not visible after
+        # the workers have started. Store schedule state in shared memory to
+        # keep per-epoch RNG and close_mosaic synchronized without respawning
+        # workers on every epoch.
+        self._epoch_state = torch.tensor([1, -1], dtype=torch.int64).share_memory_()
         self.mosaic_enabled = bool(float(self.augmentation.get("mosaic", 0.0) or 0.0) > 0.0)
         self.mixup_enabled = bool(float(self.augmentation.get("mixup", 0.0) or 0.0) > 0.0)
 
     def __len__(self) -> int:
         return len(self.base_dataset)
+
+    @property
+    def epoch(self) -> int:
+        return int(self._epoch_state[0].item())
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        self._epoch_state[0] = int(value)
+
+    @property
+    def total_epochs(self) -> int | None:
+        value = int(self._epoch_state[1].item())
+        return value if value >= 0 else None
+
+    @total_epochs.setter
+    def total_epochs(self, value: int | None) -> None:
+        self._epoch_state[1] = -1 if value is None else int(value)
 
     def set_epoch(self, epoch: int, total_epochs: int | None = None) -> None:
         self.epoch = int(epoch)
@@ -610,6 +879,10 @@ class AugmentedFaceKeypointDataset(Dataset):
         geometry_keys = ("degrees", "translate", "scale", "shear", "perspective")
         if any(float(self.augmentation.get(key, 0.0) or 0.0) > 0.0 for key in geometry_keys):
             image, target = apply_geometry(image, target, self.augmentation, rng=rng)
+
+        ellipse_border_crop = float(self.augmentation.get("ellipse_border_crop", 0.0) or 0.0)
+        if ellipse_border_crop > 0.0 and rng.random() < ellipse_border_crop:
+            image, target = apply_ellipse_border_crop(image, target, self.augmentation, rng=rng)
 
         fliplr = float(self.augmentation.get("fliplr", 0.0) or 0.0)
         if fliplr > 0.0 and rng.random() < fliplr:

@@ -165,6 +165,7 @@ def _tensor_target(
     *,
     boxes: list[list[float]],
     ellipses: list[list[float]] | None = None,
+    labels: list[int] | None = None,
     keypoints: list[list[list[float]]],
     keypoint_mask: list[list[bool]],
     image_id: str,
@@ -183,10 +184,16 @@ def _tensor_target(
     ellipse_tensor = torch.as_tensor(ellipse_values, dtype=torch.float32).reshape(box_tensor.shape[0], 5)
     kpt_tensor = torch.as_tensor(keypoints, dtype=torch.float32).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES), 2)
     mask_tensor = torch.as_tensor(keypoint_mask, dtype=torch.bool).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES))
+    if labels is None:
+        label_tensor = torch.ones((box_tensor.shape[0],), dtype=torch.long)
+    else:
+        label_tensor = torch.as_tensor(labels, dtype=torch.long).reshape(-1)
+        if label_tensor.numel() != box_tensor.shape[0]:
+            raise ValueError(f"labels length must match boxes: labels={label_tensor.numel()}, boxes={box_tensor.shape[0]}")
     return {
         "boxes": box_tensor,
         "ellipses": ellipse_tensor,
-        "labels": torch.ones((box_tensor.shape[0],), dtype=torch.long),
+        "labels": label_tensor,
         "keypoints": kpt_tensor,
         "keypoint_mask": mask_tensor,
         "image_id": str(image_id),
@@ -467,6 +474,8 @@ class FaceKeypointDataset(Dataset):
 
     def _target_from_coco_sample(self, sample: dict[str, Any], width: int, height: int) -> dict[str, Any]:
         boxes: list[list[float]] = []
+        ellipses: list[list[float]] = []
+        labels: list[int] = []
         keypoints: list[list[list[float]]] = []
         keypoint_mask: list[list[bool]] = []
         metadata = {"annotations": sample.get("annotations", [])}
@@ -478,6 +487,20 @@ class FaceKeypointDataset(Dataset):
             if clipped is None:
                 continue
             boxes.append(clipped)
+            raw_ellipse = annotation.get("ellipse")
+            if isinstance(raw_ellipse, (list, tuple)) and len(raw_ellipse) == 5:
+                values = [float(value) for value in raw_ellipse]
+                if not all(math.isfinite(value) for value in values) or values[2] <= 0.0 or values[3] <= 0.0:
+                    raise ValueError(
+                        f"Invalid ellipse in COCO annotation id={annotation.get('id')}: {raw_ellipse}"
+                    )
+                ellipses.append(values)
+            else:
+                x1, y1, x2, y2 = clipped
+                ellipses.append(
+                    [(x1 + x2) * 0.5, (y1 + y2) * 0.5, (x2 - x1) * 0.5, (y2 - y1) * 0.5, 0.0]
+                )
+            labels.append(int(annotation.get("category_id", 1)))
             raw = annotation.get("keypoints", [])
             sample_keypoints = []
             sample_mask = []
@@ -493,6 +516,8 @@ class FaceKeypointDataset(Dataset):
             keypoint_mask.append(sample_mask)
         return _tensor_target(
             boxes=boxes,
+            ellipses=ellipses,
+            labels=labels,
             keypoints=keypoints,
             keypoint_mask=keypoint_mask,
             image_id=str(sample["image_id"]),

@@ -1,0 +1,19 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_960_ellipse.yaml
+
+# Train the balanced 8:1:1 export independently from the public COCO
+# checkpoint. Do not initialize from a face checkpoint trained with the old
+# split because old-train images may now belong to validation or test.
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco
+
+model:
+  init_checkpoint:
+    path: checkpoint/DEIMv2/deimv2_dinov3_l_coco.safetensors
+    prefer_ema: false
+    skip_class_heads: true
+    verbose: true
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco
+
+verification:
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco_preflight

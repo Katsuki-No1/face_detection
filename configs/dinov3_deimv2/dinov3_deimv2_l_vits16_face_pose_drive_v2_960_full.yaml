@@ -1,0 +1,15 @@
+extends:
+  - dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml
+  - ../datasets/default_face_pose.yaml
+
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_full
+
+# Production continuation of the validated DEIMv2-L + real DINOv3 ViT-S/16
+# architecture. Dataset paths and contracts come from the repository-wide
+# configs/datasets/default_face_pose.yaml definition.
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_full
+
+verification:
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_full_preflight

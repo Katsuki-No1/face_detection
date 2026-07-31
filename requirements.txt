@@ -4,6 +4,9 @@ numpy>=1.26
 opencv-python>=4.9
 Pillow>=10.0
 PyYAML>=6.0
+safetensors>=0.4
+scipy>=1.11
 torch>=2.0
 torchvision>=0.15
 ultralytics>=8.3
+wandb==0.22.3

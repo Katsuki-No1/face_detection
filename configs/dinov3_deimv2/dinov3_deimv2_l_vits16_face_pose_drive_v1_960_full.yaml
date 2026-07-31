@@ -1,0 +1,226 @@
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full
+
+# Official DEIMv2-L architecture with the real DINOv3 ViT-S/16 backbone.
+# Task-level changes from COCO are limited to one face class, 960 px input,
+# the fixed 3,090-frame split, and the already validated face augmentation.
+model:
+  type: dinov3_deimv2
+  num_classes: 1
+  class_names: [face]
+  init_checkpoint:
+    path: checkpoint/DEIMv2/deimv2_dinov3_l_coco.safetensors
+    skip_class_heads: true
+    verbose: true
+  backbone:
+    type: official_dinov3_vits16
+    name: dinov3_vits16
+    patch_size: 16
+    embed_dim: 384
+    hub_repo: models/source/dinov3
+    hub_model: dinov3_vits16
+    hub_module: dinov3.hub.backbones
+    pretrained: false
+    weights: null
+    freeze: false
+    trainable_last_blocks: 0
+    strict_weights: false
+    num_prefix_tokens: 0
+    token_key: x_norm_patchtokens
+    call_method: forward_features
+    allow_non_divisible: false
+  adapter:
+    type: official_dinov3_sta
+    hidden_dim: 224
+    interaction_indexes: [5, 8, 11]
+    conv_inplane: 32
+    use_sta: true
+  encoder:
+    type: official_hybrid_encoder
+    in_channels: [224, 224, 224]
+    feat_strides: [8, 16, 32]
+    hidden_dim: 224
+    nhead: 8
+    dim_feedforward: 896
+    use_encoder_idx: [2]
+    num_encoder_layers: 1
+    depth_mult: 1.0
+    expansion: 1.0
+    version: deim
+    csp_type: csp2
+    fuse_op: sum
+  decoder:
+    type: official_deim_transformer
+    feat_channels: [224, 224, 224]
+    feat_strides: [8, 16, 32]
+    hidden_dim: 224
+    num_queries: 300
+    num_layers: 4
+    nhead: 8
+    dim_feedforward: 1792
+    num_denoising: 100
+    label_noise_ratio: 0.5
+    box_noise_scale: 1.0
+    num_levels: 3
+    num_points: [3, 6, 3]
+    reg_max: 32
+    reg_scale: 4.0
+    layer_scale: 1.0
+    eval_idx: -1
+    aux_loss: true
+    cross_attn_method: default
+    query_select_method: default
+    activation: silu
+    mlp_act: silu
+
+loss:
+  use_focal_loss: true
+  weight_dict: {loss_mal: 1.0, loss_bbox: 5.0, loss_giou: 2.0, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: [mal, boxes, local]
+  alpha: 0.75
+  gamma: 1.5
+  reg_max: 32
+  matcher:
+    weight_dict: {cost_class: 2.0, cost_bbox: 5.0, cost_giou: 2.0}
+    alpha: 0.25
+    gamma: 2.0
+    change_matcher: true
+    iou_order_alpha: 4.0
+    matcher_change_epoch: 50
+
+data:
+  format: coco
+  dataset_version: face_pose_drive_v1
+  data_root: datasets/face_pose_drive_v1
+  annotation_path: datasets/face_pose_drive_v1/train.json
+  image_root: datasets/face_pose_drive_v1
+  split: train
+  image_size: 960
+  include_negative: true
+  category_ids: [2]
+  synthetic_if_missing: false
+  leakage_audit:
+    enabled: true
+    splits: [train, val, test]
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full
+  production_mode: true
+  backbone_policy: full_unfreeze
+  minimum_epochs: 68
+  minimum_image_size: 960
+  imgsz: 960
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  epochs: 120
+  checkpoint_every: 5
+  seed: 0
+  lr: 5.0e-4
+  lr_head: 5.0e-4
+  lr_backbone: 1.25e-5
+  weight_decay: 1.25e-4
+  max_grad_norm: 0.1
+  scheduler: flat_cosine
+  warmup_epochs: 3
+  flat_epochs: 60
+  min_lr_ratio: 0.01
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  fused_optimizer: true
+  ema:
+    enabled: true
+    decay: 0.9999
+    warmups: 1000
+    start: 0
+  early_stopping:
+    enabled: true
+    monitor: val/mAP50_95
+    minimum_epoch: 68
+    patience_validations: 6
+    min_delta: 0.0005
+  param_groups:
+    - name: dinov3_decay
+      params: '^(?=.*backbone\.dino\.backbone)(?!.*(?:norm|bn|bias)).*$'
+      lr: 1.25e-5
+    - name: dinov3_no_decay
+      params: '^(?=.*backbone\.dino\.backbone)(?=.*(?:norm|bn|bias)).*$'
+      lr: 1.25e-5
+      weight_decay: 0.0
+    - name: deim_no_decay
+      params: '^(?=.*(?:backbone\.sta|backbone\.convs|backbone\.norms|encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.0
+  torch_compile:
+    enabled: false
+  feature_cache:
+    enabled: false
+  progressive_resizing:
+    enabled: false
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  device: cuda:0
+  output_root: outputs/experiments
+  validation:
+    enabled: true
+    every: 5
+    split: val
+    image_size: 960
+    fixed_threshold: 0.30
+    score_min: 0.001
+
+augmentation:
+  enabled: true
+  mosaic: 0.30
+  close_mosaic: 20
+  mixup: 0.0
+  mixup_alpha: 0.20
+  degrees: 10.0
+  translate: 0.08
+  scale: 0.30
+  shear: 2.0
+  perspective: 0.0005
+  fliplr: 0.5
+  hsv_h: 0.015
+  hsv_s: 0.50
+  hsv_v: 0.35
+  brightness: 0.25
+  contrast: 0.25
+  gamma: 0.20
+  blur: 0.20
+  blur_radius_min: 0.3
+  blur_radius_max: 1.5
+  noise: 0.03
+  min_ellipse_radius: 2.0
+
+inference:
+  score_thr: 0.001
+  remap_mscoco_category: false
+  topk: 300
+  detections_per_image: 100
+
+assets:
+  dinov3_source:
+    path: models/source/dinov3
+    repository: https://github.com/facebookresearch/dinov3.git
+    commit: 6876159a11b4df116f30f667f8c9888617df0751
+  deimv2_checkpoint:
+    path: checkpoint/DEIMv2/deimv2_dinov3_l_coco.safetensors
+    url: https://huggingface.co/Intellindust/DEIMv2_DINOv3_L_COCO/resolve/main/model.safetensors
+    sha256: c0d0f45fa62b785126db5b40f5530866fecaab2d340cea812d2ba5f0f5646163
+
+verification:
+  official_variant: DEIMv2-L
+  official_backbone: dinov3_vits16
+  backbone_policy: full_unfreeze
+  official_num_classes: 80
+  official_model_zoo_parameters: 32200000
+  reconstructed_official_80_class_parameters: 32551214
+  official_huggingface_state_numel: 32631627
+  parameter_relative_tolerance: 0.02
+  expected_images: {train: 2460, val: 300, test: 330}
+  expected_coco_sha256:
+    train: f783ba5bf9f0d5da672b4e34ce46767c2180676c0046dfbf894bf65aff52f423
+    val: c2755ce5291c0ee8fdd617c3886e7f8a2f1b2c76f162a91b61cd346708378bd6
+    test: cce68a5fef9c7c386cd208cb9a18b2b0fa1e8f54a96e8a5484ccd2adc25eb950
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full_preflight

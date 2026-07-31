@@ -61,6 +61,27 @@ class FaceKeypointDatasetTest(unittest.TestCase):
             self.assertEqual(target["metadata"]["ellipse_metadata"][0]["cx"], 50.0)
             self.assertEqual(len(target["metadata"]["head_boxes"]), 1)
 
+    def test_coco_detection_preserves_head_face_category_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_dir = root / "images" / "train"
+            image_dir.mkdir(parents=True)
+            Image.new("RGB", (100, 80)).save(image_dir / "sample.jpg")
+            annotation = {
+                "images": [{"id": 10, "file_name": "images/train/sample.jpg", "width": 100, "height": 80}],
+                "categories": [{"id": 1, "name": "head"}, {"id": 2, "name": "face"}],
+                "annotations": [
+                    {"id": 1, "image_id": 10, "category_id": 1, "bbox": [10, 15, 40, 30], "area": 1200},
+                    {"id": 2, "image_id": 10, "category_id": 2, "bbox": [20, 25, 20, 15], "area": 300},
+                ],
+            }
+            path = root / "annotations.json"
+            path.write_text(json.dumps(annotation), encoding="utf-8")
+            dataset = FaceKeypointDataset(annotation_path=path, annotation_format="coco", image_root=root, category_ids=[1, 2])
+            _image, target = dataset[0]
+            self.assertEqual(target["labels"].tolist(), [1, 2])
+            self.assertEqual(tuple(target["boxes"].shape), (2, 4))
+
     def test_rotated_ellipse_outer_bbox(self) -> None:
         box = ellipse_to_xyxy({"cx": 0.0, "cy": 0.0, "rx": 10.0, "ry": 20.0, "rotation": 90.0})
         self.assertAlmostEqual(box[0], -20.0, places=5)

@@ -3,15 +3,18 @@ import random
 from pathlib import Path
 
 import torch
+from torch.utils.data import DataLoader
 
 from src.config_utils import load_yaml_config
-from src.data import SyntheticFaceKeypointDataset, ellipse_params_to_xyxy
+from src.data import SyntheticFaceKeypointDataset, collate_face_keypoint_batch, ellipse_params_to_xyxy
 from src.data.ellipse_augmentation import (
     AugmentedFaceKeypointDataset,
+    apply_ellipse_border_crop,
     apply_horizontal_flip,
     apply_mixup,
     apply_mosaic,
     apply_photometric,
+    transform_target_homography,
 )
 from src.models.ellipse_target_assigner import CenterFaceEllipseTargetAssigner
 
@@ -34,6 +37,11 @@ def sample_target() -> dict:
 
 
 class DinoCenterFaceAugmentationTest(unittest.TestCase):
+    @staticmethod
+    def _first_batch_after_full_epoch(loader: DataLoader) -> tuple[torch.Tensor, list[dict]]:
+        batches = list(loader)
+        return batches[0]
+
     def test_flip_swaps_left_right_keypoints(self) -> None:
         image = torch.zeros((3, 56, 56), dtype=torch.float32)
         _flipped_image, target = apply_horizontal_flip(image, sample_target())
@@ -91,6 +99,82 @@ class DinoCenterFaceAugmentationTest(unittest.TestCase):
         self.assertGreaterEqual(int(assignments["positive_count"].item()), 1)
         self.assertGreater(float(assignments["center_targets"][0].max()), 0.0)
 
+    def test_homography_can_preserve_intersecting_outside_center(self) -> None:
+        target = sample_target()
+        matrix = torch.tensor(
+            [[1.0, 0.0, -25.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        ).numpy()
+
+        dropped = transform_target_homography(target, matrix, width=56, height=56)
+        preserved = transform_target_homography(
+            target,
+            matrix,
+            width=56,
+            height=56,
+            allow_outside_center=True,
+        )
+
+        self.assertEqual(int(dropped["ellipses"].shape[0]), 0)
+        self.assertEqual(int(preserved["ellipses"].shape[0]), 1)
+        self.assertLess(float(preserved["ellipses"][0, 0]), 0.0)
+        self.assertGreater(float(preserved["boxes"][0, 2]), 0.0)
+
+    def test_border_crop_places_contour_outside_with_center_inside(self) -> None:
+        image = torch.zeros((3, 56, 56), dtype=torch.float32)
+        _cropped, target = apply_ellipse_border_crop(
+            image,
+            sample_target(),
+            {
+                "ellipse_border_crop_center_outside_probability": 0.0,
+                "ellipse_border_crop_contour_margin": [0.25, 0.25],
+                "ellipse_border_crop_min_scale": 0.50,
+            },
+            rng=random.Random(0),
+        )
+
+        ellipse = target["ellipses"][0]
+        box = ellipse_params_to_xyxy(ellipse.tolist())
+        self.assertGreaterEqual(float(ellipse[0]), 0.0)
+        self.assertLess(float(ellipse[0]), 56.0)
+        self.assertGreaterEqual(float(ellipse[1]), 0.0)
+        self.assertLess(float(ellipse[1]), 56.0)
+        self.assertTrue(box[0] < 0.0 or box[1] < 0.0 or box[2] > 56.0 or box[3] > 56.0)
+        debug = target["metadata"]["augmentation_debug"]["ellipse_border_crop"]
+        self.assertEqual(debug["mode"], "contour")
+        self.assertFalse(debug["center_outside"])
+        self.assertTrue(debug["contour_outside"])
+
+    def test_border_crop_places_center_outside_and_keeps_clipped_box(self) -> None:
+        image = torch.zeros((3, 56, 56), dtype=torch.float32)
+        _cropped, target = apply_ellipse_border_crop(
+            image,
+            sample_target(),
+            {
+                "ellipse_border_crop_center_outside_probability": 1.0,
+                "ellipse_border_crop_center_margin": [0.10, 0.10],
+                "ellipse_border_crop_min_scale": 0.50,
+            },
+            rng=random.Random(0),
+        )
+
+        ellipse = target["ellipses"][0]
+        center_outside = (
+            float(ellipse[0]) < 0.0
+            or float(ellipse[0]) >= 56.0
+            or float(ellipse[1]) < 0.0
+            or float(ellipse[1]) >= 56.0
+        )
+        self.assertTrue(center_outside)
+        self.assertGreater(float(target["boxes"][0, 2] - target["boxes"][0, 0]), 0.0)
+        self.assertGreater(float(target["boxes"][0, 3] - target["boxes"][0, 1]), 0.0)
+        self.assertTrue(bool((target["boxes"] >= 0.0).all()))
+        self.assertTrue(bool((target["boxes"] <= 56.0).all()))
+        debug = target["metadata"]["augmentation_debug"]["ellipse_border_crop"]
+        self.assertEqual(debug["mode"], "center")
+        self.assertTrue(debug["center_outside"])
+        self.assertTrue(debug["contour_outside"])
+
     def test_blur_photometric_augmentation_changes_image_only(self) -> None:
         image = torch.zeros((3, 56, 56), dtype=torch.float32)
         image[:, :, ::2] = 1.0
@@ -106,6 +190,51 @@ class DinoCenterFaceAugmentationTest(unittest.TestCase):
         weak_delta = float((weak - image).abs().mean())
         strong_delta = float((strong - image).abs().mean())
         self.assertGreater(strong_delta, weak_delta)
+
+    def test_persistent_workers_observe_epoch_updates(self) -> None:
+        dataset = AugmentedFaceKeypointDataset(
+            SyntheticFaceKeypointDataset(length=4, image_size=32, positive=True),
+            {"enabled": True, "noise": 0.03},
+            seed=0,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            persistent_workers=True,
+            prefetch_factor=1,
+            collate_fn=collate_face_keypoint_batch,
+        )
+        dataset.set_epoch(1, 120)
+        epoch_one, _targets_one = self._first_batch_after_full_epoch(loader)
+        dataset.set_epoch(2, 120)
+        epoch_two, _targets_two = self._first_batch_after_full_epoch(loader)
+        self.assertEqual(dataset.epoch, 2)
+        self.assertEqual(dataset.total_epochs, 120)
+        self.assertFalse(torch.equal(epoch_one, epoch_two))
+
+    def test_persistent_workers_honor_close_mosaic(self) -> None:
+        dataset = AugmentedFaceKeypointDataset(
+            SyntheticFaceKeypointDataset(length=4, image_size=32, positive=True),
+            {"enabled": True, "mosaic": 1.0, "close_mosaic": 20},
+            seed=0,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            persistent_workers=True,
+            prefetch_factor=1,
+            collate_fn=collate_face_keypoint_batch,
+        )
+        dataset.set_epoch(100, 120)
+        _images_active, targets_active = self._first_batch_after_full_epoch(loader)
+        dataset.set_epoch(101, 120)
+        _images_closed, targets_closed = self._first_batch_after_full_epoch(loader)
+        self.assertTrue(str(targets_active[0]["image_id"]).startswith("mosaic__"))
+        self.assertFalse(str(targets_closed[0]["image_id"]).startswith("mosaic__"))
 
     def test_ablation_configs_keep_fixed_training_conditions(self) -> None:
         base = load_yaml_config(CONFIG_DIR / "E0_baseline.yaml")

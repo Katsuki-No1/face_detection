@@ -1,0 +1,92 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full.yaml
+
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse
+
+model:
+  type: dinov3_deimv2_ellipse
+  init_checkpoint:
+    path: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full/checkpoints/best_val_map.pt
+    prefer_ema: true
+    skip_class_heads: false
+    verbose: true
+  ellipse_head:
+    prior_major: 0.05
+    prior_axis_ratio: 0.70
+    prior_angle_degrees: 90.0
+
+loss:
+  ellipse:
+    weights:
+      center: 5.0
+      axes: 5.0
+      angle: 1.0
+      chamfer: 2.0
+    contour_points: 36
+    circle_ratio_threshold: 1.05
+
+augmentation:
+  # Produce amodal edge cases on the final training canvas. Half place only
+  # the ellipse contour outside; half place the ellipse center outside while
+  # retaining the intersecting ellipse and a clipped detector box.
+  ellipse_border_crop: 0.20
+  ellipse_border_crop_center_outside_probability: 0.50
+  ellipse_border_crop_contour_margin: [0.10, 0.50]
+  ellipse_border_crop_center_margin: [0.02, 0.20]
+  ellipse_border_crop_min_scale: 0.50
+  preserve_outside_ellipse_center: true
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse
+  minimum_epochs: 20
+  epochs: 70
+  lr: 1.0e-4
+  lr_head: 5.0e-4
+  lr_backbone: 5.0e-6
+  flat_epochs: 45
+  early_stopping:
+    enabled: true
+    monitor: val/ellipse_mAP50_95
+    checkpoint_name: best_val_ellipse_map.pt
+    minimum_epoch: 20
+    patience_validations: 6
+    min_delta: 0.0005
+  param_groups:
+    - name: ellipse_head_decay
+      params: '^(?=.*decoder\.ellipse_head)(?!.*(?:norm|bn|bias)).*$'
+      lr: 5.0e-4
+    - name: ellipse_head_no_decay
+      params: '^(?=.*decoder\.ellipse_head)(?=.*(?:norm|bn|bias)).*$'
+      lr: 5.0e-4
+      weight_decay: 0.0
+    - name: dinov3_decay
+      params: '^(?=.*backbone\.dino\.backbone)(?!.*(?:norm|bn|bias)).*$'
+      lr: 5.0e-6
+    - name: dinov3_no_decay
+      params: '^(?=.*backbone\.dino\.backbone)(?=.*(?:norm|bn|bias)).*$'
+      lr: 5.0e-6
+      weight_decay: 0.0
+    - name: deim_no_decay
+      params: '^(?=.*(?:backbone\.sta|backbone\.convs|backbone\.norms|encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      lr: 1.0e-4
+      weight_decay: 0.0
+  validation:
+    enabled: true
+    every: 5
+    split: val
+    image_size: 960
+    fixed_threshold: 0.30
+    score_min: 0.001
+
+verification:
+  expected_ellipse_annotations: {train: 6529, val: 840, test: 769}
+  expected_ellipse_coco_sha256:
+    train: 2fac1a20b089c801099bed0b439db3ed612d2ea812b5eab21a574f473f981cfa
+    val: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+    test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
+  ellipse_annotation_summary: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/conversion_summary.json
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_preflight
+
+acceptance:
+  max_bbox_map_drop: 0.01
+  # A new bbox reference must be measured on this balanced validation split.
+  bbox_reference_map: {}
