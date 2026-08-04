@@ -1,0 +1,520 @@
+version: 1
+
+queue:
+  name: three_stage_codino_deimv2_landmark_query_after_current
+  state_dir: outputs/training_queues/three_stage_codino_deimv2_landmark_query_after_current
+  continue_on_failure: false
+  gpu:
+    index: 0
+  wait:
+    poll_seconds: 15
+    log_interval_seconds: 60
+    idle_samples: 4
+    max_gpu_utilization: 10
+    max_memory_used_mib: 2500
+    timeout_seconds: 0
+    # The successor cooperative queue is itself waiting for the primary
+    # queue. Blocking on it preserves the complete already-scheduled order,
+    # including idle gaps between its jobs.
+    extra_process_patterns:
+      - "run_training_queue_when_idle\\.py.*face_keypoint_cooperative_after_current\\.yaml"
+
+jobs:
+  # Legacy standalone HEAD jobs are retained as an explicit provenance trail
+  # but disabled.  The active three-stage arms train the internal Co-DINO HEAD
+  # branch from the same ViT-S+/16 invocation used by FACE/Landmark Query.
+  - name: head_codino_balanced_811_preflight
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/audit_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --output
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/preflight.json"
+    completion_marker: outputs/head_codino/face_pose_drive_v2_balanced_811/preflight.json
+
+  - name: head_codino_balanced_811_real_data_overfit
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --output-dir
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811_overfit"
+      - --overfit-images
+      - "4"
+      - --epochs
+      - "20"
+      - --max-steps
+      - "64"
+    completion_marker: runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811_overfit/overfit_success.json
+
+  - name: head_codino_balanced_811_train
+    enabled: false
+    depends_on:
+      - head_codino_balanced_811_preflight
+      - head_codino_balanced_811_real_data_overfit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --output-dir
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811"
+    completion_marker: runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/training_complete.json
+    resume:
+      checkpoint: runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth
+      arguments:
+        - --resume
+        - "{checkpoint}"
+
+  - name: head_codino_balanced_811_checkpoint_audit
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/audit_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --output
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/checkpoint_audit.json"
+    completion_marker: outputs/head_codino/face_pose_drive_v2_balanced_811/checkpoint_audit.json
+
+  - name: head_codino_balanced_811_val_predictions
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/eval_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --split
+      - val
+      - --output
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/val_predictions.json"
+    completion_marker: outputs/head_codino/face_pose_drive_v2_balanced_811/val_predictions_metrics.json
+
+  - name: head_codino_balanced_811_select_val_threshold
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/select_head_codino_threshold.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/val.json"
+      - --predictions
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/val_predictions.json"
+      - --output
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/validation_threshold.json"
+      - --minimum-precision
+      - "0.90"
+      - --iou-threshold
+      - "0.50"
+    completion_marker: outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/validation_threshold.json
+
+  - name: head_codino_balanced_811_train_predictions
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/eval_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --split
+      - train
+      - --output
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/train_predictions.json"
+    completion_marker: outputs/head_codino/face_pose_drive_v2_balanced_811/train_predictions_metrics.json
+
+  - name: head_codino_balanced_811_test_predictions
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/eval_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/face_pose_drive_v2_balanced_811.yaml"
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --split
+      - test
+      - --output
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/test_predictions.json"
+    completion_marker: outputs/head_codino/face_pose_drive_v2_balanced_811/test_predictions_metrics.json
+
+  - name: three_stage_build_train_head_cache
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/build_predicted_head_cache.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/train.json"
+      - --predictions
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/train_predictions.json"
+      - --output
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/train.json"
+      - --split
+      - train
+      - --detector-name
+      - head_codino_vits16plus_balanced_811_seed42
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --threshold-file
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/validation_threshold.json"
+    completion_marker: outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/train.json
+
+  - name: three_stage_build_val_head_cache
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/build_predicted_head_cache.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/val.json"
+      - --predictions
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/val_predictions.json"
+      - --output
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/val.json"
+      - --split
+      - val
+      - --detector-name
+      - head_codino_vits16plus_balanced_811_seed42
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --threshold-file
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/validation_threshold.json"
+    completion_marker: outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/val.json
+
+  - name: three_stage_build_test_head_cache
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/build_predicted_head_cache.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json"
+      - --predictions
+      - "{project_root}/outputs/head_codino/face_pose_drive_v2_balanced_811/test_predictions.json"
+      - --output
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/test.json"
+      - --split
+      - test
+      - --detector-name
+      - head_codino_vits16plus_balanced_811_seed42
+      - --checkpoint
+      - "{project_root}/runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811/last.pth"
+      - --threshold-file
+      - "{project_root}/outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/validation_threshold.json"
+    completion_marker: outputs/three_stage/codino_deimv2_l_landmark_query/head_detections/test.json
+
+  - name: three_stage_baseline_audit
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/audit_success.json
+
+  - name: three_stage_baseline_real_data_overfit
+    enabled: true
+    depends_on:
+      - three_stage_baseline_audit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/overfit_success.json
+
+  - name: three_stage_baseline_train
+    enabled: true
+    depends_on:
+      - three_stage_baseline_audit
+      - three_stage_baseline_real_data_overfit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --resume
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_hpg_audit
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/audit_success.json
+
+  - name: three_stage_hpg_real_data_overfit
+    enabled: true
+    depends_on:
+      - three_stage_hpg_audit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/overfit_success.json
+
+  - name: three_stage_hpg_train
+    enabled: true
+    depends_on:
+      - three_stage_hpg_audit
+      - three_stage_hpg_real_data_overfit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --resume
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_baseline_val_evaluate
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/val/baseline_aligned/success.json
+
+  - name: three_stage_hpg_val_evaluate
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/val/baseline_aligned/success.json
+
+  - name: three_stage_baseline_test_evaluate
+    enabled: true
+    depends_on:
+      - three_stage_baseline_val_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/test/baseline_aligned/success.json
+
+  - name: three_stage_hpg_test_evaluate
+    enabled: true
+    depends_on:
+      - three_stage_hpg_val_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/test/baseline_aligned/success.json
+
+  - name: three_stage_baseline_test_strata
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/evaluate_head_pose_geometry_strata.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json"
+      - --predictions-jsonl
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/test/predictions.jsonl"
+      - --output
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/test/strata.json"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/test/strata.json
+
+  - name: three_stage_hpg_test_strata
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/evaluate_head_pose_geometry_strata.py"
+      - --annotations
+      - "{project_root}/outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json"
+      - --predictions-jsonl
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/test/predictions.jsonl"
+      - --output
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/test/strata.json"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/test/strata.json
+
+  - name: three_stage_hpg_comparison
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/compare_three_stage_hpg.py"
+      - --baseline-root
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42"
+      - --hpg-root
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42"
+      - --output-dir
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_comparison_seed42"
+      - --splits
+      - val
+      - test
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_comparison_seed42/comparison.md
+
+  # Border-crop + factorized Query Refinement arm appended after all previously
+  # scheduled work. Existing baseline and HPG jobs above remain unchanged.
+  - name: three_stage_ellipse_border_crop_audit
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --augmentation-audit-samples
+      - "100"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/audit_success.json
+
+  - name: three_stage_ellipse_border_crop_real_data_overfit
+    enabled: true
+    depends_on:
+      - three_stage_ellipse_border_crop_audit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42_preflight"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42_preflight/overfit_success.json
+
+  - name: three_stage_ellipse_border_crop_train
+    enabled: true
+    depends_on:
+      - three_stage_ellipse_border_crop_audit
+      - three_stage_ellipse_border_crop_real_data_overfit
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --resume
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_ellipse_border_crop_val_evaluate
+    enabled: true
+    depends_on:
+      - three_stage_ellipse_border_crop_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/evaluation/val/baseline_aligned/success.json
+
+  - name: three_stage_ellipse_border_crop_test_evaluate
+    enabled: true
+    depends_on:
+      - three_stage_ellipse_border_crop_train
+      - three_stage_ellipse_border_crop_val_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/evaluation/test/baseline_aligned/success.json
+
+  - name: three_stage_ellipse_border_crop_comparison
+    enabled: true
+    depends_on:
+      - three_stage_baseline_val_evaluate
+      - three_stage_baseline_test_evaluate
+      - three_stage_ellipse_border_crop_val_evaluate
+      - three_stage_ellipse_border_crop_test_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/compare_three_stage_variants.py"
+      - --baseline-root
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42"
+      - --candidate-root
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42"
+      - --candidate-label
+      - ellipse_border_crop_factorized_query_refinement
+      - --output-dir
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_comparison_seed42"
+      - --splits
+      - val
+      - test
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_comparison_seed42/comparison.md

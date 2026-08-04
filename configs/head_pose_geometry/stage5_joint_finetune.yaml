@@ -1,0 +1,14 @@
+extends: stage3_pose_domain_adaptation.yaml
+experiment_name: hpg_stage5_joint_finetune
+train:
+  learning_rates:
+    backbone: 0.000001
+    sta_neck: 0.000005
+    shared_encoder: 0.000005
+    face_decoder: 0.00002
+    keypoint_decoder: 0.00004
+    association: 0.00005
+    cooperative_decoder: 0.00005
+    head_pose_geometry: 0.00002
+output:
+  root: outputs/experiments/head_pose_geometry/stage5_joint

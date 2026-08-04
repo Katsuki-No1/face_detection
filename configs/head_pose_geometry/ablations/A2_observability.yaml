@@ -1,0 +1,17 @@
+extends: ../stage2_fixed_geometry.yaml
+experiment_name: hpg_A2_observability
+model:
+  head_pose_geometry:
+    fusion:
+      enabled: false
+    loss_weights:
+      rotation: 0.0
+      projected_keypoints: 0.0
+      amodal_ellipse_center: 0.0
+      amodal_ellipse_axes: 0.0
+      amodal_ellipse_angle: 0.0
+      head_relative: 0.0
+      observability: 1.0
+      visibility: 0.0
+output:
+  root: outputs/experiments/head_pose_geometry/A2

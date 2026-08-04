@@ -1,0 +1,50 @@
+schema_version: 1
+project_root: ..
+model_registry: configs/model_registry/active_learning_strongest_models.yaml
+
+input_roots:
+  - data/input/active_learning
+output_root: data/output/active_learning
+
+device: cuda:0
+random_seed: 20260728
+recursive: false
+video_include_globs: []
+
+montage:
+  timeline_segments: 10
+  clip_duration_sec: 60.0
+  crf: 20
+  preset: fast
+  audio_bitrate: 192k
+  verify_decode: false
+
+inference:
+  # 10 minutes x 5 fps = 3,000 evaluated frames per source video.
+  sample_fps: 5.0
+  pipeline_batch_size: 4
+  scene_change_threshold: 0.32
+
+selection:
+  max_frames_per_video: 50
+  # Prevent near-duplicate review burden even when adjacent samples have
+  # different pixels or satisfy different failure categories.
+  min_interval_sec: 10.0
+  category_ratios:
+    temporal_ellipse_instability: 0.25
+    low_confidence: 0.25
+    face_without_keypoints: 0.25
+    extreme_screen_edge: 0.25
+  confidence_min_ratio: 0.70
+  confidence_max_ratio: 1.30
+  # The ellipse bbox must touch/cross the outermost 1% of the image.
+  extreme_edge_margin_ratio: 0.01
+  temporal_max_gap_sec: 0.60
+  temporal_min_track_hits: 3
+  ellipse_center_jump_ratio: 0.75
+  ellipse_axis_log_jump: 0.45
+  ellipse_angle_jump_deg: 35.0
+
+output:
+  jpeg_quality: 95
+  write_evidence_overlay: true

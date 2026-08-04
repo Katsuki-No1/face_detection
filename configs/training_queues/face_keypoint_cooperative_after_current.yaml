@@ -1,0 +1,279 @@
+version: 1
+
+queue:
+  name: face_keypoint_cooperative_after_current
+  state_dir: outputs/training_queues/face_keypoint_cooperative_after_current
+  continue_on_failure: false
+  gpu:
+    index: 0
+  wait:
+    poll_seconds: 15
+    log_interval_seconds: 60
+    idle_samples: 4
+    max_gpu_utilization: 10
+    max_memory_used_mib: 2500
+    timeout_seconds: 0
+    # The active primary runner loaded its job list at process startup. Treat
+    # that runner itself as a blocker so this successor starts only after every
+    # already-scheduled model has finished, including gaps between its jobs.
+    extra_process_patterns:
+      - "run_training_queue_when_idle\\.py.*after_current_models\\.yaml"
+
+jobs:
+  # The currently running primary queue loaded its jobs before Landmark Query
+  # was appended. Keep this first so the live schedule still runs it after
+  # ViTPose-376 under the exact same keypoint_comparison1 config.
+  - name: keypoint_comparison1_landmark_query
+    # Legacy checkpoint: v>0 was collapsed into the visible target.
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - train
+      - --variants
+      - query
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/query/training_summary.json
+    resume:
+      checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/query/checkpoints/last.pt
+      arguments: []
+
+  - name: keypoint_comparison1_query_vs_vitpose_376_evaluate
+    # Retained for queue history; the corrected models are evaluated below.
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query
+      - vitpose_376
+      - --evaluation-set
+      - v2_test
+      - --evaluation-set
+      - external_v1_v2
+      - --device
+      - cuda:0
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/evaluation/v2_test/G_vitpose_376_deim/metrics.json
+
+  - name: keypoint_comparison1_query_refinement_gt_ellipse_long_axis_square
+    # Legacy checkpoint: v>0 was collapsed into the visible target.
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - train
+      - --variants
+      - query_refinement
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/query_refinement/training_summary.json
+    resume:
+      checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/query_refinement/checkpoints/last.pt
+      arguments: []
+
+  - name: face_keypoint_cooperative_960_audit
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml"
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/audit.json
+
+  - name: face_keypoint_cooperative_real_data_overfit
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml"
+      - --device
+      - cuda:0
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+    completion_marker: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/overfit_report.json
+
+  - name: face_keypoint_cooperative_detr_l_960_train
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/checkpoints/last.pt
+      arguments: []
+
+  - name: yolo26m_pose_balanced_811_960_train
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts_YOLO/yolo26_pose/run_yolo26_pose.py"
+      - --config
+      - "{project_root}/configs/yolo/yolo26_pose/face_pose_drive_v2_full.yaml"
+      - --stage
+      - train
+      - --models
+      - m
+      - --device
+      - "0"
+      - --skip-weight-download
+    completion_marker: runs/yolo/yolo26_pose/face_pose_drive_v2_balanced_811/yolo26m_pose_full/yolo26_experiment_metadata.json
+    resume:
+      checkpoint: runs/yolo/yolo26_pose/face_pose_drive_v2_balanced_811/yolo26m_pose_full/weights/last.pt
+      arguments:
+        - --resume
+
+  - name: face_keypoint_cooperative_detr_l_960_val_evaluate
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/evaluation/val/baseline_aligned/success.json
+
+  - name: face_keypoint_cooperative_detr_l_960_evaluate
+    enabled: true
+    depends_on:
+      - face_keypoint_cooperative_detr_l_960_val_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/evaluation/test/baseline_aligned/success.json
+
+  # Factorized presence/conditional-visibility training starts only after
+  # cooperative DEIM has completed both training and fixed-test evaluation.
+  - name: keypoint_comparison1_factorized_state_preflight
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - preflight
+      - --device
+      - cuda:0
+      - --skip-detector-preflight
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/preflight/success.json
+
+  - name: keypoint_comparison1_factorized_state_query_train
+    # Retained as an optional architecture ablation. Query Refinement below is
+    # the production candidate requested for this run.
+    enabled: false
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - train
+      - --variants
+      - query
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query/training_summary.json
+    resume:
+      checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query/checkpoints/last.pt
+      arguments: []
+
+  - name: keypoint_comparison1_factorized_state_query_refinement_train
+    enabled: true
+    depends_on:
+      - keypoint_comparison1_factorized_state_preflight
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - train
+      - --variants
+      - query_refinement
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query_refinement/training_summary.json
+    resume:
+      checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query_refinement/checkpoints/last.pt
+      arguments: []
+
+  - name: keypoint_comparison1_factorized_state_query_refinement_evaluate
+    enabled: true
+    depends_on:
+      - keypoint_comparison1_factorized_state_query_refinement_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query_refinement
+      - --evaluation-set
+      - v2_test
+      - --evaluation-set
+      - external_v1_v2
+      - --device
+      - cuda:0
+    completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/evaluation/v2_test/E_query_refinement_deim/baseline_aligned/success.json
+
+  - name: yolo26m_pose_balanced_811_960_evaluate
+    enabled: true
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts_YOLO/yolo26_pose/run_yolo26_pose.py"
+      - --config
+      - "{project_root}/configs/yolo/yolo26_pose/face_pose_drive_v2_full.yaml"
+      - --stage
+      - evaluate
+      - --models
+      - m
+      - --device
+      - "0"
+      - --skip-weight-download
+    completion_marker: outputs/yolo/yolo26_pose/face_pose_drive_v2_balanced_811/yolo26m_pose_full/evaluation/test/baseline_aligned/success.json

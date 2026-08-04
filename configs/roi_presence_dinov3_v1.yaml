@@ -1,0 +1,35 @@
+project_root: ..
+dataset_version: mmdet_hf_v1
+output_dir: outputs/models/roi_presence_dinov3_v1
+seed: 20260717
+roi_input_size: 384
+roi_padding: 0.25
+background_crops_per_image: 2
+epochs: 100
+batch_size: 128
+learning_rate: 0.001
+
+dino_model:
+  name: dino_deimv2
+  type: dinov3_deimv2
+  config: configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze.yaml
+  weights: outputs/experiments/dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze_20260714/checkpoints/epoch_0010.pt
+  device: cuda:0
+  input_size: 960
+  confidence_threshold: 0.05
+  analysis_threshold: 0.51
+  max_detections: 100
+  batch_size: 16
+  class_id: 2
+  class_name: face
+
+splits:
+  train:
+    annotation: outsput/experience/data/mmdet_hf/train.json
+    image_root: outsput/experience/data/mmdet_hf
+  val:
+    annotation: outsput/experience/data/mmdet_hf/val.json
+    image_root: outsput/experience/data/mmdet_hf
+  test:
+    annotation: outsput/experience/data/mmdet_hf/test.json
+    image_root: outsput/experience/data/mmdet_hf

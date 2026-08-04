@@ -31,6 +31,65 @@ def small_config(encoder_type: str = "lightweight_transformer") -> dict:
     }
 
 
+def small_official_config() -> dict:
+    return {
+        "model": {
+            "type": "dinov3_deimv2",
+            "num_classes": 2,
+            "class_names": ["head", "face"],
+            "backbone": {
+                "name": "dinov3_vitb16",
+                "patch_size": 16,
+                "embed_dim": 32,
+                "pretrained": False,
+                "dummy": True,
+                "freeze": True,
+                "num_prefix_tokens": 0,
+                "token_key": "x_norm_patchtokens",
+            },
+            "adapter": {"hidden_dim": 32, "conv_inplane": 4, "interaction_indexes": [3, 7, 11]},
+            "encoder": {
+                "in_channels": [32, 32, 32],
+                "hidden_dim": 32,
+                "nhead": 4,
+                "dim_feedforward": 64,
+                "num_encoder_layers": 1,
+                "use_encoder_idx": [2],
+                "depth_mult": 0.34,
+                "expansion": 0.5,
+                "version": "deim",
+                "csp_type": "csp2",
+                "fuse_op": "sum",
+            },
+            "decoder": {
+                "feat_channels": [32, 32, 32],
+                "hidden_dim": 32,
+                "num_queries": 7,
+                "num_layers": 1,
+                "nhead": 4,
+                "dim_feedforward": 64,
+                "num_denoising": 4,
+                "num_points": [2, 2, 2],
+                "reg_max": 8,
+                "eval_idx": -1,
+            },
+        },
+        "loss": {
+            "weight_dict": {"loss_mal": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_fgl": 0.15, "loss_ddf": 1.5},
+            "losses": ["mal", "boxes", "local"],
+            "reg_max": 8,
+            "matcher": {
+                "weight_dict": {"cost_class": 2.0, "cost_bbox": 5.0, "cost_giou": 2.0},
+                "change_matcher": True,
+                "iou_order_alpha": 4.0,
+                "matcher_change_epoch": 1,
+            },
+        },
+        "data": {"category_ids": [1, 2], "image_size": 64},
+        "inference": {"score_thr": 0.0, "topk": 7, "detections_per_image": 5},
+    }
+
+
 def positive_target() -> dict:
     return {
         "boxes": torch.tensor([[16.0, 14.0, 42.0, 44.0]]),
@@ -64,6 +123,14 @@ class DINODeimStyleDetectorTest(unittest.TestCase):
         self.assertEqual(tuple(outputs["pred_boxes"].shape), (2, 7, 4))
         self.assertTrue(bool((outputs["pred_boxes"] >= 0).all().item()))
         self.assertTrue(bool((outputs["pred_boxes"] <= 1).all().item()))
+
+    def test_dinov3_deimv2_alias_builds_two_class_detector(self) -> None:
+        config = small_official_config()
+        model = build_detector_from_config(config)
+        model.eval()
+        with torch.no_grad():
+            outputs = model.forward_raw(torch.zeros(1, 3, 64, 64))
+        self.assertEqual(tuple(outputs["pred_logits"].shape), (1, 7, 2))
 
     def test_loss_and_backward_with_positive_target(self) -> None:
         model = build_dino_deim_style_detector(small_config())
@@ -126,6 +193,59 @@ class DINODeimStyleDetectorTest(unittest.TestCase):
         self.assertIn("scores", detections[0])
         self.assertIn("labels", detections[0])
         self.assertEqual(detections[0]["boxes"].shape[-1], 4)
+
+    def test_official_dinov3_deimv2_loss_and_backward(self) -> None:
+        model = build_detector_from_config(small_official_config())
+        model.train()
+        model.set_epoch(1)
+        target = positive_target()
+        target["labels"] = torch.tensor([2])
+        losses = model(torch.zeros(1, 3, 64, 64), [target])
+        self.assertTrue(torch.isfinite(losses["loss_total"]))
+        self.assertIn("loss_mal", losses)
+        self.assertIn("loss_fgl", losses)
+        self.assertIn("loss_dn", losses)
+        losses["loss_total"].backward()
+        grads = [parameter.grad for parameter in model.decoder.parameters() if parameter.requires_grad]
+        self.assertTrue(any(grad is not None and torch.isfinite(grad).all().item() for grad in grads))
+
+    def test_official_dinov3_deimv2_empty_target_is_finite(self) -> None:
+        model = build_detector_from_config(small_official_config())
+        model.train()
+        losses = model(torch.zeros(1, 3, 64, 64), [negative_target()])
+        self.assertTrue(torch.isfinite(losses["loss_total"]))
+
+    def test_official_dinov3_deimv2_category_mapping(self) -> None:
+        model = build_detector_from_config(small_official_config())
+        targets = [
+            {
+                "boxes": torch.tensor([[1.0, 2.0, 11.0, 22.0], [3.0, 4.0, 13.0, 24.0]]),
+                "labels": torch.tensor([1, 2]),
+            }
+        ]
+        converted = model._targets_to_official(targets, (64, 64), device=torch.device("cpu"), dtype=torch.float32)
+        self.assertEqual(converted[0]["labels"].tolist(), [0, 1])
+        one_class_config = small_official_config()
+        one_class_config["model"]["num_classes"] = 1
+        one_class_config["model"]["class_names"] = ["face"]
+        one_class_config["data"]["category_ids"] = [2]
+        one_class_model = build_detector_from_config(one_class_config)
+        converted = one_class_model._targets_to_official(targets, (64, 64), device=torch.device("cpu"), dtype=torch.float32)
+        self.assertEqual(converted[0]["labels"].tolist(), [0])
+
+    def test_official_dinov3_deimv2_inference_returns_records(self) -> None:
+        model = build_detector_from_config(small_official_config())
+        model.eval()
+        model.set_epoch(3)
+        with torch.no_grad():
+            detections = model(torch.zeros(1, 3, 64, 64))
+        self.assertEqual(len(detections), 1)
+        self.assertIn("boxes", detections[0])
+        self.assertIn("scores", detections[0])
+        self.assertIn("labels", detections[0])
+        if detections[0]["boxes"].numel() > 0:
+            self.assertTrue(bool((detections[0]["boxes"] >= 0).all().item()))
+            self.assertTrue(bool((detections[0]["boxes"] <= 64).all().item()))
 
     def test_e1_to_e5_configs_progressively_enable_features(self) -> None:
         root = Path("configs/dino_deim_style_ablation")

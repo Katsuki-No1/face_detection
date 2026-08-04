@@ -1,0 +1,1932 @@
+version: 1
+
+queue:
+  name: pending_models_tests_then_training
+  state_dir: outputs/training_queues/pending_models_tests_then_training
+  continue_on_failure: false
+  # Preserve fail-fast behavior for gates and production training.  An
+  # evaluation/postprocess failure is recorded, its dependents are skipped,
+  # and independent later inference jobs are still attempted.
+  continue_on_failure_phases: [evaluation, postprocess]
+  gate_contract:
+    enabled: true
+    tests_first: true
+    required_stages: [schema, gpu_step, overfit, small_scale]
+  gpu:
+    index: 0
+  wait:
+    poll_seconds: 15
+    log_interval_seconds: 60
+    idle_samples: 4
+    # WSL includes the Windows display/compositor load in this reading even
+    # when no CUDA process exists. Process detection plus the low-memory
+    # ceiling remain the primary guards against training overlap.
+    max_gpu_utilization: 25
+    max_memory_used_mib: 2500
+    timeout_seconds: 0
+    extra_process_patterns: []
+
+# Execution contract:
+#   1. Every gate for every pending architecture runs first.
+#   2. No production training starts unless all four gates for its architecture
+#      have explicit success markers.
+#   3. All production training jobs are contiguous. Evaluation follows them,
+#      so an unattended machine spends the long window training continuously.
+jobs:
+  # -----------------------------------------------------------------------
+  # TEST GROUP: KeypointComparison2 DEIMv2 Joint
+  # -----------------------------------------------------------------------
+  - name: deimv2_joint_schema_gate
+    enabled: true
+    phase: gate
+    architecture: keypoint_comparison2_deimv2_joint
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - keypoint_comparison2
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/schema/success.json"
+    completion_marker: outputs/training_gates/keypoint_comparison2_deimv2_joint/schema/success.json
+
+  - name: deimv2_joint_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: keypoint_comparison2_deimv2_joint
+    gate_stage: gpu_step
+    depends_on: [deimv2_joint_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_command_gate.py"
+      - --stage
+      - gpu_step
+      - --success-marker
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/gpu_step/success.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - preflight
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --forward-preflight
+    completion_marker: outputs/training_gates/keypoint_comparison2_deimv2_joint/gpu_step/success.json
+
+  - name: deimv2_joint_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: keypoint_comparison2_deimv2_joint
+    gate_stage: overfit
+    depends_on: [deimv2_joint_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit"
+      - --metrics
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit/deimv2_joint/metrics.csv"
+      - --metric
+      - loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "8"
+      - --minimum-relative-improvement
+      - "0.05"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - train
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --output-root
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit"
+      - --epochs
+      - "12"
+      - --freeze-backbone-epochs
+      - "12"
+      - --max-train-samples
+      - "4"
+      - --max-val-samples
+      - "4"
+      - --no-resume
+      - --no-wandb
+    completion_marker: outputs/training_gates/keypoint_comparison2_deimv2_joint/overfit/success.json
+
+  - name: deimv2_joint_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: keypoint_comparison2_deimv2_joint
+    gate_stage: small_scale
+    depends_on: [deimv2_joint_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale/deimv2_joint/metrics.csv"
+      - --metric
+      - validation_loss
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.003"
+      - --minimum-improving-transition-fraction
+      - "0.4"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - train
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --output-root
+      - "{project_root}/outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale"
+      - --epochs
+      - "12"
+      - --max-train-samples
+      - "128"
+      - --max-val-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+    completion_marker: outputs/training_gates/keypoint_comparison2_deimv2_joint/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: causal curriculum stage 1, unfrozen DINOv3 + Co-DINO HEAD
+  # -----------------------------------------------------------------------
+  - name: shared_head_codino_unfrozen_schema_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960_unfrozen
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - head_codino
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960_unfrozen.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/schema/success.json"
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/schema/success.json
+
+  - name: shared_head_codino_unfrozen_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960_unfrozen
+    gate_stage: gpu_step
+    depends_on: [shared_head_codino_unfrozen_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_command_gate.py"
+      - --stage
+      - gpu_step
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/gpu_step/success.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/audit_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960_unfrozen.yaml"
+      - --checkpoint
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --output
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/gpu_step/audit.json"
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/gpu_step/success.json
+
+  - name: shared_head_codino_unfrozen_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960_unfrozen
+    gate_stage: overfit
+    depends_on: [shared_head_codino_unfrozen_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960_unfrozen.yaml"
+      - --initialize-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --output-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/overfit"
+      - --overfit-images
+      - "4"
+      - --epochs
+      - "20"
+      - --max-steps
+      - "64"
+      - --no-wandb
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/overfit/overfit_success.json
+
+  - name: shared_head_codino_unfrozen_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960_unfrozen
+    gate_stage: small_scale
+    depends_on: [shared_head_codino_unfrozen_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      # This stage warm-starts a converged HEAD detector. Require a measurable
+      # validation gain while accounting for the smaller remaining headroom.
+      - "0.003"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960_unfrozen.yaml"
+      - --initialize-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --output-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale"
+      - --epochs
+      - "5"
+      - --max-train-samples
+      - "128"
+      - --max-val-samples
+      - "128"
+      - --no-wandb
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: causal curriculum stage 2a, fixed HEAD -> FACE
+  # -----------------------------------------------------------------------
+  - name: three_stage_face_stage_schema_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_face_stage
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_face_stage.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/schema/success.json"
+    completion_marker: outputs/training_gates/three_stage_face_stage/schema/success.json
+
+  - name: three_stage_face_stage_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_face_stage
+    gate_stage: gpu_step
+    depends_on:
+      - three_stage_face_stage_schema_gate
+      - shared_head_codino_unfrozen_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_face_stage.yaml"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/gpu_step/audit.json"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/best_val_loss.pth"
+      - --initialize-shared-dino-from-head-checkpoint
+    completion_marker: outputs/training_gates/three_stage_face_stage/gpu_step/audit_success.json
+
+  - name: three_stage_face_stage_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_face_stage
+    gate_stage: overfit
+    depends_on: [three_stage_face_stage_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_face_stage.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --no-resume
+      - --no-wandb
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/best_val_loss.pth"
+      - --initialize-shared-dino-from-head-checkpoint
+    completion_marker: outputs/training_gates/three_stage_face_stage/overfit/overfit_success.json
+
+  - name: three_stage_face_stage_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_face_stage
+    gate_stage: small_scale
+    depends_on: [three_stage_face_stage_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_face_stage.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960_unfrozen/small_scale/best_val_loss.pth"
+      - --initialize-shared-dino-from-head-checkpoint
+    completion_marker: outputs/training_gates/three_stage_face_stage/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: causal curriculum stage 2b, fixed HEAD/FACE -> keypoint
+  # -----------------------------------------------------------------------
+  - name: three_stage_keypoint_stage_schema_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_keypoint_stage
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_keypoint_stage.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/schema/success.json"
+    completion_marker: outputs/training_gates/three_stage_keypoint_stage/schema/success.json
+
+  - name: three_stage_keypoint_stage_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_keypoint_stage
+    gate_stage: gpu_step
+    depends_on:
+      - three_stage_keypoint_stage_schema_gate
+      - three_stage_face_stage_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_keypoint_stage.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/checkpoints/best_val_loss.pt"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/gpu_step/audit.json"
+    completion_marker: outputs/training_gates/three_stage_keypoint_stage/gpu_step/audit_success.json
+
+  - name: three_stage_keypoint_stage_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_keypoint_stage
+    gate_stage: overfit
+    depends_on: [three_stage_keypoint_stage_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_keypoint_stage.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --no-resume
+      - --no-wandb
+      - --initialize-from
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/checkpoints/best_val_loss.pt"
+    completion_marker: outputs/training_gates/three_stage_keypoint_stage/overfit/overfit_success.json
+
+  - name: three_stage_keypoint_stage_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_keypoint_stage
+    gate_stage: small_scale
+    depends_on: [three_stage_keypoint_stage_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_keypoint_stage.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_keypoint_stage/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+      - --initialize-from
+      - "{project_root}/outputs/training_gates/three_stage_face_stage/small_scale/checkpoints/best_val_loss.pt"
+    completion_marker: outputs/training_gates/three_stage_keypoint_stage/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: historical frozen-DINO shared component
+  # -----------------------------------------------------------------------
+  - name: shared_head_codino_schema_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - head_codino
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/schema/success.json"
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960/schema/success.json
+
+  - name: shared_head_codino_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960
+    gate_stage: gpu_step
+    depends_on: [shared_head_codino_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_command_gate.py"
+      - --stage
+      - gpu_step
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/gpu_step/success.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/audit_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --output
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/gpu_step/audit.json"
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960/gpu_step/success.json
+
+  - name: shared_head_codino_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960
+    gate_stage: overfit
+    depends_on: [shared_head_codino_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --output-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit"
+      - --overfit-images
+      - "4"
+      - --epochs
+      - "20"
+      - --max-steps
+      - "64"
+      - --no-wandb
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960/overfit/overfit_success.json
+
+  - name: shared_head_codino_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: shared_head_codino_vits16plus_960
+    gate_stage: small_scale
+    depends_on: [shared_head_codino_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --output-dir
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale"
+      - --epochs
+      - "5"
+      - --max-train-samples
+      - "128"
+      - --max-val-samples
+      - "128"
+      - --metrics-csv
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/small_scale/metrics.csv"
+      - --no-wandb
+    completion_marker: outputs/training_gates/shared_head_codino_vits16plus_960/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: strict HEAD -> FACE -> keypoint baseline / HPG / ellipse-border-crop
+  # -----------------------------------------------------------------------
+  - name: three_stage_baseline_schema_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_baseline
+    gate_stage: schema
+    command: &baseline_schema_command
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_baseline/schema/success.json"
+    completion_marker: outputs/training_gates/three_stage_baseline/schema/success.json
+
+  - name: three_stage_baseline_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_baseline
+    gate_stage: gpu_step
+    depends_on: [three_stage_baseline_schema_gate, shared_head_codino_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/three_stage_baseline/gpu_step/audit.json"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_baseline/gpu_step/audit_success.json
+
+  - name: three_stage_baseline_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_baseline
+    gate_stage: overfit
+    depends_on: [three_stage_baseline_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_baseline/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+      - --no-wandb
+    completion_marker: outputs/training_gates/three_stage_baseline/overfit/overfit_success.json
+
+  - name: three_stage_baseline_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_baseline
+    gate_stage: small_scale
+    depends_on: [three_stage_baseline_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/three_stage_baseline/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/three_stage_baseline/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_baseline/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/three_stage_baseline/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_baseline/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_baseline/small_scale/success.json
+
+  - name: three_stage_hpg_schema_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_hpg
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_hpg/schema/success.json"
+    completion_marker: outputs/training_gates/three_stage_hpg/schema/success.json
+
+  - name: three_stage_hpg_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_hpg
+    gate_stage: gpu_step
+    depends_on: [three_stage_hpg_schema_gate, shared_head_codino_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/three_stage_hpg/gpu_step/audit.json"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_hpg/gpu_step/audit_success.json
+
+  - name: three_stage_hpg_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_hpg
+    gate_stage: overfit
+    depends_on: [three_stage_hpg_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_hpg/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+      - --no-wandb
+    completion_marker: outputs/training_gates/three_stage_hpg/overfit/overfit_success.json
+
+  - name: three_stage_hpg_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_hpg
+    gate_stage: small_scale
+    depends_on: [three_stage_hpg_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/three_stage_hpg/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/three_stage_hpg/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_hpg/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/three_stage_hpg/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_hpg/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_hpg/small_scale/success.json
+
+  - name: three_stage_ellipse_border_crop_schema_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_ellipse_border_crop
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/schema/success.json"
+    completion_marker: outputs/training_gates/three_stage_ellipse_border_crop/schema/success.json
+
+  - name: three_stage_ellipse_border_crop_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_ellipse_border_crop
+    gate_stage: gpu_step
+    depends_on: [three_stage_ellipse_border_crop_schema_gate, shared_head_codino_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/gpu_step/audit.json"
+      - --augmentation-audit-samples
+      - "200"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_ellipse_border_crop/gpu_step/audit_success.json
+
+  - name: three_stage_ellipse_border_crop_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_ellipse_border_crop
+    gate_stage: overfit
+    depends_on: [three_stage_ellipse_border_crop_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+      - --no-wandb
+    completion_marker: outputs/training_gates/three_stage_ellipse_border_crop/overfit/overfit_success.json
+
+  - name: three_stage_ellipse_border_crop_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: three_stage_ellipse_border_crop
+    gate_stage: small_scale
+    depends_on: [three_stage_ellipse_border_crop_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/three_stage_ellipse_border_crop/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+      - --initialize-shared-head-from
+      - "{project_root}/outputs/training_gates/shared_head_codino_vits16plus_960/overfit/last.pth"
+    completion_marker: outputs/training_gates/three_stage_ellipse_border_crop/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: HEAD detection -> square HEAD crop -> cooperative DINO
+  # -----------------------------------------------------------------------
+  - name: head_crop_cooperative_schema_gate
+    enabled: true
+    phase: gate
+    architecture: head_crop_cooperative_detr_l_960
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_training_schema_gate.py"
+      - --kind
+      - cooperative
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960.yaml"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/schema/success.json"
+    completion_marker: outputs/training_gates/head_crop_cooperative_detr_l_960/schema/success.json
+
+  - name: head_crop_cooperative_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: head_crop_cooperative_detr_l_960
+    gate_stage: gpu_step
+    depends_on: [head_crop_cooperative_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/audit_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960_gate.yaml"
+      - --device
+      - cuda:0
+      - --output
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/gpu_step/audit.json"
+    completion_marker: outputs/training_gates/head_crop_cooperative_detr_l_960/gpu_step/audit_success.json
+
+  - name: head_crop_cooperative_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: head_crop_cooperative_detr_l_960
+    gate_stage: overfit
+    depends_on: [head_crop_cooperative_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960_gate.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/overfit"
+      - --overfit-smoke
+      - --max-samples
+      - "4"
+      - --overfit-steps
+      - "64"
+      - --no-wandb
+    completion_marker: outputs/training_gates/head_crop_cooperative_detr_l_960/overfit/overfit_success.json
+
+  - name: head_crop_cooperative_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: head_crop_cooperative_detr_l_960
+    gate_stage: small_scale
+    depends_on: [head_crop_cooperative_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/run_small_scale_training_gate.py"
+      - --work-dir
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale"
+      - --metrics
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale/metrics.csv"
+      - --metric
+      - val/loss_total
+      - --direction
+      - lower
+      - --minimum-points
+      - "5"
+      - --minimum-relative-improvement
+      - "0.005"
+      - --success-marker
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale/success.json"
+      - --report
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale/report.json"
+      - --
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960_gate.yaml"
+      - --device
+      - cuda:0
+      - --output-dir
+      - "{project_root}/outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale"
+      - --epochs
+      - "5"
+      - --max-samples
+      - "128"
+      - --no-resume
+      - --no-wandb
+    completion_marker: outputs/training_gates/head_crop_cooperative_detr_l_960/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: data effect / normal400 / ellipse DEIMv2-L + Query Refinement
+  # -----------------------------------------------------------------------
+  - name: active_learning_effect_normal400_schema_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_normal400
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/validate_active_learning_effect_training.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - normal400
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_normal400/schema/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_normal400/schema/success.json
+
+  - name: active_learning_effect_normal400_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_normal400
+    gate_stage: gpu_step
+    depends_on: [active_learning_effect_normal400_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - normal400
+      - --stage
+      - gpu_step
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_normal400/gpu_step/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_normal400/gpu_step/success.json
+
+  - name: active_learning_effect_normal400_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_normal400
+    gate_stage: overfit
+    depends_on: [active_learning_effect_normal400_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - normal400
+      - --stage
+      - overfit
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_normal400/overfit/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_normal400/overfit/success.json
+
+  - name: active_learning_effect_normal400_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_normal400
+    gate_stage: small_scale
+    depends_on: [active_learning_effect_normal400_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - normal400
+      - --stage
+      - small_scale
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_normal400/small_scale/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_normal400/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # TEST GROUP: data effect / active357 / ellipse DEIMv2-L + Query Refinement
+  # -----------------------------------------------------------------------
+  - name: active_learning_effect_active357_schema_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_active357
+    gate_stage: schema
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/validate_active_learning_effect_training.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - active357
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_active357/schema/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_active357/schema/success.json
+
+  - name: active_learning_effect_active357_gpu_step_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_active357
+    gate_stage: gpu_step
+    depends_on: [active_learning_effect_active357_schema_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - active357
+      - --stage
+      - gpu_step
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_active357/gpu_step/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_active357/gpu_step/success.json
+
+  - name: active_learning_effect_active357_overfit_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_active357
+    gate_stage: overfit
+    depends_on: [active_learning_effect_active357_gpu_step_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - active357
+      - --stage
+      - overfit
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_active357/overfit/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_active357/overfit/success.json
+
+  - name: active_learning_effect_active357_small_scale_gate
+    enabled: true
+    phase: gate
+    architecture: active_learning_effect_active357
+    gate_stage: small_scale
+    depends_on: [active_learning_effect_active357_overfit_gate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_active_learning_effect_gate.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --arm
+      - active357
+      - --stage
+      - small_scale
+      - --device
+      - cuda:0
+      - --success-marker
+      - "{project_root}/outputs/training_gates/active_learning_effect_active357/small_scale/success.json"
+    completion_marker: outputs/training_gates/active_learning_effect_active357/small_scale/success.json
+
+  # -----------------------------------------------------------------------
+  # PRODUCTION TRAINING GROUP: contiguous unattended work
+  # -----------------------------------------------------------------------
+  - name: shared_head_codino_unfrozen_train
+    enabled: true
+    phase: production_train
+    architecture: shared_head_codino_vits16plus_960_unfrozen
+    depends_on:
+      - shared_head_codino_unfrozen_schema_gate
+      - shared_head_codino_unfrozen_gpu_step_gate
+      - shared_head_codino_unfrozen_overfit_gate
+      - shared_head_codino_unfrozen_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960_unfrozen.yaml"
+      - --initialize-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --wandb
+    completion_marker: runs/shared_head_codino_vits16plus_960_balanced_811_unfrozen/training_complete.json
+    resume:
+      checkpoint: runs/shared_head_codino_vits16plus_960_balanced_811_unfrozen/last.pth
+      arguments: [--resume, "{checkpoint}"]
+
+  - name: three_stage_face_stage_train
+    enabled: true
+    phase: production_train
+    architecture: three_stage_face_stage
+    depends_on:
+      - three_stage_face_stage_schema_gate
+      - three_stage_face_stage_gpu_step_gate
+      - three_stage_face_stage_overfit_gate
+      - three_stage_face_stage_small_scale_gate
+      - shared_head_codino_unfrozen_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_face_stage.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+      - --initialize-shared-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811_unfrozen/best_val_loss.pth"
+      - --initialize-shared-dino-from-head-checkpoint
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_face_stage_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_face_stage_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_keypoint_stage_train
+    enabled: true
+    phase: production_train
+    architecture: three_stage_keypoint_stage
+    depends_on:
+      - three_stage_keypoint_stage_schema_gate
+      - three_stage_keypoint_stage_gpu_step_gate
+      - three_stage_keypoint_stage_overfit_gate
+      - three_stage_keypoint_stage_small_scale_gate
+      - three_stage_face_stage_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_keypoint_stage.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+      - --initialize-from
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_face_stage_seed42/checkpoints/best_val_loss.pt"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_keypoint_stage_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_keypoint_stage_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: shared_head_codino_train
+    enabled: true
+    phase: production_train
+    architecture: shared_head_codino_vits16plus_960
+    depends_on:
+      - shared_head_codino_schema_gate
+      - shared_head_codino_gpu_step_gate
+      - shared_head_codino_overfit_gate
+      - shared_head_codino_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --wandb
+    completion_marker: runs/shared_head_codino_vits16plus_960_balanced_811/training_complete.json
+    resume:
+      checkpoint: runs/shared_head_codino_vits16plus_960_balanced_811/last.pth
+      arguments: [--resume, "{checkpoint}"]
+
+  - name: deimv2_joint_train
+    enabled: true
+    phase: production_train
+    architecture: keypoint_comparison2_deimv2_joint
+    depends_on:
+      - deimv2_joint_schema_gate
+      - deimv2_joint_gpu_step_gate
+      - deimv2_joint_overfit_gate
+      - deimv2_joint_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - train
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/keypoint_comparison2/face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/deimv2_joint/training_complete.json
+    resume:
+      checkpoint: outputs/keypoint_comparison2/face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/deimv2_joint/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_baseline_train
+    enabled: false
+    phase: production_train
+    architecture: three_stage_baseline
+    depends_on:
+      - three_stage_baseline_schema_gate
+      - three_stage_baseline_gpu_step_gate
+      - three_stage_baseline_overfit_gate
+      - three_stage_baseline_small_scale_gate
+      - shared_head_codino_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+      - --initialize-shared-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_hpg_train
+    enabled: false
+    phase: production_train
+    architecture: three_stage_hpg
+    depends_on:
+      - three_stage_hpg_schema_gate
+      - three_stage_hpg_gpu_step_gate
+      - three_stage_hpg_overfit_gate
+      - three_stage_hpg_small_scale_gate
+      - shared_head_codino_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+      - --initialize-shared-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: three_stage_ellipse_border_crop_train
+    enabled: false
+    phase: production_train
+    architecture: three_stage_ellipse_border_crop
+    depends_on:
+      - three_stage_ellipse_border_crop_schema_gate
+      - three_stage_ellipse_border_crop_gpu_step_gate
+      - three_stage_ellipse_border_crop_overfit_gate
+      - three_stage_ellipse_border_crop_small_scale_gate
+      - shared_head_codino_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+      - --initialize-shared-head-from
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: head_crop_cooperative_train
+    enabled: true
+    phase: production_train
+    architecture: head_crop_cooperative_detr_l_960
+    depends_on:
+      - head_crop_cooperative_schema_gate
+      - head_crop_cooperative_gpu_step_gate
+      - head_crop_cooperative_overfit_gate
+      - head_crop_cooperative_small_scale_gate
+      - shared_head_codino_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/train_head_crop_cooperative_with_shared_head.py"
+      - --head-config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --head-checkpoint
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --cache-output-root
+      - "{project_root}/outputs/shared_head_codino_vits16plus_960_balanced_811"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960.yaml"
+      - --device
+      - cuda:0
+      - --wandb
+    completion_marker: outputs/experiments/head_crop_cooperative_detr_l_960_seed42/training_complete.json
+    resume:
+      checkpoint: outputs/experiments/head_crop_cooperative_detr_l_960_seed42/checkpoints/last.pt
+      arguments: []
+
+  - name: active_learning_effect_normal400_detector_train
+    enabled: true
+    phase: production_train
+    architecture: active_learning_effect_normal400
+    depends_on:
+      - active_learning_effect_normal400_schema_gate
+      - active_learning_effect_normal400_gpu_step_gate
+      - active_learning_effect_normal400_overfit_gate
+      - active_learning_effect_normal400_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_dinov3_deimv2.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/normal400_detector.yaml"
+      - --data-root
+      - "{project_root}/outputs/dataset_cache/active_learning_effect/normal400"
+      - --output-dir
+      - "{project_root}/outputs/experiments/active_learning_effect/normal400/ellipse_deimv2_l"
+      - --device
+      - cuda:0
+      - --wandb
+      - --wandb-entity
+      - sato-waseda-university
+      - --wandb-project
+      - face_detection
+      - --wandb-run-name
+      - active_learning_effect_normal400_ellipse_deimv2_l_seed0
+      - --wandb-group
+      - active_learning_effect_normal400_vs_active357
+      - --wandb-mode
+      - online
+      - --dataset-version
+      - face_pose_drive_v2_balanced_811_plus_normal400_seed20260802
+    completion_marker: outputs/experiments/active_learning_effect/normal400/ellipse_deimv2_l/summary.md
+    resume:
+      checkpoint: outputs/experiments/active_learning_effect/normal400/ellipse_deimv2_l/checkpoints/last.pt
+      arguments: [--resume-from, "{checkpoint}"]
+
+  - name: active_learning_effect_active357_detector_train
+    enabled: true
+    phase: production_train
+    architecture: active_learning_effect_active357
+    depends_on:
+      - active_learning_effect_active357_schema_gate
+      - active_learning_effect_active357_gpu_step_gate
+      - active_learning_effect_active357_overfit_gate
+      - active_learning_effect_active357_small_scale_gate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/train_dinov3_deimv2.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/active357_detector.yaml"
+      - --data-root
+      - "{project_root}/outputs/dataset_cache/active_learning_effect/active357"
+      - --output-dir
+      - "{project_root}/outputs/experiments/active_learning_effect/active357/ellipse_deimv2_l"
+      - --device
+      - cuda:0
+      - --wandb
+      - --wandb-entity
+      - sato-waseda-university
+      - --wandb-project
+      - face_detection
+      - --wandb-run-name
+      - active_learning_effect_active357_ellipse_deimv2_l_seed0
+      - --wandb-group
+      - active_learning_effect_normal400_vs_active357
+      - --wandb-mode
+      - online
+      - --dataset-version
+      - face_pose_drive_v2_balanced_811_plus_active357
+    completion_marker: outputs/experiments/active_learning_effect/active357/ellipse_deimv2_l/summary.md
+    resume:
+      checkpoint: outputs/experiments/active_learning_effect/active357/ellipse_deimv2_l/checkpoints/last.pt
+      arguments: [--resume-from, "{checkpoint}"]
+
+  - name: active_learning_effect_normal400_query_refinement_train
+    enabled: true
+    phase: production_train
+    architecture: active_learning_effect_normal400
+    depends_on:
+      - active_learning_effect_normal400_schema_gate
+      - active_learning_effect_normal400_gpu_step_gate
+      - active_learning_effect_normal400_overfit_gate
+      - active_learning_effect_normal400_small_scale_gate
+      - active_learning_effect_normal400_detector_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/normal400_query_refinement.yaml"
+      - --stage
+      - train
+      - --variants
+      - query_refinement
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/experiments/active_learning_effect/normal400/query_refinement/training_summary.json
+    resume:
+      checkpoint: outputs/experiments/active_learning_effect/normal400/query_refinement/checkpoints/last.pt
+      arguments: []
+
+  - name: active_learning_effect_active357_query_refinement_train
+    enabled: true
+    phase: production_train
+    architecture: active_learning_effect_active357
+    depends_on:
+      - active_learning_effect_active357_schema_gate
+      - active_learning_effect_active357_gpu_step_gate
+      - active_learning_effect_active357_overfit_gate
+      - active_learning_effect_active357_small_scale_gate
+      - active_learning_effect_active357_detector_train
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/active357_query_refinement.yaml"
+      - --stage
+      - train
+      - --variants
+      - query_refinement
+      - --device
+      - cuda:0
+      - --resume
+      - --wandb
+    completion_marker: outputs/experiments/active_learning_effect/active357/query_refinement/training_summary.json
+    resume:
+      checkpoint: outputs/experiments/active_learning_effect/active357/query_refinement/checkpoints/last.pt
+      arguments: []
+
+  # -----------------------------------------------------------------------
+  # EVALUATION GROUP
+  # -----------------------------------------------------------------------
+  - name: shared_head_codino_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: shared_head_codino_vits16plus_960
+    depends_on: [shared_head_codino_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/eval_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --checkpoint
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --split
+      - val
+      - --output
+      - "{project_root}/outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/val/predictions.json"
+    completion_marker: outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/val/wandb_evaluation_sync.json
+
+  - name: shared_head_codino_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: shared_head_codino_vits16plus_960
+    depends_on: [shared_head_codino_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/eval_head_codino.py"
+      - --config
+      - "{project_root}/configs/head_codino/shared_three_stage_960.yaml"
+      - --checkpoint
+      - "{project_root}/runs/shared_head_codino_vits16plus_960_balanced_811/last.pth"
+      - --split
+      - test
+      - --output
+      - "{project_root}/outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/test/predictions.json"
+    completion_marker: outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/test/wandb_evaluation_sync.json
+  - name: deimv2_joint_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: keypoint_comparison2_deimv2_joint
+    depends_on: [deimv2_joint_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - evaluate
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --split
+      - val
+    completion_marker: outputs/keypoint_comparison2/face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/deimv2_joint/evaluation/val/wandb_evaluation_sync.json
+
+  - name: deimv2_joint_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: keypoint_comparison2_deimv2_joint
+    depends_on: [deimv2_joint_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison2/run.py"
+      - --config
+      - "{project_root}/keypoint_comparison2/configs/production.yaml"
+      - --stage
+      - evaluate
+      - --models
+      - deimv2_joint
+      - --device
+      - cuda:0
+      - --split
+      - test
+    completion_marker: outputs/keypoint_comparison2/face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/deimv2_joint/evaluation/test/wandb_evaluation_sync.json
+
+  - name: three_stage_baseline_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_baseline
+    depends_on: [three_stage_baseline_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/val/wandb_evaluation_sync.json
+
+  - name: three_stage_hpg_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_hpg
+    depends_on: [three_stage_hpg_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/val/wandb_evaluation_sync.json
+
+  - name: three_stage_ellipse_border_crop_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_ellipse_border_crop
+    depends_on: [three_stage_ellipse_border_crop_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/evaluation/val/wandb_evaluation_sync.json
+
+  - name: head_crop_cooperative_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: head_crop_cooperative_detr_l_960
+    depends_on: [head_crop_cooperative_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/head_crop_cooperative_detr_l_960_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/head_crop_cooperative_detr_l_960_seed42/evaluation/val/wandb_evaluation_sync.json
+
+  - name: three_stage_baseline_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_baseline
+    depends_on: [three_stage_baseline_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_baseline.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_baseline_seed42/evaluation/test/wandb_evaluation_sync.json
+
+  - name: three_stage_hpg_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_hpg
+    depends_on: [three_stage_hpg_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_hpg.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_hpg_seed42/evaluation/test/wandb_evaluation_sync.json
+
+  - name: three_stage_ellipse_border_crop_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: three_stage_ellipse_border_crop
+    depends_on: [three_stage_ellipse_border_crop_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42/evaluation/test/wandb_evaluation_sync.json
+
+  - name: head_crop_cooperative_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: head_crop_cooperative_detr_l_960
+    depends_on: [head_crop_cooperative_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/tools/eval_face_keypoint_cooperative.py"
+      - --config
+      - "{project_root}/configs/face_keypoint_cooperative/head_crop_cooperative_detr_l_960.yaml"
+      - --checkpoint
+      - "{project_root}/outputs/experiments/head_crop_cooperative_detr_l_960_seed42/checkpoints/best_val_loss.pt"
+      - --split
+      - test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/head_crop_cooperative_detr_l_960_seed42/evaluation/test/wandb_evaluation_sync.json
+
+  - name: active_learning_effect_normal400_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: active_learning_effect_normal400
+    depends_on: [active_learning_effect_normal400_query_refinement_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/normal400_query_refinement.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query_refinement
+      - --evaluation-set
+      - v2_val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/active_learning_effect/normal400/evaluation/val/baseline_aligned/success.json
+
+  - name: active_learning_effect_active357_val_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: active_learning_effect_active357
+    depends_on: [active_learning_effect_active357_query_refinement_train]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/active357_query_refinement.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query_refinement
+      - --evaluation-set
+      - v2_val
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/active_learning_effect/active357/evaluation/val/baseline_aligned/success.json
+
+  - name: active_learning_effect_normal400_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: active_learning_effect_normal400
+    depends_on: [active_learning_effect_normal400_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/normal400_query_refinement.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query_refinement
+      - --evaluation-set
+      - v2_test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/active_learning_effect/normal400/evaluation/test/baseline_aligned/success.json
+
+  - name: active_learning_effect_active357_test_evaluate
+    enabled: true
+    phase: evaluation
+    architecture: active_learning_effect_active357
+    depends_on: [active_learning_effect_active357_val_evaluate]
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/keypoint_comparison1/scripts/run_landmark_experiments.py"
+      - --config
+      - "{project_root}/configs/active_learning_effect/active357_query_refinement.yaml"
+      - --stage
+      - evaluate
+      - --variants
+      - query_refinement
+      - --evaluation-set
+      - v2_test
+      - --device
+      - cuda:0
+    completion_marker: outputs/experiments/active_learning_effect/active357/evaluation/test/baseline_aligned/success.json
+
+  - name: active_learning_effect_compare_visualize
+    enabled: true
+    phase: postprocess
+    depends_on:
+      - active_learning_effect_normal400_test_evaluate
+      - active_learning_effect_active357_test_evaluate
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/compare_active_learning_effect.py"
+      - --experiment-config
+      - "{project_root}/configs/active_learning_effect/experiment.yaml"
+      - --output-dir
+      - "{project_root}/outputs/experiments/active_learning_effect/comparison"
+    completion_marker: outputs/experiments/active_learning_effect/comparison/success.json
+
+  # -----------------------------------------------------------------------
+  # ACTIVE-LEARNING VIDEO INFERENCE + FRAME EXTRACTION
+  # Keep these jobs independent: queue order makes them sequential, while an
+  # allowed failure in one dataset does not suppress the remaining datasets.
+  # -----------------------------------------------------------------------
+  - name: active_learning08_02_4_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-4-4
+      - --allow-known-videos
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-4-4/summary.json
+
+  - name: active_learning08_02_5_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-5-4
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-5-4/summary.json
+
+  - name: active_learning08_02_6_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-6-4
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-6-4/summary.json

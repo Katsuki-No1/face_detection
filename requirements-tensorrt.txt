@@ -1,0 +1,4 @@
+# Optional production inference dependency. Install after the base
+# requirements into the same virtual environment.
+tensorrt-cu12==11.2.1.2
+nvidia-modelopt[onnx]==0.45.0

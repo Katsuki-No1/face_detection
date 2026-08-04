@@ -470,6 +470,8 @@ class DINODeimStyleCriterion(nn.Module):
             else:
                 cls_target = torch.ones_like(quality)
                 weight = torch.ones_like(quality)
+            cls_target = cls_target.to(device=target_classes.device, dtype=target_classes.dtype)
+            weight = weight.to(device=pred_boxes.device, dtype=pred_boxes.dtype)
             target_classes[batch_index, src_indices, labels[target_indices]] = cls_target
             matched_pred_boxes.append(src_boxes)
             matched_target_boxes.append(dst_boxes)

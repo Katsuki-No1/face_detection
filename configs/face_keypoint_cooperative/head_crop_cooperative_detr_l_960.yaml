@@ -1,0 +1,80 @@
+extends: face_keypoint_cooperative_detr_l_960.yaml
+
+schema_version: 1
+experiment_name: head_codino_head_crop_cooperative_detr_l_960_seed42
+
+model:
+  face_detector:
+    initialization: pretrained
+    config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16plus_face_pose_drive_v2_balanced_811_960_ellipse.yaml
+  pose_branch:
+    initialization: fine_tuned
+    checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query_refinement/checkpoints/best_nme.pt
+    prefer_ema: true
+    minimum_eligible_load_fraction: 0.65
+    state_head_mode: factorized_presence_visibility
+  # HEAD detection is an upstream shared component, not a second trainable
+  # branch inside every crop model.
+  shared_head_branch:
+    enabled: false
+  external_head_cascade:
+    enabled: false
+  head_pose_geometry:
+    enabled: false
+
+data:
+  dataset_version: face_pose_drive_v2_balanced_811
+  head_centric: true
+  image_root: outputs/dataset_cache/face_pose_drive_v2_balanced_811
+  image_size: 960
+  category_ids: [1]
+  target_category_id: 2
+  annotations:
+    train: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/train.json
+    val: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/val.json
+    test: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json
+  predicted_head_caches:
+    train: outputs/shared_head_codino_vits16plus_960_balanced_811/head_cache/train.json
+    val: outputs/shared_head_codino_vits16plus_960_balanced_811/head_cache/val.json
+    test: outputs/shared_head_codino_vits16plus_960_balanced_811/head_cache/test.json
+  head_crop:
+    enabled: true
+    require_predicted_heads: true
+    # Locked common-evaluation contract.
+    context_scale: 1.20
+    output_size: 960
+    pad_value: 0.0
+    evaluation_batch_size: 4
+  augmentation:
+    enabled: false
+  synthetic:
+    enabled: false
+
+train:
+  seed: 42
+
+evaluation:
+  keypoint_presence_threshold: 0.50
+
+output:
+  root: outputs/experiments/head_crop_cooperative_detr_l_960_seed42
+
+wandb:
+  enabled: true
+  group: head_codino_head_crop_cooperative
+  name: head_codino_head_crop_cooperative_detr_l_960_seed42
+  tags:
+    - DINOv3-ViT-S-plus
+    - shared-upstream-head
+    - predicted-head-crop
+    - cooperative
+    - landmark-query
+
+provenance:
+  shared_head_config: configs/head_codino/shared_three_stage_960.yaml
+  shared_head_checkpoint: runs/shared_head_codino_vits16plus_960_balanced_811/last.pth
+  head_crop_contract: square_1.20x_max_head_side
+  threshold_policy:
+    source: locked_common_evaluation_contract
+    head_score: 0.30
+    test_selection_forbidden: true

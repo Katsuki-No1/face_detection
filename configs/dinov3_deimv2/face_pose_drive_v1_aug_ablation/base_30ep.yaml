@@ -1,0 +1,21 @@
+extends: ../dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze.yaml
+
+experiment_name: dinov3_deimv2_m_face_pose_drive_v1_aug_ablation_base
+
+loss:
+  matcher:
+    matcher_change_epoch: 20
+
+train:
+  name: dinov3_deimv2_m_face_pose_drive_v1_aug_ablation_base
+  epochs: 30
+  validation:
+    enabled: true
+    every: 5
+    split: val
+    image_size: 960
+    fixed_threshold: 0.3
+    score_min: 0.001
+
+augmentation:
+  close_mosaic: 5

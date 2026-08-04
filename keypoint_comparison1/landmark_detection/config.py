@@ -87,6 +87,12 @@ def load_landmark_config(path: str | Path, *, project_root: str | Path | None = 
     for name, value in dict(data.get("evaluation_sets", {})).items():
         value["root"] = _resolved(root, value["root"])
         value["annotation"] = _resolved(root, value["annotation"])
+    evaluation = raw.get("evaluation", {})
+    if evaluation.get("baseline_aligned_output_root"):
+        evaluation["baseline_aligned_output_root"] = _resolved(
+            root,
+            evaluation["baseline_aligned_output_root"],
+        )
     backbone = model.get("backbone", {})
     for key in ("hub_repo", "weights", "initialize_from_deim_checkpoint"):
         if backbone.get(key):

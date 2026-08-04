@@ -1,0 +1,55 @@
+# Active-learning model versions are resolved from this registry. The
+# threshold is read from the evaluation artifact paired with each checkpoint;
+# do not duplicate analysis_threshold in pipeline configs.
+models:
+  yolo26m_pose_face_pose_drive_v1_960:
+    name: yolo26m_pose
+    adapter: yolo26m
+    weights: runs/yolo/yolo26_pose/face_pose_drive_v1/yolo26m_pose_full/weights/best.pt
+    checkpoint_state: model
+    threshold_source: outputs/evaluations/yolo26m_pose_face_pose_drive_v1_960/test_common_bbox/metrics.json
+    threshold_field: fixed_threshold
+    input_size: 960
+    confidence_threshold: 0.05
+    max_detections: 100
+    batch_size: 8
+    model_weight: 0.5178
+    validation_map: 0.5178
+    source_class_id: 0
+    class_id: 2
+    class_name: face
+
+  dinov3_deimv2_l_face_pose_drive_v1_960_full:
+    name: dinov3_deimv2_l_unfreeze_ema
+    adapter: dinov3_deimv2
+    config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml
+    weights: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full/checkpoints/best_val_map.pt
+    checkpoint_state: ema
+    threshold_source: outputs/evaluations/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full/test/metrics.json
+    threshold_field: fixed_threshold
+    embedding_source: true
+    input_size: 960
+    confidence_threshold: 0.05
+    max_detections: 100
+    batch_size: 4
+    model_weight: 0.5470
+    validation_map: 0.5470
+    source_class_id: 0
+    class_id: 2
+    class_name: face
+
+  rtmdet_hf_head_face_pose_drive_v1_960_epoch54:
+    name: rtmdet_hf_head_epoch54
+    adapter: rtmdet
+    config: configs/rtmdet/rtmdet_s_hf_full_960_wandb.py
+    weights: outputs/experiments/rtmdet_s_hf_drive_v1_960_low_lr_20260719/best_coco_bbox_mAP_epoch_54.pth
+    checkpoint_state: model
+    threshold_source: outputs/evaluations/rtmdet_s_hf_face_drive_v1_960/val_common_bbox/metrics.json
+    threshold_field: fixed_threshold
+    input_size: 960
+    confidence_threshold: 0.05
+    max_detections: 100
+    batch_size: 8
+    source_class_id: 0
+    class_id: 1
+    class_name: head

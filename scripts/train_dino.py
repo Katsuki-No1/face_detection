@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config_utils import load_yaml_config
+from src.checkpoint_retention import prune_periodic_checkpoints
 from src.data import AugmentedFaceKeypointDataset, FaceKeypointDataset, SyntheticFaceKeypointDataset, collate_face_keypoint_batch
 from src.models import build_detector_from_config
 
@@ -1858,6 +1859,7 @@ def train(
                     metrics=metrics,
                     ema=ema,
                 )
+                prune_periodic_checkpoints(output_dir / "checkpoints", keep=1)
             if validation_enabled and validation_every > 0 and (epoch % validation_every == 0 or epoch == epochs):
                 val_metrics = validate_detection_split(
                     ema.module if ema is not None else model,
@@ -1977,6 +1979,7 @@ def train(
                 wandb_run.log(wandb_metrics, step=epoch)
             if early_stopping_triggered:
                 break
+    prune_periodic_checkpoints(output_dir / "checkpoints", keep=0)
     print(f"training_complete: {output_dir} early_stopped={early_stopping_triggered}")
     return 0
 

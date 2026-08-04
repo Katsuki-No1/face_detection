@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from src.checkpoint_retention import prune_periodic_checkpoints
+
 from .config import (
     KEYPOINT_TARGET_POLICY,
     LandmarkExperimentConfig,
@@ -350,6 +352,18 @@ def train_variant(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train_dataset = make_dataset(raw, split="train", training=True)
     val_dataset = make_dataset(raw, split="val", training=False)
+    max_train_samples = train_cfg.get("max_train_samples")
+    max_val_samples = train_cfg.get("max_val_samples")
+    if max_train_samples is not None:
+        train_dataset = torch.utils.data.Subset(
+            train_dataset,
+            range(min(int(max_train_samples), len(train_dataset))),
+        )
+    if max_val_samples is not None:
+        val_dataset = torch.utils.data.Subset(
+            val_dataset,
+            range(min(int(max_val_samples), len(val_dataset))),
+        )
     generator = torch.Generator().manual_seed(seed)
     num_workers = int(train_cfg.get("num_workers", 4))
     loader = DataLoader(
@@ -508,6 +522,7 @@ def train_variant(
             torch.save(state, checkpoint_dir / "last.pt")
             if epoch % int(train_cfg.get("checkpoint_every", 5)) == 0:
                 torch.save(state, checkpoint_dir / f"epoch_{epoch:04d}.pt")
+                prune_periodic_checkpoints(checkpoint_dir, keep=1)
             improvement = best_nme - nme
             if improvement > float(early_cfg.get("min_delta", 1e-4)):
                 best_nme = nme
@@ -540,6 +555,7 @@ def train_variant(
             run.finish(exit_code=1)
         raise
     elapsed = time.perf_counter() - started
+    prune_periodic_checkpoints(checkpoint_dir, keep=0)
     summary = {
         "status": "complete",
         "variant": variant,

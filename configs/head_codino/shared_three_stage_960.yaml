@@ -1,0 +1,39 @@
+extends: face_pose_drive_v2_balanced_811.yaml
+
+# Common upstream detector for both downstream paths:
+#   1. integrated full-frame Three-stage HEAD branch initialization;
+#   2. predicted-HEAD caches for HEAD-crop cooperative DINO.
+model:
+  score_threshold: 0.001
+
+data:
+  image_size: 960
+
+train:
+  output_dir: runs/shared_head_codino_vits16plus_960_balanced_811
+  seed: 42
+  validate_each_epoch: true
+  # W&B keeps the full metric/config history. Locally retain last/best plus a
+  # bounded periodic recovery point instead of one checkpoint per epoch.
+  save_every: 5
+
+evaluation:
+  output: outputs/shared_head_codino_vits16plus_960_balanced_811/val_predictions.json
+
+benchmark:
+  output: outputs/shared_head_codino_vits16plus_960_balanced_811/benchmark.json
+
+wandb:
+  enabled: true
+  metric_schema_version: 2
+  live_sync_seconds: 30
+  entity: sato-waseda-university
+  project: face_detection
+  group: shared_head_codino_vits16plus_960
+  name: shared_head_codino_vits16plus_960_balanced_811_seed42
+  mode: online
+  tags:
+    - DINOv3-ViT-S-plus
+    - Co-DINO-HEAD
+    - shared-component
+    - face_pose_drive_v2_balanced_811

@@ -1,0 +1,66 @@
+version: 1
+
+queue:
+  name: priority_active_learning08_02_inference
+  state_dir: outputs/training_queues/priority_active_learning08_02_inference
+  continue_on_failure: false
+  continue_on_failure_phases:
+    - postprocess
+  gate_contract:
+    enabled: false
+  gpu:
+    index: 0
+  wait:
+    poll_seconds: 15
+    log_interval_seconds: 60
+    idle_samples: 4
+    max_gpu_utilization: 25
+    max_memory_used_mib: 2500
+    timeout_seconds: 0
+    extra_process_patterns: []
+
+jobs:
+  - name: active_learning08_02_4_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-4-4
+      - --allow-known-videos
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-4-4/summary.json
+
+  - name: active_learning08_02_5_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-5-4
+      - --allow-known-videos
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-5-4/summary.json
+
+  - name: active_learning08_02_6_4_infer_extract
+    enabled: true
+    phase: postprocess
+    command:
+      - "{project_root}/.venv/bin/python"
+      - "{project_root}/scripts/run_strongest_active_learning.py"
+      - --config
+      - "{project_root}/configs/active_learning_tensorrt.yaml"
+      - --dataset-name
+      - active_learning08-02-6-4
+      - --allow-known-videos
+      - --stage
+      - all
+    completion_marker: data/output/active_learning/active_learning08-02-6-4/summary.json

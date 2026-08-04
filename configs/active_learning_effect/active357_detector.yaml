@@ -1,0 +1,31 @@
+extends: ../dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco.yaml
+
+experiment_name: active_learning_effect_active357_ellipse_deimv2_l
+
+data:
+  dataset_version: face_pose_drive_v2_balanced_811_plus_active357
+  data_root: outputs/dataset_cache/active_learning_effect/active357
+  annotation_path: outputs/dataset_adapters/active_learning_effect/active357/face_keypoints_train.json
+  annotation_paths:
+    train: outputs/dataset_adapters/active_learning_effect/active357/face_keypoints_train.json
+    val: outputs/dataset_adapters/active_learning_effect/active357/face_keypoints_val.json
+    test: outputs/dataset_adapters/active_learning_effect/active357/face_keypoints_test.json
+  image_root: outputs/dataset_cache/active_learning_effect/active357
+
+train:
+  name: active_learning_effect_active357_ellipse_deimv2_l_seed0
+  seed: 0
+
+verification:
+  expected_images: {train: 4594, val: 530, test: 528}
+  expected_coco_sha256:
+    train: bad8c2eaab2f5a819726b59e43cc13cff67f06392030383b7f72cf40fc44ce3b
+    val: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+    test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
+  expected_ellipse_annotations: {train: 7023, val: 840, test: 769}
+  expected_ellipse_coco_sha256:
+    train: bad8c2eaab2f5a819726b59e43cc13cff67f06392030383b7f72cf40fc44ce3b
+    val: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+    test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
+  ellipse_annotation_summary: outputs/dataset_adapters/active_learning_effect/active357/conversion_summary.json
+  output: outputs/training_gates/active_learning_effect_active357/schema/detector_preflight

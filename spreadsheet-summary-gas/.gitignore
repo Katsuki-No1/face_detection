@@ -1,0 +1,8 @@
+# Google OAuth
+credentials.json
+credential.json
+token.json
+.env
+
+# Local Node.js dependencies
+node_modules/

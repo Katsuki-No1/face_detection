@@ -4,6 +4,206 @@
 
 このリポジトリでは、個人情報や実データを Git に含めない運用を前提にしています。モデルの重み、入力動画、抽出したフレーム、アノテーション、生成したデータセット、学習結果、推論結果はローカルに保存し、`.gitignore` によって Git の管理対象から除外します。
 
+## RTMDet-HF 3,090フレーム学習
+
+`configs/rtmdet/rtmdet_s_hf_full_960_wandb.py`は、変換済みの
+`datasets/rtmdet_hf_drive_v1`を使って`head`と`face`を同時学習する2クラスRTMDet-S設定です。
+旧390フレーム版の`output_experiment/data/mmdet_hf`は参照しません。
+
+接続後のdatasetを検査し、画像欠損0、split間の元動画ID・画像SHA-256・画像path重複0を確認しました。
+`rtmdet_hf_drive_v1`は`face_pose_drive_v1`と同じ3,090画像・同じ動画単位splitを使い、
+既存Face annotationへ変換済みHead annotationを追加したdatasetです。
+
+| split | source videos | images | Head annotations | Face annotations | total annotations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| train | 26 | 2,460 | 4,536 | 4,027 | 8,563 |
+| validation | 3 | 300 | 525 | 503 | 1,028 |
+| test | 4 | 330 | 512 | 503 | 1,015 |
+
+RTMDet-Sは8,856,738 parameters、960px、batch 16、AdamW 2e-4、AMP、EMAで
+60 epoch全件学習しています。Mosaicを含むstage 1からepoch 50で非Mosaicのstage 2へ切り替えます。
+
+```bash
+PYTHONPATH=. .venv/bin/python tools/preflight_rtmdet_hf.py
+
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+  .venv/lib/python3.12/site-packages/mmdet/.mim/tools/train.py \
+  configs/rtmdet/rtmdet_s_hf_full_960_wandb.py
+
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+  .venv/lib/python3.12/site-packages/mmdet/.mim/tools/test.py \
+  configs/rtmdet/rtmdet_s_hf_full_960_wandb.py \
+  outputs/experiments/rtmdet_s_hf_drive_v1_960_low_lr_20260719/best_coco_bbox_mAP_epoch_54.pth \
+  --work-dir outputs/experiments/rtmdet_s_hf_drive_v1_960_low_lr_20260719/eval_test_best
+```
+
+best checkpointはtestを見ず、validation COCO mAPが最高だったepoch 54を選択しました。
+独立test 330画像 / 1,015 annotationの結果は次のとおりです。
+
+| split / class | mAP50:95 | AP50 | AP75 |
+| --- | ---: | ---: | ---: |
+| validation overall | 0.616 | 0.921 | 0.671 |
+| test overall | 0.660 | 0.937 | 0.718 |
+| test head | 0.796 | 0.974 | 0.871 |
+| test face | 0.525 | 0.900 | 0.564 |
+
+Headはtest 512 annotationに対してmAP50:95 `0.796`、AP50 `0.974`、AP75 `0.871`でした。
+AP50だけでなくAP75も高いため、Headの有無だけでなくbbox位置も比較的安定しています。
+size別ではHead AP medium `0.304`、AP large `0.801`であり、largeに対してmediumのHeadが
+主な改善対象です。YOLO11s PoseとDEIMv2-Mの既存runはFaceだけを学習しており、
+Head annotationを学習・評価していないため、Head mAPを3モデル間で直接比較することはできません。
+
+同じtest 330画像 / 503 Faceに限定した参考比較は次のとおりです。YOLO11sとDEIMv2-Mは
+共通manual COCO-like evaluator、RTMDet-HFはMMDetection `CocoMetric`を使用しているため、
+同じIoU 0.50:0.95の指標でもRTMDet-HFとの比較は厳密な同一評価器比較ではありません。
+
+| model | task | total params | trainable params | Face mAP50:95 | Face AP50 | Face AP75 | mAP差（対RTMDet-HF） |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTMDet-S-HF | Head + Face bbox | **8,856,738** | 8,856,738 | 0.5250 | **0.9000** | 0.5640 | - |
+| YOLO11s Pose | Face bbox + 5 keypoints | 9,715,744 | 9,715,744 | **0.5332** | 0.8850 | **0.5874** | +0.0082 |
+| DEIMv2-M DINO freeze | Face bbox | 18,236,011 | 8,561,769 | 0.4562 | 0.8440 | 0.4222 | -0.0688 |
+
+RTMDet-HFの総parameter数はYOLO11s Poseより約8.8%少なく、DEIMv2-Mより約51.4%少ない構成です。
+Face mAP50:95はYOLO11s Poseより0.0082低い一方、DEIMv2-Mより0.0688高く、AP50は3モデル中
+最高でした。DEIMv2-Mの18,236,011 parametersにはfrozen DINO backboneを含み、実際に更新した
+parametersは8,561,769です。したがって、Head検出を含む用途ではRTMDet-HFが最小の総model sizeで
+Head mAP50:95 `0.796`を提供しつつ、Face検出もYOLO11s Poseに近い性能を維持しています。
+
+YOLO11s Poseの同じtestにおけるpose mAP50:95は`0.8327`ですが、RTMDet-HFとDEIMv2-Mは
+keypoint headを持たないため、これはbbox比較には含めません。各比較のcheckpointとconfidence
+thresholdはvalidationだけで選択し、test上で選び直していません。
+
+学習時間はRTX 4090で2,541秒（42分21秒）でした。結果とEMA適用済みbest checkpointは
+`outputs/experiments/rtmdet_s_hf_drive_v1_960_low_lr_20260719`、W&B runは
+<https://wandb.ai/sato-waseda-university/face_detection/runs/rtmdet-s-hf-drive-v1-960-low-lr-s42-20260719>
+です。機械可読な条件・結果は同directoryの`result_summary.json`へ保存しています。
+
+## 現行最強modelによるActive Learning自動化
+
+`scripts/run_strongest_active_learning.py`は、元動画から10分montageを作成し、model
+registryで指定した現行最強modelを推論して、アノテーション対象frameと選択根拠資料を
+自動生成します。既定modelは`DEIMv2-L ellipse + DINOv3 Query Refinement`です。
+
+1本の元動画を時間方向に10等分し、各区間中央の60秒を時系列順に連結します。生成される
+montageは10分です。5fpsで3,000 frameを推論し、元動画ごとに次の4条件を25%ずつ、
+最大50 frame選びます。ある条件が不足した場合は、他の3条件を実際に満たす候補だけで
+補完します。
+
+- 時系列的な検出矛盾、ellipse中心・軸・角度の不安定
+- validationで固定したface threshold周辺の低confidence
+- face検出はあるが、閾値以上のkeypointが1点もない
+- 予測ellipseが画面の最外周1%へ到達している
+
+入力は指定どおり`data/rawdata/active_learning_data/<dataset-name>/`を優先します。
+既存データとの移行互換のため、現在の
+`data/raw_data/active_learning_data/<dataset-name>/`もfallbackとして認識します。同じ
+datasetを両方へ置いた場合は、入力元の曖昧さを避けるため停止します。
+
+まず書き込みなしで対象を確認できます。
+
+```bash
+.venv/bin/python scripts/run_strongest_active_learning.py \
+  --dataset-name 'active_learning(dataset=3000frame)7-17' \
+  --dry-run
+```
+
+全stageを実行するコマンドは次のとおりです。
+
+```bash
+.venv/bin/python scripts/run_strongest_active_learning.py \
+  --dataset-name 'active_learning(dataset=3000frame)7-17' \
+  --stage all
+```
+
+`montage → infer → select → export → report`を個別に実行できます。中断した推論は
+`--stage infer --resume`、model・threshold・入力・設定を変更して再生成する場合は
+該当stageへ`--force`を指定します。checkpoint/config hash、seed、座標規約、選定閾値、
+montageと元動画の時刻対応は内部provenanceへ保存されます。
+
+modelを変更する場合は
+`configs/model_registry/active_learning_strongest_models.yaml`へ共通
+`face / ellipse / keypoints` schemaを返すadapter entryを追加し、`active_model`だけを
+切り替えます。一時的な比較は`--model-ref <entry>`で行えます。model固有のロード処理は
+adapter内に閉じており、4条件の判定・配分・export処理は変更不要です。
+
+出力は次の構成です。JPEG名は元動画名と元動画frame IDを含みます。
+
+```text
+data/output_active_learning_frame/<dataset-name>/
+  frames/<source-video>__frame_<frame-id>.jpg
+  evidence/<source-video>__frame_<frame-id>__evidence.jpg
+  selection_manifest.csv
+  selection_manifest.jsonl
+  selection_report.html
+  summary.json
+  _active_learning/
+    config_resolved.yaml
+    run_provenance.json
+    videos/<source-video>/
+      montage/
+      inference/
+      selection/
+```
+
+詳細な判定定義とmodel adapter contractは
+`docs/active_learning_strongest.md`を参照してください。
+
+## 旧・複数model比較によるActive Learning用frame dataset生成
+
+`scripts/build_active_learning_montage.py`は、未ラベル動画から動画ごとに最大100枚の原解像度JPEGを選択します。旧clip/montage出力との互換性はありません。既定構成は、一定間隔40枚、モデル間不一致20枚、時系列的不整合20枚、低confidence・bbox不安定20枚です。active枠が不足した場合は他のactive枠だけで補完し、弱い候補や一定間隔frameで100枚へ水増ししません。
+
+入力動画は`data/raw_data/active_learning_data/<dataset-name>/`へ手作業で配置します。実行例は次のとおりです。
+
+```bash
+.venv/bin/python scripts/build_active_learning_montage.py \
+  --config configs/active_learning_frame_dataset.yaml \
+  --dataset-name 'active_learning(dataset=3000frame)7-17' \
+  --stage all
+```
+
+処理順は`inventory → scan → propose → dense → score → select → export → report`です。全体を0.5fpsで走査した後、予備候補の周辺だけを5fpsで解析します。`--resume`で未完了の生成物を再利用し、`--force`で指定stageを再生成できます。入力動画・model file・resolved configのfingerprintが変わった場合は、誤ったcache再利用を防ぐため`--stage all --force`が必要です。
+
+比較modelは`configs/model_registry/active_learning_face_models.yaml`で一元管理します。pipeline YAMLではmodel versionの`ref`だけを指定し、weight、adapter、checkpoint state、source class、保存floor、DINO embedding sourceを解決します。解析thresholdは対応する評価`metrics.json`の`fixed_threshold`から自動取得し、metricsに記録されたcheckpointとregistryのweightが一致しない場合は停止します。新versionへの切替はregistry entryを追加して`ref`を変更します。
+
+`low_confidence`枠は、confidenceが最も低い候補ではなく、model別の`confidence / analysis_threshold`が既定0.70〜1.30に入る境界候補を対象にします。比率1.0に近いほど優先し、0.05付近の弱いraw proposalは除外します。確認overlayでは閾値以上をmodel色、閾値未満の境界bboxをorangeで描画します。既定modelはYOLO26m PoseとDINOv3 + DEIMv2-L unfreeze EMA、HEAD補助は2-class RTMDet-HF epoch 54です。ROIは現在frameのHEAD＋比較modelの閾値周辺以上のbbox和集合、confirmed track補間、frame全体の順で決まり、ROI存在分類器には依存しません。
+
+出力例は次のとおりです。JPEGはdataset directory直下に保存されるため、同じ場所へCVAT export ZIPを追加できます。`--force`は前回manifestに記録された生成物だけを更新し、利用者が追加したファイルは削除しません。
+
+```text
+data/output_active_learning/<dataset-name>/
+  <safe-video>__<source-hash>__f<frame>__t<timestamp>s.jpg
+  _active_learning/
+    config_resolved.yaml
+    run_fingerprint.json
+    inventory/
+    scans/model_predictions/
+    proposals/
+    dense/roi_embeddings.npy
+    candidates/
+    context_clips/
+    overlays/
+    selection_manifest.{csv,jsonl}
+    review.html
+    review_template.csv
+    summary.json
+```
+
+HTMLでは原frame、ROI、model別bbox/confidence、前後2秒のcontext、全選定理由を確認できます。教師データ判定として、顔ありなら`positive`（正しいbboxを付与）、顔なしなら`negative`（bboxなし）、判断を保留する場合は`needs_review`を記録できます。各modelのerror、属性・メモと一緒にJSON/CSVへ保存されます。HTML生成は原frame出力のゲートではなく、contextやoverlayに失敗してもframe自体は先に保存されます。
+
+### 推論済み一様モンタージュの手動確認
+
+`scripts/review_inference_montage.py`で推論済みモンタージュを再生し、推論不良を見つけた位置で`Space`または`P`を押すと停止します。停止と同時に、モンタージュ内の時刻を元動画の該当する10秒区間へ逆変換し、bbox等を描画していない原frameを自動保存します。再度`Space`または`P`で再開し、`A`/`D`で停止中に1 frameずつ移動、`S`で現在位置を追加保存、`Q`または`Esc`で終了します。
+
+MIDAを確認する例です。元動画は`data/raw_data/active_learning_data/`以下から自動検出されます。
+
+```bash
+.venv/bin/python scripts/review_inference_montage.py \
+  --video-prefix MIDA \
+  --inference-video data/output_active_learning/active_montage/MID_2026-07-22/four_model_comparison/four_model_face_comparison.mp4
+```
+
+保存先は`data/output_active_learning/active_montage/MID_YYYY-MM-DD/`です。JPEG名には連番、元動画frame番号、元動画時刻を含み、対応情報は同directoryの`review_manifest.jsonl`へ追記されます。既定の一様モンタージュ条件は、全編60等分・各区間中央の10秒です。
+
 ## このリポジトリでできること
 
 - YOLO Pose を使って、顔の矩形と 5 点の keypoint を推論できます。keypoint の名前は `e1`、`e2`、`n`、`m1`、`m2` です。
@@ -16,6 +216,7 @@
 - SCRFD による顔検出と、必要に応じた MediaPipe による目のランドマーク抽出を実行できます。
 - ラベルの確認、YOLO Pose の推論結果、SCRFD と MediaPipe の処理段階、検出エラーの確認用に overlay 画像を生成できます。
 - DINOv3 / DINOv2 を fine-tune せず frozen backbone として使い、顔・頭・背景・hard negative・patch similarity の特徴分離を Phase 1 として診断できます。
+- DINOv3 を frozen backbone として使い、DEIMv2-style / RT-DETR-style の query detector で head / face bbox を学習・評価する実験入口があります。
 
 ## このリポジトリではできないこと
 
@@ -55,19 +256,30 @@ script/
 
 src/
   phase1_dino/                         # frozen DINO feature analysis 用の crop 生成、特徴抽出、数値解析、HTML report
+  models/dinov3_deimv2/                # official-style DINOv3 + DEIMv2 bbox detector wrapper
+  third_party/deimv2/                  # upstream DEIMv2 の vendored decoder / matcher / criterion / postprocessor
+  data/coco_detection.py               # DINOv3 + DEIMv2 detector 用の COCO detection dataset
 
 configs/
   dino_phase1_feature_analysis.yaml    # Phase 1 DINO 特徴診断の default config
+  dinov3_deimv2/                       # official-style DINOv3 + DEIMv2 detector の debug / full config
 
 docs/
   detector_stage_dump.md               # SCRFD/MediaPipe の debug 出力に関する説明
   phase1_dino_feature_analysis.md      # DINO Phase 1 の目的、CLI、成果物、解釈のメモ
+  dinov3_deimv2_implementation_note.md # official-style DINOv3 + DEIMv2 detector の実装メモ
 
 scripts/
   run_phase1_dino_feature_analysis.sh  # Phase 1 DINO 特徴診断の一括実行ラッパー
   analyze_dinov3_cpu_features.py       # DINOv3 image-level embedding の可視化と近傍解析
   visualize_dinov3_crop_patch_cpu.py   # 実 DINOv3 CPU で crop gallery と patch similarity map を生成する
   profile_training_speed.py            # GPU 空き待ち、1 epoch 学習、nvidia-smi 計測をまとめて実行する
+
+tools/
+  train_dinov3_deimv2.py               # official-style DINOv3 + DEIMv2 detector の学習入口
+  eval_dinov3_deimv2.py                # bbox 指標、threshold sweep、overlay / failure sample を出力する評価入口
+  infer_dinov3_deimv2.py               # 画像またはディレクトリに対する推論入口
+  visualize_dinov3_deimv2.py           # 予測や GT の可視化補助
 
 tests/
   test_dino_phase1_*.py                # DINO Phase 1 の crop/metrics/report の軽量 unittest
@@ -219,35 +431,144 @@ Priority A として、AMP/TF32、DataLoader の `num_workers`、`persistent_wor
 - `feature_cache`: frozen DINO backbone の出力を `.pt` として保存し、以降は backbone forward を省略します。train-time augmentation、progressive resizing、backbone fine-tune とは同時に使いません。
 - `progressive_resizing`: 序盤を小さい画像サイズで回し、warmup 中に最終サイズへ近づけます。feature cache とは同時に使いません。
 
-### DINO-DEIM-style bbox detector
+### DINO detectorのW&B学習Run
+
+アノテーション集計Runと同じ`face_detection` projectに、`training` job typeで学習曲線を記録します。
+最初に`wandb login --verify`を実行し、full trainingへ`--wandb`を追加します。
+`--dry-run`と`--overfit-smoke`はW&B学習Runを作成しません。
+
+```bash
+.venv/bin/python scripts/train_dino.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml \
+  --device cuda:0 \
+  --wandb \
+  --wandb-entity sato-waseda-university \
+  --wandb-project face_detection \
+  --wandb-group face_pose_drive_v1_four_model_comparison \
+  --dataset-version face_pose_drive_v1
+```
+
+entity/projectの既定値は`sato-waseda-university / face_detection`のため、通常は
+`--wandb`だけでこの接続先を使用します。
+
+各epochで`train/loss`、`train/lr`、`epoch`を記録し、モデルが返す場合は`train/cls_loss`、
+`train/bbox_loss`、`train/keypoint_loss`も記録します。validation実行epochでは`val/loss`、
+`val/map50`、`val/map50_95`、`val/precision`、`val/recall`、`val/f1`を記録します。
+Configにはmodel、model size、dataset version、epochs、batch size、image size、optimizer、learning rate、
+seed、augmentation、backboneのfreeze/unfreeze設定を保存し、job typeは`training`です。
+
+`--wandb-group`を省略すると、seedを除いた上記条件からgroup名を自動生成します。同じ条件でseedだけ
+変更したRunは同じgroupに入り、その他の主要条件が変わると別groupになります。groupを固定したい場合は
+`--wandb-group <name>`を明示してください。
+
+online modeでは学習開始前にAPI keyと対象projectへのアクセスを検査します。結果は出力dirの
+`wandb_preflight.json`へ保存しますが、API key自体は保存しません。run IDはentity、project、
+group、run name、seedから決定的に生成され、checkpointからの再開時は同じW&B runへ継続します。
+ローカル同期データは各実験出力dirの`wandb/`以下へ集約します。
+
+### DINOv3 + DEIMv2 bbox detector
 
 CenterFace-style head より強い DINO 主体の bbox detector を比較するため、
-DEIMv2 / RT-DETR に inspired された実験用 detector を追加しています。完全な
-DEIMv2 再現ではありません。
+DEIMv2 / RT-DETR に inspired された実験用 detector と、公式 DEIMv2 の主要モデル部品を移植した
+`dinov3_deimv2` detector を追加しています。`model.type: dinov3_deimv2` は decoder、matcher、
+criterion などのモデル本体を公式に合わせるためのpathですが、local datasetのaugmentationと
+学習scheduleまで自動的に公式レシピになるわけではありません。過去比較用の軽量実装は
+`model.type: dino_deim_style` として扱います。
 
-この実装の目的は、DINOv3 を特徴抽出 backbone として使った場合に、
+`dinov3_deimv2` は upstream DEIMv2 の decoder、matcher、criterion、postprocessor、
+denoising、deformable attention、local/FGL loss 系を `src/third_party/deimv2/`
+に取り込み、DINO loader と COCO head/face dataset に接続します。DEIMv2-Lの検証では
+公式構成どおり実DINOv3 ViT-S/16を使い、DEIMv2-Mのdistilled ViT-TinyPlusとは分けます。
+`dino_deim_style` は従来の lightweight query detector であり、既存 ablation 結果は
+公式 DEIMv2 の性能ではなく、この軽量試作 detector の結果として扱います。
+
+この detector 群の目的は、DINOv3 を特徴抽出 backbone として使った場合に、
 `head` / `face` の bbox 検出性能を stage ごとに改善できるかを検証することです。
 特に HFDP の流れである `image -> head detection -> head crop -> face detection -> face crop -> keypoint detection`
-のうち、今回の DINO-DEIM-style は `head detection` と `face detection` の bbox detector を担当します。
+のうち、DINO + DEIM 系は `head detection` と `face detection` の bbox detector を担当します。
 keypoint 検出はこのモデルには含めず、既存の RTMPose などの下流 keypoint detector が担当します。
 
-現在の結果は検証中です。E1〜E5 の smoke test では forward / loss 計算と
-Dense O2O-style positive 増加が動作することを確認していますが、実データでの bbox 精度、
-HFDP/GTHFDP に組み込んだ keypoint 指標、RTMDet 系 baseline との優劣はまだ確定していません。
-そのため、この節の内容は「実装済みの実験条件」と「これから比較する仮説」を示すものであり、
-性能改善を保証する結果ではありません。
+公式準拠 path:
 
 ```text
-DINO backbone
+image
+  -> local DINOv3 backbone loader
+  -> official DEIMv2-style STA
+  -> official HybridEncoder
+  -> official DEIMTransformer
+  -> official DEIMCriterion / PostProcessor
+```
+
+旧 lightweight path:
+
+```text
+DINOv3 ViT patch tokens
   -> Spatial Tuning Adapter風 multi-scale adapter
+  -> P3/P4/P5 features
   -> lightweight hybrid encoder
   -> DETR-style decoder
-  -> bbox prediction
+  -> pred_logits [B, Q, C] + pred_boxes [B, Q, 4]
 ```
+
+#### DEIMv2-M augmentationと公式レシピとの差（2026-07-18監査）
+
+`configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze.yaml` は、
+公式DEIMv2-Mのモデル構成とCOCO checkpointを使いますが、augmentationは顔検出用のlocal独自実装です。
+実際の値はrun directoryの`config_resolved.yaml`を正とし、現在の標準設定では960×960への直接resize後に
+次の順で適用します。
+
+| order | local augmentation |
+| ---: | --- |
+| 1 | Mosaic: 確率0.30。4画像を固定2×2に配置し、各画像を480×480へ縮小、fill=114。`close_mosaic=20` |
+| 2 | Geometry: 全sampleに回転±10度、移動±8%、scale 0.7–1.3、X shear±2度、perspective 0.0005 |
+| 3 | Horizontal flip: 確率0.50。bbox、ellipse、左右keypointを同時変換 |
+| 4 | Photometric: HSV、brightness 0.75–1.25、contrast 0.75–1.25、gamma 0.8–1.2を全sampleへ適用 |
+| 5 | Blur / noise: Gaussian blurは確率0.20・radius 0.3–1.5。noiseは基準値0.03で全sampleへ適用 |
+
+`mixup=0.0`なのでlocal MixUpは無効です。ImageNet mean/stdのnormalizeはDatasetではなく
+`OfficialTinySTABackbone`内部で行い、bboxはmodel入力時にnormalized `cxcywh`へ変換します。
+
+公式の
+[`deimv2_dinov3_m_coco.yml`](https://github.com/Intellindust-AI-Lab/DEIMv2/blob/main/configs/deimv2/deimv2_dinov3_m_coco.yml)
+は、640px、cache型Mosaic、`RandomPhotometricDistort(p=0.5)`、`RandomZoomOut`、
+`RandomIoUCrop(p=0.8)`、horizontal flip、MixUp、CopyBlend、batch multi-scale、
+epoch policy `[4, 49, 90]`、最後12 epochのno-augmentation phaseを使用します。
+local実装にはRandomZoomOut、RandomIoUCrop、CopyBlend、batch multi-scaleがなく、MixUpも無効です。
+一方でlocal側には公式configにない明示的なblur、noise、gamma、perspective、shearがあります。
+したがって現在のweightは「DEIMv2-M architecture + custom face augmentation」と記録し、
+公式DEIMv2-Mのtraining recipe再現とは扱いません。
+
+##### persistent workerのepoch同期
+
+修正前の`AugmentedFaceKeypointDataset`はepochを通常のPython属性として保持していました。
+`num_workers>0`かつ`persistent_workers=true`ではworker起動後の`set_epoch()`がworker側へ伝わらず、
+各image indexの乱数augmentationがepoch 1の内容に固定され、`close_mosaic`もworker上では発動しませんでした。
+shuffleによるbatch順は変わりますが、同じimage indexのgeometry、photometric、Mosaic sourceは反復されます。
+
+現在は`epoch`と`total_epochs`をshared-memory tensorへ保存しているため、persistent workerを再起動せずに
+全workerが最新epochを参照します。これによりepochごとにaugmentation seedが変化し、120 epoch設定では
+epoch 100までMosaicが有効、epoch 101–120で無効になります。次のテストでworker越しの変化と
+`close_mosaic`境界を検証します。
+
+```bash
+.venv/bin/python -m pytest tests/test_dino_centerface_augmentation.py -q
+```
+
+この修正は新しい学習runにだけ有効です。修正前に生成されたcheckpointのaugmentation履歴は変わらないため、
+公式recipeとの再比較やepoch間のaugmentation多様性を保証する場合は修正後コードで再学習します。
+
+`pred_boxes` は normalized `cx, cy, w, h` で出力し、postprocess で画像座標の
+`xyxy` に変換します。COCO category id は `head=1`、`face=2` を想定し、criterion
+内部で 0-based class index に変換します。既存M baselineはbackboneをfreezeしていますが、
+新しいL production configはDINOv3 ViT-S/16を含めて全層をfine-tuneします。debug configは
+CPU smoke test用にdummy DINO backboneを使えますが、本評価には使いません。
 
 設定ファイルは次です。
 
 ```text
+configs/dinov3_deimv2/dinov3_deimv2_s_face_head.yaml
+configs/dinov3_deimv2/dinov3_deimv2_s_face_head_debug.yaml
+configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml
 configs/dino_deim_style_head.yaml
 configs/dino_deim_style_face.yaml
 configs/dino_deim_style_ablation/head/E1_baseline.yaml
@@ -262,6 +583,159 @@ configs/dino_deim_style_ablation/face/E4_mal.yaml
 configs/dino_deim_style_ablation/face/E5_sta_decoder_refine.yaml
 ```
 
+主な実装ファイルは次です。
+
+```text
+src/models/dino_deim_style.py
+src/models/dinov3_deimv2/
+src/third_party/deimv2/
+src/data/coco_detection.py
+tools/train_dinov3_deimv2.py
+tools/eval_dinov3_deimv2.py
+tools/infer_dinov3_deimv2.py
+tools/visualize_dinov3_deimv2.py
+scripts/evaluate_dino_deim_style.py
+scripts/infer_dino_deim_style.py
+scripts/run_dino_deim_style_ablation.py
+```
+
+#### DEIMv2-L + DINOv3 ViT-S/16 production path (2026-07-18)
+
+公式DEIMv2-Lの`dinov3_vits16`、interaction layers `[5, 8, 11]`、width 224、
+4-layer decoderをそのまま使用するface 1-class production構成を追加しました。
+公式COCO weightのclass head以外を移植し、DINOv3を含む全層fine-tuning、EMA、
+960px、固定3,090-frame dataset全件、定期validationを有効にしています。
+
+公式model zooはLを32.2M paramsとしています。local 80-class再構成は32,551,214、
+face 1-class版は32,444,643 paramsで、80-class再構成と公式表記との差は1.09%でした。
+checkpoint移植のshape mismatchは0、face state要素数ベースの移植率は99.995%です。
+実画像960×960 CUDA forwardと、実データ4枚のfinite loss/backward検査後、固定した
+`face_pose_drive_v1`全件でDINOv3 backboneのfreeze / unfreezeをそれぞれ本学習しました。
+どちらもcheckpointと動作閾値はvalidationだけで選び、独立test 330画像 / 503 faceへ固定しています。
+
+| condition | trainable params | stop / best val epoch | test mAP50:95 | AP50 | AP75 | val選択threshold | test F1 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| DINOv3 freeze | 10,843,489 | epoch 81で停止 / 5 | 0.5318 | 0.9141 | 0.5372 | 0.35 | 0.8935 |
+| DINOv3 unfreeze | 32,444,641 | epoch 70でearly stop / 25 | 0.5914 | 0.9480 | 0.6533 | 0.48 | 0.9310 |
+
+unfreezeはfreezeよりtest mAP50:95が0.0595、F1が0.0375高く、このdatasetでは
+backboneを低い学習率でfine-tuneする条件を採用します。freezeはepoch 5以降validation mAPが
+更新されず、unfreezeもepoch 25以降は改善が停滞したため、いずれもbest checkpointを使用します。
+unfreezeのW&B runは
+<https://wandb.ai/sato-waseda-university/face_detection/runs/6fc4b22612dba2e5>です。
+
+```bash
+.venv/bin/python tools/prepare_dinov3_deimv2_l_assets.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml
+
+.venv/bin/python tools/preflight_dinov3_deimv2_l.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml \
+  --device cuda:0
+
+.venv/bin/python tools/train_dinov3_deimv2.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_freeze.yaml \
+  --output-dir outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_freeze \
+  --device cuda:0
+
+.venv/bin/python tools/train_dinov3_deimv2.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml \
+  --output-dir outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full \
+  --device cuda:0 \
+  --wandb \
+  --wandb-entity sato-waseda-university \
+  --wandb-project face_detection \
+  --wandb-group face_pose_drive_v1_four_model_comparison
+```
+
+設計差分、parameter内訳、本学習コマンド、既知の制約は
+[`docs/dinov3_deimv2_l_vits16.md`](docs/dinov3_deimv2_l_vits16.md)を参照してください。
+4条件の共通bbox評価は
+`outputs/benchmarks/face_pose_drive_v1_four_model_comparison_20260718/benchmark_test_metrics.md`に保存しています。
+
+#### DINOv3 + DEIMv2 3,090-frame baseline (2026-07-13)
+
+390フレーム版（train 260枚）だけで学習していた条件を置き換えるため、
+`face_pose_drive_v1` の3,090枚を元動画単位で train / val / test =
+2,460 / 300 / 330枚（79.6% / 9.7% / 10.7%）に分割して学習しました。
+train / val / test の元動画数は26 / 3 / 4で、学習入口の監査により元動画ID、
+実画像SHA-256、実画像パスのsplit間重複がすべて0であることを確認しています。
+
+学習条件は次のとおりです。
+
+| item | value |
+| --- | --- |
+| config | `configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml` |
+| model | DEIMv2-M（DINOv3-S distilled ViT-TinyPlus backbone）、COCO checkpoint初期化、face 1 class |
+| input / batch | 960px / 16 |
+| epochs | 120（valは5 epochごと、300枚全件） |
+| optimizer schedule | cosine、warmup 3 epochs、AMP / TF32、frozen backbone |
+| augmentation | local独自のmosaic + geometry + photometric + blur（修正前runのepoch同期制約は上記監査を参照） |
+| GPU | NVIDIA GeForce RTX 4090 24 GB |
+| run directory | `outputs/experiments/dinov3_deimv2_m_face_pose_drive_v1_960_aug_baseline_20260712` |
+
+> **Historical run note:** このbaselineはshared-memoryによるepoch同期修正より前に、
+> `num_workers=4, persistent_workers=true`で学習しています。同じimage indexのaugmentationが
+> epoch間で固定され、意図した最後20 epochのMosaic停止もworkerへ反映されなかった可能性が高いため、
+> 結果は修正前のcustom-augmentation baselineとしてのみ扱います。
+
+実データ16枚のpreflightは8.36秒で成功しました。第1 epochは143.34秒、
+定常epochは約104秒だったため、開始直後に全体を約3.5時間と見積もりました。
+epoch 120のmetrics記録時点は12,650.8秒（3時間30分51秒、途中のvalとcheckpoint保存を含む）、
+最終val完了までの実壁時計は12,663.9秒（3時間31分4秒）でした。
+val推論24回の純粋な合計時間は313.4秒です。
+
+lossの初期低下は旧390フレーム版より遅くありません。同じaugmentationの旧runは
+epoch 1→8で47.29→29.21（38.2%減）、今回のrunは38.14→22.06（42.2%減）でした。
+ただし旧runは1 epoch 17 step、今回のrunは154 stepなので、optimizer step基準では
+旧runのほうが早く低下します。これは260枚を繰り返して早く記憶しやすいためで、
+今回のように2,460枚の多様なtrainを使う条件ではepoch基準とval指標を優先して判断します。
+最終lossは6.72で、epoch 1から82.4%低下しました。
+
+主なval推移は次のとおりです。mAP50:95の全体最高はepoch 5でしたが、実行時の
+`save_every=10`によりepoch 5重みは保存されませんでした。そのためtestには、保存済みの
+5 epoch間隔checkpointのうちmAP50:95が最高だったepoch 15を使用しています。
+今後の再実行では最初から`--save-every 5`を指定します。
+
+| epoch | loss | val mAP50:95 | val AP50 | val best F1 | best threshold | note |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 5 | 24.89 | 0.4708 | 0.8587 | 0.8431 | 0.40 | 全val履歴の最高、重み未保存 |
+| 15 | 16.83 | 0.4521 | 0.8294 | 0.8145 | 0.67 | 保存済みmAP最高、test採用 |
+| 90 | 7.30 | 0.4214 | 0.7869 | 0.8272 | 0.17 | 後半のF1改善点 |
+| 120 | 6.72 | 0.4254 | 0.7888 | 0.8251 | 0.35 | 最終epoch |
+
+独立test 330枚 / 503 GTに対するbaseline結果です。checkpointとthresholdはvalだけで
+決定し、testを見て選び直していません。評価器はこのrepositoryのmanual COCO-like evaluatorです。
+
+| checkpoint | threshold source | mAP50:95 | AP50 | AP75 | Precision | Recall | F1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| epoch 15 | val best F1 threshold = 0.67 | 0.4562 | 0.8440 | 0.4222 | 0.9313 | 0.7276 | 0.8170 |
+
+参考としてtest上のbest F1は0.8216（threshold 0.46）ですが、baseline比較には使用しません。
+size別mAP50:95はsmall 0.0000、medium 0.0252、large 0.4589で、小さいfaceの検出が
+明確な残課題です。詳細は`eval_test_epoch0015/metrics.json`、threshold sweep、
+visualization、failure samplesに保存しています。
+
+再現コマンド:
+
+```bash
+.venv/bin/python tools/train_dinov3_deimv2.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml \
+  --output-dir outputs/experiments/dinov3_deimv2_m_face_pose_drive_v1_960_aug_baseline \
+  --device cuda:0 \
+  --save-every 5
+
+.venv/bin/python tools/eval_dinov3_deimv2.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml \
+  --checkpoint <val-selected-checkpoint> \
+  --data-root datasets/face_pose_drive_v1 \
+  --split test \
+  --output-dir outputs/experiments/dinov3_deimv2_baseline_test \
+  --device cuda:0 \
+  --image-size 960 \
+  --score-min 0.001 \
+  --fixed-threshold <val-selected-threshold>
+```
+
 E1〜E5 は次の段階比較です。
 
 ```text
@@ -271,6 +745,29 @@ E3: E2 + Dense O2O-style extra positives
 E4: E3 + MAL-style quality-aware matching loss
 E5: E4 + STA/decoder refinement style toggles
 ```
+
+注意点として、現実装の `E3_dense_o2o` は Hungarian matching の 1対1割当の後に
+GT ごとの追加 positive query を足すため、厳密な pure O2O ではありません。記録を読むときは
+`Dense O2O-style extra positives` または `extra positive matching` として扱います。
+
+2026-07-05 時点の face ablation 評価は
+`outputs_experiment/dino_deim_style_ablation_eval/face/summary.md` に保存しています。
+評価対象は head crop 内の face bbox detector で、test split は 71 images / 66 GT face boxes、
+category id は `face=2` です。現在の最良は `E1_baseline` を 200 epoch まで伸ばした条件です。
+
+| exp | epochs | fixed P | fixed R | fixed F1 | best thr | best P | best R | best F1 | AP50 | mAP50:95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| E1_baseline | 100 | 0.623 | 0.727 | 0.671 | 0.500 | 0.750 | 0.727 | 0.738 | 0.726 | 0.299 |
+| E1_baseline | 200 | 0.731 | 0.742 | 0.737 | 0.930 | 0.878 | 0.652 | 0.748 | 0.745 | 0.329 |
+| E2_stronger_aug | 100 | 0.423 | 0.500 | 0.458 | 0.210 | 0.404 | 0.636 | 0.494 | 0.356 | 0.113 |
+| E3_dense_o2o | 100 | 0.221 | 0.742 | 0.340 | 0.940 | 0.440 | 0.500 | 0.468 | 0.460 | 0.197 |
+| E4_mal | 100 | 0.162 | 0.727 | 0.265 | 0.940 | 0.425 | 0.470 | 0.446 | 0.365 | 0.153 |
+| E5_sta_decoder_refine | 100 | 0.215 | 0.758 | 0.334 | 0.670 | 0.518 | 0.667 | 0.583 | 0.473 | 0.164 |
+
+`E2` の 100 epoch から 200 epoch への途中再開は、`close_mosaic` が総 epoch 数に依存して
+augmentation schedule を変えてしまうため、正式比較から除外しています。`E1` は train-time
+augmentation なしなので、100 epoch から 200 epoch への延長を同条件として扱っています。
+この表は bbox detector 単体の評価であり、HFDP/GTHFDP に組み込んだ keypoint 指標ではありません。
 
 一括実験のコマンド表は次で生成します。デフォルトでは実学習は走らず、manifest だけを書きます。
 
@@ -285,6 +782,8 @@ E5: E4 + STA/decoder refinement style toggles
 ```
 
 詳細は `docs/dino_deim_style_detector.md` を参照してください。
+`dinov3_deimv2` 名での train / eval / infer 入口については
+`docs/dinov3_deimv2_implementation_note.md` を参照してください。
 
 config では次の項目で管理します。
 
@@ -886,7 +1385,75 @@ E4 は、mosaic を弱めにするか中程度にするかを早めに判断す�
 
 現時点では、keypoint と recall を優先するなら `mosaic=0.4, close_mosaic=30` は有効候補です。一方で box mAP50-95 が下がるため、次は `mosaic=0.3` または `mosaic=0.4, close_mosaic=20` のように中間条件を確認するのが妥当です。combined 条件を試す場合は、E2 の photometric と E3 の geometry を基準にし、mosaic は E4 より少し弱める候補を残します。
 
+## YOLO26s / YOLO26m Pose production comparison
+
+固定した `face_pose_drive_v1` 3,090 frameを全件使用し、YOLO26s-poseと
+YOLO26m-poseを同一条件で比較するproduction pipelineを追加しました。
+短縮学習やsubset modeは持たず、preflightでdataset fingerprint、split漏洩、
+YOLO label、17点から5点face-pose headへの適応、YOLO26 end-to-end modeを検査します。
+
+両方のfull trainingと独立test評価が完了しています。sはepoch 188で停止（best 138、1.960時間）、
+mはepoch 193で停止（best 143、3.640時間）しました。test上で閾値を選び直さず、validationで
+選択した閾値を固定しています。
+
+| model | parameters | GFLOPs | bbox mAP50:95 | pose mAP50:95 | NME | PCK@0.05 | fixed-threshold F1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| YOLO26s-pose | 10,579,532 | 24.5 | 0.4814 | 0.8173 | 0.0461 | 0.7613 | 0.8809 |
+| YOLO26m-pose | 23,535,244 | 82.1 | 0.5178 | 0.8385 | 0.0414 | 0.7924 | 0.8866 |
+
+mは設定済みのpose改善、bbox非退行、NME非退行gateをすべて通過したため、最大性能を優先する
+採用候補はmです。一方、mはsの2.22倍のparameters、学習時間は1.86倍なので、現在の小規模datasetで
+効率を優先する運用にはs、将来のdataset拡大と最大pose品質にはmという使い分けが妥当です。
+
+```bash
+.venv/bin/python scripts_YOLO/yolo26_pose/run_yolo26_pose.py \
+  --config configs/yolo/yolo26_pose/face_pose_drive_v1_full.yaml \
+  --stage all \
+  --models all \
+  --device 0
+```
+
+設定、学習・評価コマンド、出力構成、採用判定、既知の制約は
+[`scripts_YOLO/yolo26_pose/README.md`](scripts_YOLO/yolo26_pose/README.md)を参照してください。
+実測値は`outputs/yolo/yolo26_pose/face_pose_drive_v1/comparison.json`へ保存しています。
+
+## DINOv3 face landmark A–G comparison
+
+DEIMv2-L → face crop → DINOv3 ViT-S/16に、ViTPose-style、parameter-matched ViTPose-376、Landmark Query、Query + coordinate-conditioned refinementを接続する7条件比較を追加しました。A/C、B/D、F/Gはそれぞれ同じcheckpointを共有します。ViTPose-376のheadは4,577,474 parametersで、Query headの4,579,081との差は1,607です。
+
+現在の設定はCOCO visibilityを`v=0` missing、`v=1` occluded、`v=2` visibleとして
+`labeled=v>0`と`visible=v>1`を分離します。旧checkpointは`v>0`をvisibility positiveへ
+統合していたため、座標評価には使用できますが遮蔽判定の比較には使用できません。
+修正版は`*_coco_visibility`出力先へ新規学習し、旧checkpointからのresumeを拒否します。
+
+```bash
+.venv/bin/python keypoint_comparison1/scripts/run_landmark_experiments.py \
+  --config keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml \
+  --stage preflight \
+  --device cuda:0
+```
+
+この実装は `keypoint_comparison1/` へ保全しました。条件A–G、full training、固定test、出力、
+指標の定義は
+[`keypoint_comparison1/docs/dinov3_face_landmark_ablation.md`](keypoint_comparison1/docs/dinov3_face_landmark_ablation.md)
+を参照してください。
+
+## Face keypoint comparison 2
+
+次段階の比較として、DEIMv2-L face cropを共通入力にしたRTMPose-Face-5、
+DINOv3 + Simple FPN + RTMCC、DINOv3 + occlusion判定 + ORFormer型feature recovery + RTMCCと、
+DEIMv2 face queryから5 landmark queryを生成する同時検出modelを
+`keypoint_comparison2/` に実装しました。
+
+DINOv3を用いるモデル2/3は、どちらもDINOv3 ViT-L/16です。DINOv3 weightだけはMetaへの
+access申請とDINOv3 Licenseへの同意が必要です。model構成、weight取得、preflight、full training、
+固定test評価、推論方法は
+[`keypoint_comparison2/README.md`](keypoint_comparison2/README.md)
+を参照してください。
+
 ## DINOv3 face landmark A–E 学習・評価結果（2026-07-24）
+
+以下はViTPose-376追加前の既存A–E結果です。F/Gは`vitpose_376`の学習完了後に同じ固定testへ追加されます。
 
 `face_pose_drive_v2`の5点顔ランドマークを用い、共通のDINOv3 ViT-S/16 backboneに
 ViTPose-style head、Landmark Query head、Landmark Query + coordinate-conditioned refinementを
@@ -932,6 +1499,14 @@ refinement設計だけでなくmodel容量の増加も含まれます。
 `outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2/evaluation/external_v1_v2/comparison.json`、
 学習結果は同directoryの`training_summary.json`に保存しています。実験条件と指標定義は
 [`keypoint_comparison1/docs/dinov3_face_landmark_ablation.md`](keypoint_comparison1/docs/dinov3_face_landmark_ablation.md)
+を参照してください。
+
+## Co-DINO → DEIMv2-L → Landmark Query 3段検出
+
+`HEAD → FACE → keypoint`を強制する厳密な逐次3段カスケードと、head-pose geometry未導入/導入の
+対応付き比較を実装しています。構成、リーク防止条件、事前学習重みの
+checksum、学習キュー、結果の出力先は
+[`docs/three_stage_codino_deimv2_landmark_query.md`](docs/three_stage_codino_deimv2_landmark_query.md)
 を参照してください。
 
 ## Git に含めないもの

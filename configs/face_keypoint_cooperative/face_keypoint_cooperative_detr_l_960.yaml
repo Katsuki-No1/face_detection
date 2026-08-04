@@ -1,0 +1,219 @@
+schema_version: 1
+experiment_name: face_keypoint_cooperative_detr_l_face_pose_drive_v2_balanced_811_960_ellipse_from_coco
+
+model:
+  type: face_keypoint_cooperative_detr
+  # HybridEncoder emits 224 channels at stride 8, 16, and 32.
+  encoded_channels: [224, 224, 224]
+  maximum_face_queries: 100
+
+  face_detector:
+    # Initialize the shared DINOv3/DEIMv2 backbone, encoder, and compatible
+    # decoder tensors directly from the public COCO-pretrained checkpoint in
+    # this detector config. Do not use a face-fine-tuned checkpoint here.
+    initialization: pretrained
+    config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco.yaml
+
+  pose_branch:
+    # No architecture-compatible public pretrained pose head exists. Initialize
+    # this cooperative-only head randomly instead of transferring a
+    # face-keypoint-fine-tuned Query+refinement checkpoint.
+    initialization: random
+    # Proposals are selected from full-frame shared encoder features and do not
+    # consume face proposals.
+    dimension: 256
+    num_queries: 100
+    num_keypoints: 5
+    layers: 4
+    heads: 8
+    feedforward: 1024
+    deformable_points: [4, 8, 4]
+    dropout: 0.0
+    auxiliary_loss: true
+    # These are applied after the last two iterative decoder updates and use
+    # the highest-resolution shared feature map.
+    local_refinement:
+      - radius_in_feature_cells: 2.0
+        maximum_delta: 0.040
+        samples_per_axis: 3
+      - radius_in_feature_cells: 1.0
+        maximum_delta: 0.020
+        samples_per_axis: 3
+
+  pose_matcher:
+    cost_class: 2.0
+    cost_box: 2.0
+    cost_keypoint: 5.0
+
+  association:
+    appearance_dimension: 128
+    hidden_dimension: 256
+    inside_temperature: 12.0
+
+  cooperative_decoder:
+    layers: 3
+    heads: 8
+    feedforward: 1024
+    deformable_points: [4, 8, 4]
+    topk_associations: 4
+    dropout: 0.0
+    auxiliary_loss: true
+    # The two directions are dropped independently and only while training.
+    drop_face_to_pose: 0.15
+    drop_pose_to_face: 0.15
+
+loss:
+  auxiliary_weight: 0.50
+  weights:
+    keypoint_independent: 10.0
+    association: 2.0
+    face_refined: 1.0
+    keypoint_refined: 10.0
+    visibility: 1.0
+    pose_box: 2.0
+    ellipse_refined: 2.0
+
+data:
+  dataset_version: face_pose_drive_v2_balanced_811
+  image_root: outputs/dataset_cache/face_pose_current
+  image_size: 960
+  category_ids: [2]
+  target_category_id: 2
+  keypoint_names:
+    [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]
+  flip_indices: [1, 0, 2, 4, 3]
+  visibility:
+    unlabeled: 0
+    occluded: 1
+    visible: 2
+  augmentation:
+    enabled: true
+    # Joint transforms preserve face boxes, rotated ellipses, the fixed
+    # five-point semantic order, and labeled/occluded/visible states.
+    mosaic_probability: 0.35
+    close_mosaic_epochs: 20
+    mixup_probability: 0.10
+    degrees: 20.0
+    translate: 0.10
+    scale: 0.25
+    minimum_axis: 2.0
+    horizontal_flip_probability: 0.50
+    brightness: 0.20
+    contrast: 0.20
+    saturation: 0.15
+    blur_probability: 0.10
+    blur_kernel_max: 7
+    noise_probability: 0.10
+    noise_std: 0.02
+    occlusion_probability: 0.25
+    occlusion_area: [0.02, 0.15]
+  annotations:
+    train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+    val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val.json
+    test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_test.json
+
+train:
+  seed: 42
+  deterministic: true
+  epochs: 150
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  # FP16 keeps the main network compact, while the numerically sensitive
+  # cooperative refinement runs in FP32. Batch 8 leaves less than 0.5 GiB on
+  # a 24 GiB card, so preserve effective batch 16 with accumulation instead.
+  batch_size_fallback:
+    enabled: true
+    candidates:
+      - batch_size: 4
+        gradient_accumulation_steps: 4
+      - batch_size: 2
+        gradient_accumulation_steps: 8
+      - batch_size: 1
+        gradient_accumulation_steps: 16
+  lr: 5.0e-4
+  learning_rates:
+    backbone: 5.0e-6
+    sta_neck: 2.0e-5
+    shared_encoder: 2.0e-5
+    face_decoder: 1.0e-4
+    keypoint_decoder: 2.0e-4
+    association: 5.0e-4
+    cooperative_decoder: 5.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  warmup_epochs: 5
+  flat_epochs: 75
+  minimum_lr_ratio: 0.01
+  max_grad_norm: 0.10
+  amp: true
+  # FP16 is the production AMP contract. Probability-space BCE was replaced
+  # by BCE-with-logits so this path remains numerically valid under autocast.
+  amp_dtype: float16
+  # The unfrozen cooperative graph has much larger gradients than the
+  # standalone detectors. Repeated real-data updates overflowed at scale 16
+  # in the extended arms, even with four-way accumulation. Start at unity;
+  # dynamic scaling can still grow after sustained finite updates.
+  grad_scaler_init_scale: 1.0
+  # A scale grown by GradScaler can overflow on an unusually difficult
+  # accumulated batch. Let AMP skip and back off transient overflows, but
+  # still fail if the model remains numerically invalid for repeated updates.
+  max_consecutive_amp_skips: 8
+  tf32: true
+  fused_optimizer: true
+  num_workers: 8
+  prefetch_factor: 2
+  checkpoint_every: 5
+  ema:
+    enabled: true
+    decay: 0.9998
+  early_stopping:
+    enabled: true
+    minimum_epoch: 100
+    patience: 25
+    min_delta: 0.0001
+
+inference:
+  # Low floors preserve PR-curve candidates. Deployment thresholds must be
+  # selected on validation and then frozen before test evaluation.
+  face_score_threshold: 0.001
+  pose_score_threshold: 0.001
+  association_threshold: 0.50
+  detections_per_image: 100
+
+evaluation:
+  # Validation runs without backward/optimizer state, so use the same
+  # microbatch already proven safe by the production training probe.
+  batch_size: 8
+  score_min: 0.001
+  # Face 0.33 comes from the existing validation-only DEIM operating point.
+  # Pose 0.25 is only an initial validation candidate and must not be tuned on
+  # test.
+  face_score_threshold: 0.33
+  pose_score_threshold: 0.25
+  matching_iou_threshold: 0.50
+  visibility_threshold: 0.50
+  pck_thresholds: [0.03, 0.05, 0.10]
+
+wandb:
+  enabled: true
+  # v2 logs a compact, documented dashboard. Full decoder diagnostics remain
+  # available in metrics.csv without creating hundreds of W&B panels.
+  metric_schema_version: 2
+  log_detailed_losses: false
+  # Keep the live dashboard close to the completed local epoch.
+  live_sync_seconds: 30
+  entity: sato-waseda-university
+  project: face_detection
+  group: face_pose_drive_v2_balanced_811_face_keypoint_cooperative
+  name: face_keypoint_cooperative_detr_l_960_ellipse_from_coco_seed42
+  mode: online
+  tags:
+    - DINOv3
+    - DEIMv2
+    - face-keypoint
+    - cooperative
+    - face_pose_drive_v2_balanced_811
+
+output:
+  root: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco

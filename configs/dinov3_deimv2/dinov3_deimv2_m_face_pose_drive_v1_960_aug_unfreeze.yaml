@@ -1,0 +1,22 @@
+extends: dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml
+
+experiment_name: dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze
+
+model:
+  backbone:
+    freeze: false
+
+train:
+  name: dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze
+  lr_backbone: 2.5e-5
+  param_groups:
+    - name: dinov3_decay
+      params: '^(?=.*backbone\.dinov3)(?!.*(?:norm|bn|bias)).*$'
+      lr: 2.5e-5
+    - name: dinov3_no_decay
+      params: '^(?=.*backbone\.dinov3)(?=.*(?:norm|bn|bias)).*$'
+      lr: 2.5e-5
+      weight_decay: 0.0
+    - name: deim_no_decay
+      params: '^(?=.*(?:backbone\.sta|backbone\.convs|backbone\.norms|encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.0

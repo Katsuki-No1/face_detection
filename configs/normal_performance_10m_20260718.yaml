@@ -1,0 +1,32 @@
+project_root: ..
+input_dir: data/raw_data/nonactive(dataset=3000frame)7-17
+output_dir: outputs/normal_performance_10m_20260718
+weights: runs/yolo11s_pose_face_pose_drive_v1_960_20260714/weights/best.pt
+
+device: "0"
+imgsz: 960
+confidence: 0.44
+max_detections: 100
+batch_size: 8
+
+anchor_interval_sec: 60
+motion_offsets_sec: [0, 0.5, 1.0]
+window_duration_sec: 600
+window_step_sec: 60
+cluster_count: 6
+top_review_count: 5
+random_seed: 20260718
+
+scene_change_threshold: 0.32
+black_brightness_threshold: 8.0
+white_brightness_threshold: 247.0
+contrast_threshold: 5.0
+blur_threshold: 20.0
+frozen_change_threshold: 0.002
+keypoint_visibility_threshold: 0.50
+
+output_video_crf: 20
+source_clip_crf: 18
+output_video_preset: veryfast
+source_clip_preset: medium
+recursive: false

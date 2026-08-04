@@ -7,6 +7,7 @@ import shutil
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,40 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 KEYPOINT_NAMES = ["e1", "e2", "n", "m1", "m2"]
 FRAME_TIME_RE = re.compile(r"_([0-9]+(?:\.[0-9]+)?)s\.[^.]+$")
 FRAME_PREFIX_PATTERNS = ("__frame_", "_frame_")
+SPLITS = ("train", "val", "test")
+SPLIT_FEATURE_WEIGHTS = {
+    "groups": 1.0,
+    "images": 8.0,
+    "face_positive_images": 2.0,
+    "face_negative_images": 2.0,
+    "head_positive_images": 2.0,
+    "head_negative_images": 2.0,
+    "head_instances": 5.0,
+    "face_instances": 4.0,
+    "visible_keypoints": 3.0,
+    "complete_keypoint_faces": 2.0,
+    "incomplete_keypoint_faces": 2.0,
+    "occluded_keypoints": 1.0,
+    "head_count_0": 1.5,
+    "head_count_1": 1.5,
+    "head_count_2": 1.5,
+    "head_count_3plus": 1.5,
+    "face_count_0": 1.0,
+    "face_count_1": 1.0,
+    "face_count_2": 1.0,
+    "face_count_3plus": 1.0,
+    "head_area_tiny": 1.5,
+    "head_area_small": 1.5,
+    "head_area_medium": 1.5,
+    "head_area_large": 1.5,
+    "face_area_tiny": 1.0,
+    "face_area_small": 1.0,
+    "face_area_medium": 1.0,
+    "face_area_large": 1.0,
+    **{f"visible_keypoint_{name}": 1.5 for name in KEYPOINT_NAMES},
+    **{f"missing_keypoint_{name}": 1.0 for name in KEYPOINT_NAMES},
+    **{f"keypoint_count_{count}": 1.0 for count in range(len(KEYPOINT_NAMES) + 1)},
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +78,16 @@ def parse_args() -> argparse.Namespace:
         help="CVAT annotations.xml file. Can be supplied multiple times.",
     )
     parser.add_argument(
+        "--annotation-root",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Directory searched recursively for CVAT zip files. Can be supplied multiple "
+            "times; discovered files are combined with --annotation-zip."
+        ),
+    )
+    parser.add_argument(
         "--image-root",
         type=Path,
         action="append",
@@ -59,6 +104,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--split-strategy",
+        choices=("balanced", "random-groups"),
+        default="balanced",
+        help=(
+            "balanced jointly matches image, Head, Face, and keypoint distributions; "
+            "random-groups preserves the legacy behavior. Default: balanced."
+        ),
+    )
+    parser.add_argument(
+        "--split-search-restarts",
+        type=int,
+        default=256,
+        help="Deterministic randomized restarts for balanced group assignment. Default: 256.",
+    )
     parser.add_argument(
         "--test-kind-contains",
         action="append",
@@ -261,6 +321,15 @@ def load_records_from_xml(path: Path) -> list[dict[str, Any]]:
         annotation_kind=path.parent.name,
         annotation_xml=str(path),
     )
+
+
+def discover_annotation_zips(roots: list[Path]) -> list[Path]:
+    paths: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            raise FileNotFoundError(f"Annotation root does not exist: {root}")
+        paths.extend(path for path in root.rglob("*.zip") if path.is_file())
+    return sorted(set(paths))
 
 
 def build_image_index(image_roots: list[Path]) -> dict[str, Path]:
@@ -516,11 +585,266 @@ def format_yolo_value(value: float | int) -> str:
 
 
 def split_group(record: dict[str, Any]) -> str:
-    annotation_kind = record.get("annotation_kind", "")
-    image_stem = record.get("image_stem", "")
+    image_stem = str(record.get("image_stem", "")).strip()
     if image_stem:
-        return f"{annotation_kind}::{image_stem}"
-    return f"{annotation_kind}::{infer_image_stem(record.get('image_name', ''))}"
+        return image_stem
+    inferred = infer_image_stem(str(record.get("image_name", ""))).strip()
+    if inferred:
+        return inferred
+    annotation_kind = str(record.get("annotation_kind", "")).strip()
+    return f"unknown::{annotation_kind}"
+
+
+def _ratio_map(train_ratio: float, val_ratio: float, test_ratio: float) -> dict[str, float]:
+    ratios = {"train": train_ratio, "val": val_ratio, "test": test_ratio}
+    if any(value < 0 for value in ratios.values()):
+        raise ValueError("split ratios must be non-negative")
+    total = sum(ratios.values())
+    if total <= 0:
+        raise ValueError("split ratios must sum to a positive number")
+    return {split: value / total for split, value in ratios.items()}
+
+
+def _count_bin(prefix: str, count: int) -> str:
+    suffix = str(count) if count < 3 else "3plus"
+    return f"{prefix}_count_{suffix}"
+
+
+def _area_bin(shape: dict[str, Any], width: int, height: int) -> str:
+    bbox = shape.get("bbox", {})
+    area = max(0.0, float(bbox.get("width", 0.0))) * max(
+        0.0, float(bbox.get("height", 0.0))
+    )
+    image_area = max(1.0, float(width * height))
+    ratio = area / image_area
+    if ratio < 0.0025:
+        return "tiny"
+    if ratio < 0.01:
+        return "small"
+    if ratio < 0.15:
+        return "medium"
+    return "large"
+
+
+def record_split_features(record: dict[str, Any]) -> Counter[str]:
+    features: Counter[str] = Counter(images=1)
+    heads = list(record.get("heads", []))
+    faces = list(record.get("faces", []))
+    head_count = len(heads)
+    face_count = len(faces)
+    features["head_positive_images" if heads else "head_negative_images"] += 1
+    features["face_positive_images" if faces else "face_negative_images"] += 1
+    features["head_instances"] += head_count
+    features["face_instances"] += face_count
+    features[_count_bin("head", head_count)] += 1
+    features[_count_bin("face", face_count)] += 1
+
+    width = int(record.get("width", 0))
+    height = int(record.get("height", 0))
+    for shape in heads:
+        features[f"head_area_{_area_bin(shape, width, height)}"] += 1
+    for shape in faces:
+        features[f"face_area_{_area_bin(shape, width, height)}"] += 1
+
+    if faces:
+        face_bboxes = [face["bbox"] for face in faces]
+        for face_index in range(len(faces)):
+            keypoints = assign_keypoints(record, face_bboxes, face_index)
+            visible = []
+            for name, point in keypoints.items():
+                if point.get("v", 0) > 0 and point_inside_image(point, width, height):
+                    visible.append(point)
+                    features[f"visible_keypoint_{name}"] += 1
+                else:
+                    features[f"missing_keypoint_{name}"] += 1
+            features["visible_keypoints"] += len(visible)
+            features[f"keypoint_count_{len(visible)}"] += 1
+            features["occluded_keypoints"] += sum(
+                bool(point.get("occluded", False)) for point in visible
+            )
+            if len(visible) == len(KEYPOINT_NAMES):
+                features["complete_keypoint_faces"] += 1
+            else:
+                features["incomplete_keypoint_faces"] += 1
+    return features
+
+
+def group_split_features(records: list[dict[str, Any]]) -> dict[str, Counter[str]]:
+    grouped: dict[str, Counter[str]] = defaultdict(Counter)
+    for record in records:
+        grouped[split_group(record)].update(record_split_features(record))
+    for features in grouped.values():
+        features["groups"] = 1
+    return dict(grouped)
+
+
+def split_objective(
+    actual: dict[str, Counter[str]],
+    totals: Counter[str],
+    ratios: dict[str, float],
+) -> float:
+    score = 0.0
+    for feature, weight in SPLIT_FEATURE_WEIGHTS.items():
+        total = float(totals.get(feature, 0.0))
+        if total <= 0:
+            continue
+        for split in SPLITS:
+            target_fraction = ratios[split]
+            if target_fraction <= 0:
+                score += weight * (float(actual[split].get(feature, 0.0)) / total) ** 2
+                continue
+            actual_fraction = float(actual[split].get(feature, 0.0)) / total
+            relative_error = (actual_fraction - target_fraction) / target_fraction
+            score += weight * relative_error * relative_error
+    return score
+
+
+def _assignment_counters(
+    assignment: dict[str, str],
+    group_features: dict[str, Counter[str]],
+) -> dict[str, Counter[str]]:
+    actual = {split: Counter() for split in SPLITS}
+    for group, split in assignment.items():
+        actual[split].update(group_features[group])
+    return actual
+
+
+def _greedy_balanced_assignment(
+    groups: list[str],
+    forced_test: set[str],
+    group_features: dict[str, Counter[str]],
+    totals: Counter[str],
+    ratios: dict[str, float],
+    rng: random.Random,
+) -> tuple[dict[str, str], dict[str, Counter[str]], float]:
+    assignment = {group: "test" for group in forced_test}
+    actual = _assignment_counters(assignment, group_features)
+    shuffled = list(groups)
+    rng.shuffle(shuffled)
+    shuffled.sort(
+        key=lambda group: (
+            -group_features[group]["images"],
+            rng.random(),
+        )
+    )
+    enabled_splits = [split for split in SPLITS if ratios[split] > 0]
+    for group in shuffled:
+        choices = []
+        for split in enabled_splits:
+            actual[split].update(group_features[group])
+            score = split_objective(actual, totals, ratios)
+            actual[split].subtract(group_features[group])
+            choices.append((score, rng.random(), split))
+        _, _, selected = min(choices)
+        assignment[group] = selected
+        actual[selected].update(group_features[group])
+    return assignment, actual, split_objective(actual, totals, ratios)
+
+
+def _improve_balanced_assignment(
+    assignment: dict[str, str],
+    group_features: dict[str, Counter[str]],
+    totals: Counter[str],
+    ratios: dict[str, float],
+    forced_test: set[str],
+    score: float,
+) -> tuple[dict[str, str], dict[str, Counter[str]], float]:
+    actual = _assignment_counters(assignment, group_features)
+    movable = sorted(set(assignment) - forced_test)
+    enabled_splits = [split for split in SPLITS if ratios[split] > 0]
+
+    for _ in range(20):
+        changed = False
+        group_counts = Counter(assignment.values())
+        for group in movable:
+            source = assignment[group]
+            if group_counts[source] <= 1:
+                continue
+            best = (score, source)
+            for destination in enabled_splits:
+                if destination == source:
+                    continue
+                actual[source].subtract(group_features[group])
+                actual[destination].update(group_features[group])
+                candidate = split_objective(actual, totals, ratios)
+                actual[destination].subtract(group_features[group])
+                actual[source].update(group_features[group])
+                if candidate < best[0] - 1e-12:
+                    best = (candidate, destination)
+            if best[1] != source:
+                actual[source].subtract(group_features[group])
+                actual[best[1]].update(group_features[group])
+                assignment[group] = best[1]
+                group_counts[source] -= 1
+                group_counts[best[1]] += 1
+                score = best[0]
+                changed = True
+        if not changed:
+            break
+
+    for _ in range(20):
+        best_swap: tuple[float, str, str] | None = None
+        for left_index, left in enumerate(movable):
+            left_split = assignment[left]
+            for right in movable[left_index + 1 :]:
+                right_split = assignment[right]
+                if left_split == right_split:
+                    continue
+                actual[left_split].subtract(group_features[left])
+                actual[right_split].subtract(group_features[right])
+                actual[left_split].update(group_features[right])
+                actual[right_split].update(group_features[left])
+                candidate = split_objective(actual, totals, ratios)
+                actual[right_split].subtract(group_features[left])
+                actual[left_split].subtract(group_features[right])
+                actual[right_split].update(group_features[right])
+                actual[left_split].update(group_features[left])
+                if candidate < score - 1e-12 and (
+                    best_swap is None or candidate < best_swap[0]
+                ):
+                    best_swap = (candidate, left, right)
+        if best_swap is None:
+            break
+        score, left, right = best_swap
+        left_split = assignment[left]
+        right_split = assignment[right]
+        actual[left_split].subtract(group_features[left])
+        actual[right_split].subtract(group_features[right])
+        actual[left_split].update(group_features[right])
+        actual[right_split].update(group_features[left])
+        assignment[left], assignment[right] = right_split, left_split
+    return assignment, actual, score
+
+
+def _legacy_random_group_assignment(
+    groups: list[str],
+    forced_test: set[str],
+    seed: int,
+    ratios: dict[str, float],
+) -> dict[str, str]:
+    shuffled = sorted(groups)
+    random.Random(seed).shuffle(shuffled)
+    train_count = round(len(shuffled) * ratios["train"])
+    val_count = round(len(shuffled) * ratios["val"])
+    test_count = len(shuffled) - train_count - val_count
+    if ratios["val"] > 0 and val_count == 0 and len(shuffled) >= 2:
+        val_count = 1
+        if test_count > 0:
+            test_count -= 1
+        else:
+            train_count = max(1, train_count - 1)
+    if ratios["test"] > 0 and test_count == 0 and len(shuffled) >= 3 and not forced_test:
+        test_count = 1
+        train_count = max(1, train_count - 1)
+    train_count = max(0, min(train_count, len(shuffled)))
+    val_count = max(0, min(val_count, len(shuffled) - train_count))
+    train_cut = train_count
+    val_cut = train_cut + val_count
+    assignment = {group: "train" for group in shuffled[:train_cut]}
+    assignment.update({group: "val" for group in shuffled[train_cut:val_cut]})
+    assignment.update({group: "test" for group in shuffled[val_cut:]})
+    assignment.update({group: "test" for group in forced_test})
+    return assignment
 
 
 def build_split_map(
@@ -530,39 +854,127 @@ def build_split_map(
     val_ratio: float,
     test_ratio: float,
     test_kind_contains: list[str],
+    strategy: str = "balanced",
+    search_restarts: int = 256,
 ) -> dict[str, str]:
+    ratios = _ratio_map(train_ratio, val_ratio, test_ratio)
     forced_test = {
         split_group(record)
         for record in records
         if any(marker in record.get("annotation_kind", "") for marker in test_kind_contains)
     }
     groups = sorted({split_group(record) for record in records} - forced_test)
+    if strategy == "random-groups":
+        return _legacy_random_group_assignment(groups, forced_test, seed, ratios)
+    if strategy != "balanced":
+        raise ValueError(f"Unsupported split strategy: {strategy}")
+    if search_restarts <= 0:
+        raise ValueError("split search restarts must be positive")
+
+    group_features = group_split_features(records)
+    totals = Counter()
+    for features in group_features.values():
+        totals.update(features)
     rng = random.Random(seed)
-    rng.shuffle(groups)
-    total_ratio = train_ratio + val_ratio + test_ratio
-    if total_ratio <= 0:
-        raise ValueError("split ratios must sum to a positive number")
-    train_count = round(len(groups) * train_ratio / total_ratio)
-    val_count = round(len(groups) * val_ratio / total_ratio)
-    test_count = len(groups) - train_count - val_count
-    if val_ratio > 0 and val_count == 0 and len(groups) >= 2:
-        val_count = 1
-        if test_count > 0:
-            test_count -= 1
-        else:
-            train_count = max(1, train_count - 1)
-    if test_ratio > 0 and test_count == 0 and len(groups) >= 3 and not forced_test:
-        test_count = 1
-        train_count = max(1, train_count - 1)
-    train_count = max(0, min(train_count, len(groups)))
-    val_count = max(0, min(val_count, len(groups) - train_count))
-    train_cut = train_count
-    val_cut = train_cut + val_count
-    split_map = {group: "train" for group in groups[:train_cut]}
-    split_map.update({group: "val" for group in groups[train_cut:val_cut]})
-    split_map.update({group: "test" for group in groups[val_cut:]})
-    split_map.update({group: "test" for group in forced_test})
-    return split_map
+    best: tuple[float, dict[str, str]] | None = None
+    for _ in range(search_restarts):
+        assignment, _, score = _greedy_balanced_assignment(
+            groups,
+            forced_test,
+            group_features,
+            totals,
+            ratios,
+            rng,
+        )
+        if best is None or score < best[0]:
+            best = (score, assignment)
+    assert best is not None
+    assignment, _, _ = _improve_balanced_assignment(
+        dict(best[1]),
+        group_features,
+        totals,
+        ratios,
+        forced_test,
+        best[0],
+    )
+    return assignment
+
+
+def split_balance_report(
+    records: list[dict[str, Any]],
+    split_map: dict[str, str],
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    strategy: str,
+    seed: int,
+    test_kind_contains: list[str],
+) -> dict[str, Any]:
+    ratios = _ratio_map(train_ratio, val_ratio, test_ratio)
+    group_features = group_split_features(records)
+    actual = _assignment_counters(split_map, group_features)
+    totals = Counter()
+    for features in group_features.values():
+        totals.update(features)
+    split_rows: dict[str, Any] = {}
+    for split in SPLITS:
+        counts = {feature: int(actual[split].get(feature, 0)) for feature in SPLIT_FEATURE_WEIGHTS}
+        proportions = {
+            feature: (
+                float(counts[feature]) / float(totals[feature]) if totals.get(feature, 0) else None
+            )
+            for feature in SPLIT_FEATURE_WEIGHTS
+        }
+        split_rows[split] = {
+            "target_fraction": ratios[split],
+            "counts": counts,
+            "fractions_of_dataset": proportions,
+        }
+    forced_test = sorted(
+        group
+        for group in split_map
+        if any(
+            split_group(record) == group
+            and any(marker in str(record.get("annotation_kind", "")) for marker in test_kind_contains)
+            for record in records
+        )
+    )
+    group_concentration: dict[str, Any] = {}
+    for feature in SPLIT_FEATURE_WEIGHTS:
+        total = int(totals.get(feature, 0))
+        ranked = sorted(
+            (
+                (group, int(features.get(feature, 0)))
+                for group, features in group_features.items()
+                if features.get(feature, 0) > 0
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        group_concentration[feature] = {
+            "nonzero_groups": len(ranked),
+            "largest_group_fraction": (float(ranked[0][1]) / total if ranked and total else None),
+            "top_two_group_fraction": (
+                float(sum(count for _, count in ranked[:2])) / total if ranked and total else None
+            ),
+            "top_groups": [
+                {"group": group, "count": count}
+                for group, count in ranked[:5]
+            ],
+        }
+    return {
+        "strategy": strategy,
+        "seed": seed,
+        "group_key": "image_stem (annotation_kind is deliberately excluded)",
+        "ratios": ratios,
+        "objective": split_objective(actual, totals, ratios),
+        "feature_weights": SPLIT_FEATURE_WEIGHTS,
+        "totals": {feature: int(totals.get(feature, 0)) for feature in SPLIT_FEATURE_WEIGHTS},
+        "group_concentration": group_concentration,
+        "forced_test_markers": list(test_kind_contains),
+        "forced_test_groups": forced_test,
+        "splits": split_rows,
+    }
 
 
 def safe_output_name(record: dict[str, Any], image_path: Path) -> str:
@@ -571,29 +983,94 @@ def safe_output_name(record: dict[str, Any], image_path: Path) -> str:
 
 
 def write_dataset_yaml(output_dir: Path) -> None:
-    yaml_text = "\n".join(
+    yaml_lines = [
+        f"path: {output_dir.as_posix()}",
+        "train: images/train",
+        "val: images/val",
+        "test: images/test",
+        "names:",
+        "  0: face",
+        "kpt_shape: [5, 3]",
+        "flip_idx: [1, 0, 2, 4, 3]",
+        f"keypoints: [{', '.join(KEYPOINT_NAMES)}]",
+        "",
+    ]
+    yaml_text = "\n".join(yaml_lines)
+    portable_text = "\n".join(["path: .", *yaml_lines[1:]])
+    (output_dir / "face_pose.yaml").write_text(yaml_text, encoding="utf-8")
+    (output_dir / "face_pose_drive.yaml").write_text(portable_text, encoding="utf-8")
+
+
+def write_dataset_manifest(output_dir: Path, summary: dict[str, Any]) -> None:
+    split_counts = summary["splits"]
+    text = "\n".join(
         [
-            f"path: {output_dir.as_posix()}",
-            "train: images/train",
-            "val: images/val",
-            "test: images/test",
-            "names:",
-            "  0: face",
-            "kpt_shape: [5, 3]",
-            "flip_idx: [1, 0, 2, 4, 3]",
-            f"keypoints: [{', '.join(KEYPOINT_NAMES)}]",
+            f"dataset_version: {output_dir.name}",
+            "layout: unified-single-image-root",
+            "image_root: .",
+            "images:",
+            "  train: images/train",
+            "  val: images/val",
+            "  test: images/test",
+            "image_counts:",
+            f"  train: {split_counts['train']}",
+            f"  val: {split_counts['val']}",
+            f"  test: {split_counts['test']}",
+            "annotations:",
+            "  yolo_pose:",
+            "    train: labels/train",
+            "    val: labels/val",
+            "    test: labels/test",
+            "    config: face_pose_drive.yaml",
+            "    classes: [face]",
+            "    keypoints: [e1, e2, n, m1, m2]",
+            "  yolo_pose_coco_eval:",
+            "    train: train.json",
+            "    val: val.json",
+            "    test: test.json",
+            "    categories: {face: 2}",
+            "    source: yolo_pose",
+            "  rtmpose_keypoints:",
+            "    train: annotations/rtmpose/person_keypoints_train.json",
+            "    val: annotations/rtmpose/person_keypoints_val.json",
+            "    test: annotations/rtmpose/person_keypoints_test.json",
+            "    categories: {face: 1}",
+            "    keypoints: [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]",
+            "    source: canonical_cvat_metadata",
+            "  deim_dino:",
+            "    train: annotations/deim_dino/face_keypoints_train.json",
+            "    val: annotations/deim_dino/face_keypoints_val.json",
+            "    test: annotations/deim_dino/face_keypoints_test.json",
+            "    categories: {face: 2}",
+            "    keypoints: [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]",
+            "    ellipse: [cx, cy, semi_major, semi_minor, theta_rad]",
+            "    source: canonical_cvat_metadata",
+            "  coco_head_face:",
+            "    train: annotations/rtmdet_hf/train.json",
+            "    val: annotations/rtmdet_hf/val.json",
+            "    test: annotations/rtmdet_hf/test.json",
+            "    categories: {head: 1, face: 2}",
+            "metadata:",
+            "  conversion: metadata/conversion_metadata.json",
+            "  split_balance: metadata/split_balance.json",
+            "drive_upload_roots:",
+            f"  - {output_dir.name}",
             "",
         ]
     )
-    (output_dir / "face_pose.yaml").write_text(yaml_text, encoding="utf-8")
+    (output_dir / "dataset_manifest.yaml").write_text(text, encoding="utf-8")
 
 
 def prepare_output(output_dir: Path, clean: bool) -> None:
     if clean:
-        for name in ["images", "labels", "metadata"]:
+        for name in ["images", "labels", "metadata", "annotations"]:
             path = output_dir / name
             if path.exists():
                 shutil.rmtree(path)
+        for name in ["train.json", "val.json", "test.json"]:
+            path = output_dir / name
+            if path.exists():
+                path.unlink()
     for split in ["train", "val", "test"]:
         (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
         (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
@@ -617,18 +1094,118 @@ def write_yolo_sample(
     return str(Path("images") / split / output_name), str(Path("labels") / split / label_name)
 
 
+def write_dataset_readme(
+    output_dir: Path,
+    summary: dict[str, Any],
+    balance: dict[str, Any],
+) -> None:
+    ratios = balance["ratios"]
+    target_text = " / ".join(
+        f"{split} {ratios[split] * 100:.1f}%" for split in SPLITS
+    )
+    split_lines = []
+    for split in SPLITS:
+        counts = balance["splits"][split]["counts"]
+        split_lines.append(
+            f"| {split} | {counts['groups']} | {summary['splits'][split]} | "
+            f"{counts['head_instances']} | {counts['face_instances']} | "
+            f"{counts['visible_keypoints']} | {counts['complete_keypoint_faces']} | "
+            f"{counts['incomplete_keypoint_faces']} |"
+        )
+    text = "\n".join(
+        [
+            f"# {output_dir.name}",
+            "",
+            "Unified training dataset with one shared image tree and task-specific annotations.",
+            "Upload this directory alone; no separate Head/Face image dataset is required.",
+            "",
+            "## Split policy",
+            "",
+            f"- Strategy: `{balance['strategy']}`",
+            f"- Group key: `{balance['group_key']}`",
+            f"- Seed: `{balance['seed']}`",
+            f"- Target: {target_text}",
+            "- Balanced signals: images, positive/negative images, Head/Face counts and size "
+            "bins, visible/occluded keypoints, and complete/incomplete five-point faces",
+            "- Source-video leakage is prevented before distribution optimization",
+            "",
+            "| split | videos | images | source Heads | source Faces | visible keypoints | complete 5-point faces | incomplete faces |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            *split_lines,
+            "",
+            "The complete targets, counts, per-split fractions, feature weights, and objective "
+            "are stored in `metadata/split_balance.json`.",
+            "Rare signals concentrated in one source video cannot always match 80/10/10 "
+            "without leakage; `group_concentration` records that constraint explicitly.",
+            "",
+            "## Preserved behavior from v1",
+            "",
+            "- Face bbox uses the rotation-aware CVAT ellipse envelope and is clipped to the image.",
+            "- Images without Face ellipses remain valid negative samples.",
+            "- Keypoints are `e1`, `e2`, `n`, `m1`, `m2`; direct model exports use visibility 0/1/2 for missing/occluded/visible.",
+            "- Horizontal flip order is `[1, 0, 2, 4, 3]`.",
+            "",
+            "## Files",
+            "",
+            "- `images/{train,val,test}`: the single shared image tree",
+            "- `labels/{train,val,test}`: YOLO Pose Face bbox + five-keypoint labels",
+            "- `face_pose.yaml`: repository-relative training configuration",
+            "- `face_pose_drive.yaml`: portable configuration for use from this directory",
+            "- `dataset_manifest.yaml`: all task-specific paths in one portable manifest",
+            "- `metadata/conversion_metadata.json`: complete source and conversion metadata",
+            "- `metadata/split_balance.json`: split distribution audit",
+            "- `{train,val,test}.json`: YOLO Pose evaluation COCO annotations (not used to train other models)",
+            "- `annotations/rtmpose/person_keypoints_{train,val,test}.json`: RTMPose専用5点annotation",
+            "- `annotations/deim_dino/face_keypoints_{train,val,test}.json`: DEIM/DINO専用bbox + ellipse + 5点annotation",
+            "- `annotations/rtmdet_hf/{train,val,test}.json`: COCO Head + Face annotations",
+            "",
+            "## Training entry points",
+            "",
+            "- YOLO Pose: `face_pose_drive.yaml`",
+            "- RTMPose: `configs/rtmpose/rtmpose_s_face_pose_drive_v2_256.py`",
+            "- DINOv3/DEIMv2: `configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_960_full.yaml`",
+            "- RTMDet Head+Face: `configs/rtmdet/rtmdet_s_hf_drive_v2_960.py`",
+            "",
+            "## Rebuild the unified dataset",
+            "",
+            "```bash",
+            ".venv/bin/python scripts_YOLO/convert_annotations_to_yolo_pose.py \\",
+            "  --annotation-root data/output \\",
+            "  --image-root data/output \\",
+            f"  --output-dir {output_dir.as_posix()} \\",
+            "  --seed 42 --split-strategy balanced --split-search-restarts 256 --clean",
+            ".venv/bin/python script/script_data/export_face_keypoints_rtmpose.py \\",
+            f"  {output_dir.as_posix()}",
+            ".venv/bin/python script/script_data/export_face_keypoints_deim_dino.py \\",
+            f"  {output_dir.as_posix()}",
+            ".venv/bin/python script/script_data/convert_face_pose_metadata_to_rtmdet_hf.py \\",
+            f"  {output_dir.as_posix()} {output_dir.as_posix()}/annotations/rtmdet_hf \\",
+            "  --dataset-version face_pose_drive_v2_head_face --image-mode reference",
+            "```",
+            "",
+        ]
+    )
+    (output_dir / "README.md").write_text(text, encoding="utf-8")
+
+
 def convert(args: argparse.Namespace) -> dict[str, Any]:
+    discovered_zips = discover_annotation_zips(list(getattr(args, "annotation_root", [])))
+    annotation_zips = list(
+        dict.fromkeys([*getattr(args, "annotation_zip", []), *discovered_zips])
+    )
     records: list[dict[str, Any]] = []
     for path in args.ground_truth_json:
         records.extend(load_records_from_json(path))
-    for path in args.annotation_zip:
+    for path in annotation_zips:
         records.extend(load_records_from_zip(path))
     for path in args.annotation_xml:
         records.extend(load_records_from_xml(path))
+    if not records:
+        raise ValueError("No annotation records were loaded")
     if args.max_images is not None:
         records = records[: args.max_images]
 
-    source_image_roots = [path.parent for path in [*args.annotation_zip, *args.annotation_xml]]
+    source_image_roots = [path.parent for path in [*annotation_zips, *args.annotation_xml]]
     configured_image_roots = args.image_root or [
         Path("data/output"),
         Path("experiments/scrfd_mediapipe_baseline/images"),
@@ -642,6 +1219,18 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        test_kind_contains=args.test_kind_contains,
+        strategy=getattr(args, "split_strategy", "balanced"),
+        search_restarts=getattr(args, "split_search_restarts", 256),
+    )
+    balance = split_balance_report(
+        records,
+        split_map,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        strategy=getattr(args, "split_strategy", "balanced"),
+        seed=args.seed,
         test_kind_contains=args.test_kind_contains,
     )
     prepare_output(args.output_dir, clean=args.clean)
@@ -725,20 +1314,40 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         metadata_records.append(record_meta)
 
     write_dataset_yaml(args.output_dir)
+    write_dataset_manifest(args.output_dir, summary)
     metadata = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "keypoint_names": KEYPOINT_NAMES,
         "bbox_source": (
             "Rotation-aware Face ellipse bbox from cx/cy/rx/ry/rotation, "
-            "then clipped to image bounds for YOLO labels"
+            "then clipped to image bounds; model-specific exporters consume this canonical target"
         ),
-        "visibility_policy": "0 for missing or outside-image keypoints, 2 for present in-image keypoints",
+        "visibility_policy": (
+            "Canonical records preserve CVAT occluded; model exports map missing/outside=0, "
+            "occluded=1, visible=2. YOLO Pose labels use their own visibility encoding."
+        ),
+        "source": {
+            "ground_truth_json": [str(path) for path in args.ground_truth_json],
+            "annotation_zip": [str(path) for path in annotation_zips],
+            "annotation_xml": [str(path) for path in args.annotation_xml],
+            "annotation_root": [str(path) for path in getattr(args, "annotation_root", [])],
+        },
+        "split_balance": balance,
         "summary": summary,
         "records": metadata_records,
     }
     metadata_path = args.output_dir / "metadata" / "conversion_metadata.json"
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {"summary": summary, "metadata": str(metadata_path), "yaml": str(args.output_dir / "face_pose.yaml")}
+    balance_path = args.output_dir / "metadata" / "split_balance.json"
+    balance_path.write_text(json.dumps(balance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_dataset_readme(args.output_dir, summary, balance)
+    return {
+        "summary": summary,
+        "split_balance_objective": balance["objective"],
+        "metadata": str(metadata_path),
+        "split_balance": str(balance_path),
+        "yaml": str(args.output_dir / "face_pose.yaml"),
+    }
 
 
 def main() -> int:

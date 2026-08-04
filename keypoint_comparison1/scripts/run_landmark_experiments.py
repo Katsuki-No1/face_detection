@@ -68,6 +68,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force-detector-cache", action="store_true")
     parser.add_argument("--skip-detector-preflight", action="store_true")
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help="Gate-only output override; production uses outputs.root from the config.",
+    )
+    parser.add_argument(
+        "--initialize-from-deim-checkpoint",
+        type=Path,
+        help="Gate-only DINO initialization override.",
+    )
+    parser.add_argument(
+        "--detector-checkpoint",
+        type=Path,
+        help="Gate-only detector checkpoint override.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="Bounded gate-training override applied after production config validation.",
+    )
+    parser.add_argument("--max-train-samples", type=int)
+    parser.add_argument("--max-val-samples", type=int)
     return parser.parse_args()
 
 
@@ -95,6 +117,28 @@ def _configure_logging(output_root: Path) -> None:
 def main() -> int:
     args = parse_args()
     config = load_landmark_config(args.config, project_root=REPO_ROOT)
+    if args.output_root is not None:
+        config.raw["outputs"]["root"] = str(args.output_root.resolve())
+    if args.initialize_from_deim_checkpoint is not None:
+        config.raw["model"]["backbone"]["initialize_from_deim_checkpoint"] = str(
+            args.initialize_from_deim_checkpoint.resolve()
+        )
+    if args.detector_checkpoint is not None:
+        config.raw["detector"]["checkpoint"] = str(
+            args.detector_checkpoint.resolve()
+        )
+    if args.epochs is not None:
+        if args.epochs <= 0:
+            raise ValueError("--epochs must be positive")
+        config.raw["train"]["epochs"] = int(args.epochs)
+    for key, value in (
+        ("max_train_samples", args.max_train_samples),
+        ("max_val_samples", args.max_val_samples),
+    ):
+        if value is not None:
+            if value <= 0:
+                raise ValueError(f"--{key.replace('_', '-')} must be positive")
+            config.raw["train"][key] = int(value)
     _configure_logging(config.output_root)
     device = _device(args.device)
     train_cfg = config.raw["train"]

@@ -1,0 +1,26 @@
+extends: production.yaml
+
+# This config uses the exact source-video-balanced split shared by both
+# three-stage comparison arms. The detector emits a low score floor so the
+# operating threshold can be selected on validation and then frozen.
+model:
+  score_threshold: 0.001
+
+data:
+  root: outputs/dataset_cache/face_pose_drive_v2_balanced_811
+  train:
+    annotation: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/train.json
+  val:
+    annotation: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/val.json
+  test:
+    annotation: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json
+
+train:
+  output_dir: runs/head_codino_vits16plus_face_pose_drive_v2_balanced_811
+  seed: 42
+
+evaluation:
+  output: outputs/head_codino/face_pose_drive_v2_balanced_811/val_predictions.json
+
+benchmark:
+  output: outputs/head_codino/face_pose_drive_v2_balanced_811/benchmark.json

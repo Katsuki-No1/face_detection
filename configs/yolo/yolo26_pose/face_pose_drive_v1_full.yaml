@@ -1,0 +1,133 @@
+schema_version: 1
+experiment_name: yolo26_pose_face_pose_drive_v1_full
+project_root: .
+
+dataset:
+  yaml: datasets/face_pose_drive_v1/face_pose.yaml
+  root: datasets/face_pose_drive_v1
+  coco_annotations:
+    train: datasets/face_pose_drive_v1/train.json
+    val: datasets/face_pose_drive_v1/val.json
+    test: datasets/face_pose_drive_v1/test.json
+  expected_coco_sha256:
+    train: f783ba5bf9f0d5da672b4e34ce46767c2180676c0046dfbf894bf65aff52f423
+    val: c2755ce5291c0ee8fdd617c3886e7f8a2f1b2c76f162a91b61cd346708378bd6
+    test: cce68a5fef9c7c386cd208cb9a18b2b0fa1e8f54a96e8a5484ccd2adc25eb950
+  expected_images:
+    train: 2460
+    val: 300
+    test: 330
+  expected_category_id: 2
+  expected_names:
+    0: face
+  expected_kpt_shape: [5, 3]
+  expected_flip_idx: [1, 0, 2, 4, 3]
+
+models:
+  s:
+    display_name: YOLO26s-pose
+    official_checkpoint: yolo26s-pose.pt
+    pretrained_weights: models/yolo/yolo26_pose/pretrained/yolo26s-pose.pt
+    expected_scale: s
+    batch: 16
+    run_name: yolo26s_pose_full
+    official_coco_reference:
+      pose_map50_95: 0.630
+      parameters: 10400000
+      flops_g: 23.9
+  m:
+    display_name: YOLO26m-pose
+    official_checkpoint: yolo26m-pose.pt
+    pretrained_weights: models/yolo/yolo26_pose/pretrained/yolo26m-pose.pt
+    expected_scale: m
+    batch: 8
+    run_name: yolo26m_pose_full
+    official_coco_reference:
+      pose_map50_95: 0.688
+      parameters: 21500000
+      flops_g: 73.1
+
+training:
+  production_mode: true
+  minimum_epochs: 120
+  imgsz: 960
+  epochs: 200
+  patience: 50
+  fraction: 1.0
+  pretrained: true
+  optimizer: MuSGD
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  nbs: 64
+  cos_lr: true
+  amp: true
+  deterministic: true
+  seed: 0
+  workers: 8
+  cache: false
+  val: true
+  plots: true
+  save: true
+  save_period: 5
+  close_mosaic: 20
+  rect: false
+  multi_scale: false
+  # Same tuned face-pose augmentation family as the fixed-dataset YOLO11s benchmark.
+  hsv_h: 0.015
+  hsv_s: 0.50
+  hsv_v: 0.35
+  degrees: 10.0
+  translate: 0.08
+  scale: 0.30
+  shear: 2.0
+  perspective: 0.0005
+  flipud: 0.0
+  fliplr: 0.50
+  bgr: 0.0
+  mosaic: 0.30
+  mixup: 0.0
+  copy_paste: 0.0
+  auto_augment: null
+  erasing: 0.0
+  max_det: 100
+
+evaluation:
+  imgsz: 960
+  # Explicitly bounded; passing all paths as a Python list forms one giant batch.
+  batch_size: 8
+  prediction_conf_min: 0.001
+  iou_threshold: 0.50
+  thresholds: "0.01:0.95:0.01"
+  keypoint_error_threshold: 0.05
+  save_error_images: true
+  max_error_images: 80
+
+selection:
+  current_default: s
+  pose_map50_95_min_gain_for_m: 0.010
+  bbox_map50_95_max_regression_for_m: 0.005
+  nme_max_regression_for_m: 0.002
+
+outputs:
+  pretrained_dir: models/yolo/yolo26_pose/pretrained
+  train_project: runs/yolo/yolo26_pose/face_pose_drive_v1
+  evaluation_root: outputs/yolo/yolo26_pose/face_pose_drive_v1
+  preflight_root: outputs/yolo/yolo26_pose/face_pose_drive_v1/preflight
+
+runtime:
+  device: "0"
+  minimum_ultralytics_version: 8.4.0
+  allow_weight_download: true
+  enable_tf32: true
+
+wandb:
+  enabled: true
+  entity: sato-waseda-university
+  project: face_detection
+  group: face_pose_drive_v1_four_model_comparison
+  mode: online

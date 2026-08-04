@@ -1,0 +1,320 @@
+schema_version: 2
+experiment_name: face_keypoint_comparison2_dinov3_vits16_balanced_811_long_axis_square_production
+
+landmarks:
+  names: [left_eye, right_eye, nose_tip, left_mouth_corner, right_mouth_corner]
+  flip_indices: [1, 0, 2, 4, 3]
+
+data:
+  dataset_version: face_pose_drive_v2_balanced_811
+  # RTMPose and DINO/DEIM deliberately use separate direct exports. Neither
+  # export is reconstructed from YOLO labels.
+  rtmpose:
+    image_root: outputs/dataset_cache/face_pose_current
+    category_ids: [1]
+    annotations:
+      train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/rtmpose/person_keypoints_train.json
+      val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/rtmpose/person_keypoints_val_keypoint_selection.json
+      test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/rtmpose/person_keypoints_test.json
+  dino:
+    image_root: outputs/dataset_cache/face_pose_current
+    category_ids: [2]
+    annotations:
+      train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+      val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val_keypoint_selection.json
+      test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_test.json
+  joint:
+    image_root: outputs/dataset_cache/face_pose_current
+    category_ids: [2]
+    target_category_id: 2
+    annotations:
+      train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+      val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val_keypoint_selection.json
+      test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_test.json
+  ellipse_error_model: outputs/crop_error_models/face_pose_drive_v2_balanced_811/ellipse_deim_val_residuals.json
+  crop_error_calibration:
+    # Two whole validation videos are reserved for detector-error calibration.
+    # They are excluded from keypoint model-selection val, and test is unused.
+    annotation: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val_detector_calibration.json
+    annotation_sha256: f1cb25b91a66bb2a42f396cb1a3bd434aac75ad3566dfe4cbd404ac8ea7ae99f
+    image_root: outputs/dataset_cache/face_pose_current
+    error_model: outputs/crop_error_models/face_pose_drive_v2_balanced_811/ellipse_deim_val_residuals.json
+    category_ids: [2]
+    source_video_ids:
+      - 2026_06_24_3_TAN_2627416c
+      - 2026_06_24_2_GQN_f235e3ee
+    expected: {images: 200, annotations: 308}
+    minimum_matching_iou: 0.50
+    minimum_matched_samples: 200
+    area_bins: 3
+    robust_quantiles: [0.01, 0.99]
+    # A residual is sampled as one correlated five-dimensional vector. A
+    # common severity multiplier expands its measured direction without
+    # destroying center/axis/angle correlation; no per-component noise is used.
+    clean_probability: 0.10
+    severity_range: [0.75, 1.25]
+    independent_component_noise: false
+  augmentation:
+    # Training applies a jointly sampled, area-stratified DEIM residual to the
+    # GT ellipse on every __getitem__ call. Validation keeps GT fixed. The
+    # source ROI is a theta-aligned square whose side is based on the
+    # perturbed semi-major axis. It is sampled from the real image with one
+    # isotropic affine transform, so facial aspect ratio is preserved and the
+    # short-axis surplus is real deployment background rather than padding.
+    roi_geometry: long_axis_square
+    scale_factor: 1.25
+    # Legacy fallback bounds are retained for isolated dataset tests; validated
+    # production runs require ellipse_error_model and do not use these values.
+    scale_jitter: 0.20
+    center_jitter: 0.08
+    rotation_deg: 25.0
+    horizontal_flip_probability: 0.50
+    brightness: 0.25
+    contrast: 0.25
+    saturation: 0.20
+    blur_probability: 0.15
+    blur_kernel_max: 7
+    occlusion_probability: 0.35
+    occlusion_area: [0.03, 0.25]
+    occlusion_count: [1, 3]
+  expected:
+    train_images: 4237
+    train_annotations: 6529
+    train_usable_keypoint_instances: 6081
+    val_images: 330
+    val_annotations: 532
+    val_usable_keypoint_instances: 498
+    test_images: 528
+    test_annotations: 769
+    test_usable_keypoint_instances: 720
+    annotation_sha256:
+      rtmpose:
+        train: 4a8b21de648be724d38601c2a715adf27d1f5da9e42d7298edcfdd1d9102a6dc
+        val: 7668ba0f0fda46f8b85c1264b0074aa32a17648851602943b51374bb0068dfc0
+        test: 8cb00ced078e73622056e1d639cece25f4ffd50cbfe4b607f38534478a5c9042
+      deim_dino:
+        train: 2fac1a20b089c801099bed0b439db3ed612d2ea812b5eab21a574f473f981cfa
+        val: 11148e4ec7240b0ec24cc9ade9530fc4fb231f874e23aab6aea7c0c31981a58e
+        test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
+    visibility_counts:
+      train: {unlabeled: 6785, occluded: 3521, visible: 22339}
+      val: {unlabeled: 576, occluded: 344, visible: 1740}
+      test: {unlabeled: 811, occluded: 437, visible: 2597}
+  leakage_audit:
+    enabled: true
+    fail_on_overlap: true
+
+# The same fixed detector and operating point are used only for end-to-end
+# inference/evaluation of the three top-down models. Keypoint train/validation
+# crops come from GT ellipses and never from this detector.
+detector:
+  variant: DEIMv2-L
+  # The queue trains this ellipse detector from the public COCO checkpoint on
+  # the balanced 8:1:1 export before starting any keypoint job.
+  # At deployment, use the predicted ellipse center/major/minor axes/angle to
+  # build the same roll-normalized long-axis square used by GT-crop training.
+  crop_geometry: ellipse
+  config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco.yaml
+  checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco/checkpoints/best_val_ellipse_map.pt
+  input_size: 960
+  score_threshold: 0.33
+  maximum_detections: 100
+  matching_iou_threshold: 0.50
+
+models:
+  rtmpose_face5:
+    family: cnn
+    input_size: 256
+    require_pretrained: true
+    # Official RTMPose-M Face6 checkpoint. Face6 is a six-dataset, 106-point
+    # pretraining set; semantic channels are transferred to the target 5 points.
+    weights: checkpoint/RTMPose/rtmpose-m_simcc-face6_pt-in1k_120e-256x256-72a37400.pth
+    five_keypoint_checkpoint: null
+    expand_ratio: 0.5
+    deepen_factor: 0.67
+    widen_factor: 0.75
+    in_channels: 768
+    norm: BN
+    batch_size: 64
+    gradient_accumulation_steps: 1
+    test_time_flip: true
+    head:
+      hidden_dimension: 256
+      gau_attention_dimension: 128
+      gau_expansion_factor: 2.0
+      final_kernel_size: 7
+      simcc_split_ratio: 2.0
+      sigma: [5.66, 5.66]
+      kl_beta: 10.0
+      visibility_loss_weight: 0.20
+      dropout: 0.0
+
+  dinov3_fpn_rtmcc:
+    family: vit
+    input_size: 320
+    batch_size: 64
+    gradient_accumulation_steps: 1
+    test_time_flip: true
+    backbone:
+      name: dinov3_vits16
+      patch_size: 16
+      embed_dim: 384
+      hub_repo: models/source/dinov3
+      hub_model: dinov3_vits16
+      hub_module: dinov3.hub.backbones
+      # Strictly extracted from the EMA DINOv3-S backbone of the locally
+      # fine-tuned balanced-811 DEIMv2-L detector. Both ViT models share it.
+      weights: checkpoint/DINOv3/dinov3_vits16_face_pose_drive_v2_balanced_811_deimv2_backbone.pth
+      require_pretrained: true
+      pretrained: false
+      freeze: false
+      strict_weights: true
+      num_prefix_tokens: 0
+      token_key: x_norm_patchtokens
+      call_method: forward_features
+      intermediate_layers: [2, 5, 8, 11]
+      activation_checkpointing: false
+    fpn:
+      out_channels: 256
+    head:
+      hidden_dimension: 256
+      featuremap_size: [8, 8]
+      gau_attention_dimension: 128
+      gau_expansion_factor: 2.0
+      final_kernel_size: 7
+      simcc_split_ratio: 2.0
+      sigma: [7.07, 7.07]
+      kl_beta: 10.0
+      visibility_loss_weight: 0.20
+
+  dinov3_orformer_rtmcc:
+    family: occlusion_vit
+    input_size: 320
+    batch_size: 64
+    gradient_accumulation_steps: 1
+    test_time_flip: true
+    backbone:
+      name: dinov3_vits16
+      patch_size: 16
+      embed_dim: 384
+      hub_repo: models/source/dinov3
+      hub_model: dinov3_vits16
+      hub_module: dinov3.hub.backbones
+      weights: checkpoint/DINOv3/dinov3_vits16_face_pose_drive_v2_balanced_811_deimv2_backbone.pth
+      require_pretrained: true
+      pretrained: false
+      freeze: false
+      strict_weights: true
+      num_prefix_tokens: 0
+      token_key: x_norm_patchtokens
+      call_method: forward_features
+      intermediate_layers: [2, 5, 8, 11]
+      activation_checkpointing: false
+    fpn:
+      out_channels: 256
+    recovery:
+      dimension: 384
+      layers: 6
+      heads: 12
+      feedforward: 1536
+      dropout: 0.0
+      occlusion_loss_weight: 1.0
+      reconstruction_loss_weight: 2.0
+      sparsity_weight: 0.01
+    head:
+      hidden_dimension: 256
+      featuremap_size: [8, 8]
+      gau_attention_dimension: 128
+      gau_expansion_factor: 2.0
+      final_kernel_size: 7
+      simcc_split_ratio: 2.0
+      sigma: [7.07, 7.07]
+      kl_beta: 10.0
+      visibility_loss_weight: 0.20
+
+  deimv2_joint:
+    family: detr
+    input_size: 960
+    batch_size: 8
+    gradient_accumulation_steps: 2
+    # Keep the effective batch at 16. Before training, run one complete
+    # unfrozen optimizer/EMA update and select the largest microbatch that fits.
+    batch_size_fallback:
+      enabled: true
+      candidates:
+        - batch_size: 8
+          gradient_accumulation_steps: 2
+        - batch_size: 4
+          gradient_accumulation_steps: 4
+        - batch_size: 2
+          gradient_accumulation_steps: 8
+        - batch_size: 1
+          gradient_accumulation_steps: 16
+    dimension: 224
+    maximum_face_queries: 100
+    landmark_decoder_layers: 6
+    heads: 8
+    feedforward: 1792
+    dropout: 0.0
+    keypoint_loss_weight: 10.0
+    visibility_loss_weight: 1.0
+    auxiliary_loss_weight: 0.5
+
+train:
+  production_mode: true
+  minimum_epochs: 100
+  epochs: 150
+  fraction: 1.0
+  seed: 42
+  lr: 5.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 0.05
+  layer_decay: 0.85
+  warmup_epochs: 5
+  minimum_lr_ratio: 0.01
+  freeze_backbone_epochs: 5
+  max_grad_norm: 1.0
+  amp: true
+  # Keep the joint baseline on the same FP16 AMP contract as every
+  # cooperative/three-stage comparison arm.
+  amp_dtype: float16
+  grad_scaler_init_scale: 1024.0
+  tf32: true
+  fused_optimizer: true
+  num_workers: 8
+  prefetch_factor: 4
+  checkpoint_every: 5
+  early_stopping:
+    enabled: true
+    minimum_epoch: 100
+    patience: 25
+    min_delta: 0.0001
+  ema:
+    enabled: true
+    decay: 0.9998
+  checkpoint_selection:
+    topdown_metric: nme
+    joint_metric: validation_loss
+  wandb:
+    enabled: true
+    metric_schema_version: 2
+    live_sync_seconds: 30
+    entity: sato-waseda-university
+    project: face_detection
+    group: keypoint_comparison2
+    name: deimv2_joint_balanced_811_long_axis_square_seed42
+    mode: online
+    tags:
+      - DEIMv2-L
+      - joint-face-keypoint
+      - face_pose_drive_v2_balanced_811
+      - long-axis-square
+
+evaluation:
+  batch_size: 32
+  pck_thresholds: [0.05, 0.10]
+  visibility_threshold: 0.50
+  save_predictions: true
+
+output:
+  root: outputs/keypoint_comparison2/face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square

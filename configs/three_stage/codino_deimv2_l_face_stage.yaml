@@ -1,0 +1,36 @@
+extends: codino_deimv2_l_landmark_query_baseline.yaml
+
+schema_version: 1
+experiment_name: codino_deimv2_l_strict_sequential_face_stage_seed42
+
+experiment_objective:
+  type: cascade_comparison
+  claim_scope: cascade_selection_only
+  joint_fine_tuning: false
+  final_performance_claim: false
+
+# Stage 2a: consume the completed unfrozen DINO + Co-DINO HEAD detector as a
+# fixed upstream component and train only HEAD -> FACE routing and FACE.
+train:
+  stage:
+    name: face
+    trainable_groups:
+      - sta_neck
+      - shared_encoder
+      - face_decoder
+      - external_head_cascade
+    loss_weights:
+      loss_face_independent: 1.0
+      loss_external_head_routing: 1.0
+
+output:
+  root: outputs/experiments/three_stage/codino_deimv2_l_face_stage_seed42
+
+wandb:
+  group: three_stage_causal_curriculum
+  name: codino_deimv2_l_face_stage_seed42
+  tags:
+    - strict-sequential
+    - causal-stage-2-face
+    - frozen-DINO-Co-DINO
+    - objective-cascade-comparison

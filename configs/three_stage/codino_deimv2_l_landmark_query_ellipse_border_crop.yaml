@@ -1,0 +1,43 @@
+extends: codino_deimv2_l_landmark_query_baseline.yaml
+
+schema_version: 1
+experiment_name: codino_deimv2_l_landmark_query_strict_sequential_shared_vits16plus_ellipse_border_crop_factorized_state_seed42
+
+model:
+  pose_branch:
+    # The later queue starts only after the standalone factorized Query
+    # Refinement run has finished. Transfer its semantic queries, decoder,
+    # coordinate/visibility heads, presence head, and both local refinement
+    # stages. The presence head is copied into every full-frame decoder layer.
+    initialization: fine_tuned
+    checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/query_refinement/checkpoints/best_nme.pt
+    prefer_ema: true
+    minimum_eligible_load_fraction: 0.65
+    # P(present) and P(visible | present) are independent. Both logits receive
+    # an explicit additive update in each local Query Refinement stage.
+    state_head_mode: factorized_presence_visibility
+
+# The internal Co-DINO HEAD targets, DEIMv2-L face/ellipse branch, and
+# query-refinement targets are transformed together. Validation and test
+# remain unaugmented.
+data:
+  augmentation:
+    enabled: true
+    ellipse_border_crop: 0.20
+    ellipse_border_crop_center_outside_probability: 0.50
+    ellipse_border_crop_contour_margin: [0.10, 0.50]
+    ellipse_border_crop_center_margin: [0.02, 0.20]
+    ellipse_border_crop_min_scale: 0.50
+    minimum_axis: 2.0
+
+train:
+  seed: 42
+
+evaluation:
+  keypoint_presence_threshold: 0.50
+
+output:
+  root: outputs/experiments/three_stage/codino_deimv2_l_landmark_query_ellipse_border_crop_seed42
+
+wandb:
+  name: codino_deimv2_l_landmark_query_strict_sequential_shared_vits16plus_ellipse_border_crop_factorized_state_seed42

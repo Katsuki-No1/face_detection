@@ -235,6 +235,12 @@ def preflight(
         known_hashes.update(inventory["image_hashes"])
     evaluation_inventory: dict[str, Any] = {}
     for name, definition in raw["data"].get("evaluation_sets", {}).items():
+        if not bool(definition.get("enabled", True)):
+            evaluation_inventory[name] = {
+                "enabled": False,
+                "disabled_reason": "disabled_by_experiment_config",
+            }
+            continue
         inventory = _annotation_inventory(
             Path(definition["annotation"]),
             image_root=Path(definition["root"]),
@@ -492,12 +498,26 @@ def evaluate_conditions(
     variants: Sequence[str] = VARIANTS,
 ) -> dict[str, Any]:
     raw = config.raw
-    available = raw["data"].get("evaluation_sets", {})
+    available = {
+        name: definition
+        for name, definition in raw["data"].get(
+            "evaluation_sets", {}
+        ).items()
+        if bool(definition.get("enabled", True))
+    }
+    evaluation_cfg = raw.get("evaluation", {})
+    configured_common_root = evaluation_cfg.get("baseline_aligned_output_root")
+    validation_success = (
+        Path(str(configured_common_root)) / "val/baseline_aligned/success.json"
+        if configured_common_root
+        else None
+    )
     if (
         "v2_test" in evaluation_sets
         and "v2_val" in available
         and "query_refinement" in variants
         and "v2_val" not in evaluation_sets
+        and not (validation_success is not None and validation_success.is_file())
     ):
         # Keep already-launched queue commands compatible with the new common
         # contract: always produce validation before the fixed test report.
@@ -560,7 +580,6 @@ def evaluate_conditions(
         maximum_detections=int(detector_cfg["maximum_detections"]),
         crop_geometry=str(detector_cfg["crop_geometry"]),
     )
-    evaluation_cfg = raw.get("evaluation", {})
     criterion = LandmarkLoss(raw.get("loss", {})).to(device)
     all_results: dict[str, Any] = {}
     for set_name in evaluation_sets:
@@ -689,6 +708,14 @@ def evaluate_conditions(
         ):
             split = "val" if set_name == "v2_val" else "test"
             directory = set_root / "E_query_refinement_deim"
+            configured_common_root = evaluation_cfg.get(
+                "baseline_aligned_output_root"
+            )
+            common_output_dir = (
+                Path(str(configured_common_root)) / split / "baseline_aligned"
+                if configured_common_root
+                else directory / "baseline_aligned"
+            )
             command = [
                 sys.executable,
                 str(
@@ -715,11 +742,16 @@ def evaluate_conditions(
                 "--output-dir",
                 str(directory / "baseline_aligned_diagnostic"),
                 "--common-output-dir",
-                str(directory / "baseline_aligned"),
+                str(common_output_dir),
                 "--split",
                 split,
                 "--architecture-id",
-                "deimv2_l_query_refinement_factorized_state",
+                str(
+                    evaluation_cfg.get(
+                        "architecture_id",
+                        "deimv2_l_query_refinement_factorized_state",
+                    )
+                ),
                 "--device",
                 str(device),
                 "--batch-size",

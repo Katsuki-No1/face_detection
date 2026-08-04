@@ -1,0 +1,43 @@
+extends: E1_baseline.yaml
+
+experiment_name: E1_dino_deim_style_face_pose_drive_v1_960
+
+experiment:
+  active: true
+  name: E1_dino_deim_style_face_pose_drive_v1_960
+  description: Frozen DINOv3 ViT-B/16 + legacy DEIM-style detector on the full-image face_pose_drive_v1 split.
+
+data:
+  format: coco
+  data_root: datasets/face_pose_drive_v1
+  annotation_path: datasets/face_pose_drive_v1/train.json
+  image_root: datasets/face_pose_drive_v1
+  split: train
+  image_size: 960
+  include_negative: true
+  category_ids: [2]
+  synthetic_if_missing: false
+  leakage_audit:
+    enabled: true
+    splits: [train, val, test]
+
+train:
+  name: E1_dino_deim_style_face_pose_drive_v1_960
+  imgsz: 960
+  batch_size: 16
+  epochs: 120
+  seed: 0
+  validation:
+    enabled: true
+    every: 5
+    split: val
+    image_size: 960
+    fixed_threshold: 0.3
+    score_min: 0.001
+
+inference:
+  score_thr: 0.001
+  use_nms: false
+  nms_iou_thr: 0.5
+  topk: 300
+  detections_per_image: 100

@@ -1,0 +1,4 @@
+extends: ../stage2_fixed_geometry.yaml
+experiment_name: hpg_A4_gated_fusion
+output:
+  root: outputs/experiments/head_pose_geometry/A4

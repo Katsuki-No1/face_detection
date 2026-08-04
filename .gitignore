@@ -89,6 +89,11 @@ models/
 wandb/
 mlruns/
 tensorboard/
+/state/
+
+# Local Codex instructions
+codex用指示書.txt
+/for codex/
 
 # Keep documentation, source, examples, and placeholders versionable
 !README.md
@@ -101,6 +106,10 @@ tensorboard/
 !src/models/**
 !tests/
 !tests/**
+!keypoint_comparison1/
+!keypoint_comparison1/**
+!keypoint_comparison2/
+!keypoint_comparison2/**
 !requirements.txt
 !pyproject.toml
 !configs/

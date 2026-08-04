@@ -1,0 +1,15 @@
+extends: head_crop_cooperative_detr_l_960.yaml
+
+# Gate-only data source. It exercises the identical crop/model/loss/AMP path
+# before the common production HEAD checkpoint and caches exist. Production,
+# validation, and test remain predicted-HEAD-only.
+data:
+  predicted_head_caches:
+    train: null
+    val: null
+    test: null
+  head_crop:
+    require_predicted_heads: false
+
+wandb:
+  enabled: false

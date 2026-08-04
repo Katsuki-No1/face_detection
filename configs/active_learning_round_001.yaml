@@ -1,0 +1,94 @@
+project_root: ..
+input_dir: data/input/active_learning/active_learning(dataset=3000frame)7-17
+output_dir: data/output/active_learning/active_learning_round_001
+
+models:
+  - name: yolo11s
+    type: yolo11s
+    weights: runs/yolo11s_face_pose_drive_v1_960_20260714/weights/best.pt
+    device: cuda:0
+    input_size: 960
+    confidence_threshold: 0.05
+    analysis_threshold: 0.52
+    max_detections: 100
+    batch_size: 8
+    model_weight: 0.4789
+    validation_map: 0.4789
+    class_id: 2
+    class_name: face
+  - name: rtmdet
+    type: rtmdet
+    config: configs/rtmdet/rtmdet_s_face_pose_drive_v1_960.py
+    weights: outputs/experiments/rtmdet_s_face_pose_drive_v1_960_low_lr_20260717/best_coco_bbox_mAP_epoch_35.pth
+    device: cuda:0
+    input_size: 960
+    confidence_threshold: 0.05
+    analysis_threshold: 0.40
+    max_detections: 100
+    batch_size: 8
+    model_weight: 0.5366
+    validation_map: 0.5366
+    class_id: 2
+    class_name: face
+  - name: dino_deimv2
+    type: dinov3_deimv2
+    config: configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze.yaml
+    weights: outputs/experiments/dinov3_deimv2_m_face_pose_drive_v1_960_aug_unfreeze_20260714/checkpoints/epoch_0010.pt
+    device: cuda:0
+    input_size: 960
+    confidence_threshold: 0.05
+    analysis_threshold: 0.51
+    max_detections: 100
+    batch_size: 8
+    model_weight: 0.4760
+    validation_map: 0.4760
+    class_id: 2
+    class_name: face
+
+sample_fps: 0.5
+clip_duration_sec: 10
+target_clip_count: 40
+max_clips_per_video: 5
+min_clips_per_video: 3
+min_interval_sec: 30
+max_clips_per_scene: 2
+max_clips_per_track: 2
+random_seed: 20260717
+selection_bucket_ratios:
+  model_disagreement: 0.40
+  common_difficulty: 0.20
+  novelty: 0.20
+  temporal_random: 0.20
+
+bbox_matching:
+  iou_threshold: 0.30
+  center_distance_threshold: 0.25
+  min_area_ratio: 0.33
+  max_area_ratio: 3.0
+
+temporal_window_sec: 4.0
+scene_change_threshold: 0.32
+duplicate_phash_distance: 5
+dark_brightness_threshold: 8.0
+broken_contrast_threshold: 1.0
+
+novelty:
+  enabled: true
+  reference_annotation: datasets/face_pose_drive_v1/train.json
+  reference_image_root: datasets/face_pose_drive_v1
+  reference_sample_count: 256
+  cluster_count: 24
+
+split_annotations:
+  train: datasets/face_pose_drive_v1/train.json
+  val: datasets/face_pose_drive_v1/val.json
+  test: datasets/face_pose_drive_v1/test.json
+
+montage:
+  width: 3840
+  height: 2160
+  fps: 30
+  review_inference_fps: 2.0
+  codec: libx264
+  crf: 20
+  preset: medium

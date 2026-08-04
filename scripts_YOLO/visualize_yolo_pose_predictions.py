@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-images", type=int, default=200)
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Randomly sample up to --max-images with this seed instead of taking the first images.",
+    )
     return parser.parse_args()
 
 
@@ -189,7 +196,12 @@ def main() -> int:
         raise RuntimeError("Missing ultralytics. Install requirements.txt first.") from error
 
     model = YOLO(str(args.weights))
-    images = image_paths(args.data_root, args.split)[: args.max_images]
+    all_images = image_paths(args.data_root, args.split)
+    if args.random_seed is None:
+        images = all_images[: args.max_images]
+    else:
+        sample_size = min(args.max_images, len(all_images))
+        images = random.Random(args.random_seed).sample(all_images, sample_size)
     results = model.predict(
         source=[str(path) for path in images],
         imgsz=args.imgsz,
@@ -227,6 +239,7 @@ def main() -> int:
         "data_root": str(args.data_root),
         "split": args.split,
         "images": len(rows),
+        "random_seed": args.random_seed,
         "conf_threshold": args.conf_threshold,
         "iou_threshold": args.iou_threshold,
         "visualization_dir": str(args.output_dir / "overlays"),

@@ -8,6 +8,10 @@ from pathlib import Path
 
 #コマンド：python script/script_data/count_head_annotations.py data/output/2026_06_21_1/task2_yk.zip
 
+DEFAULT_WANDB_ENTITY = "sato-waseda-university"
+DEFAULT_WANDB_PROJECT = "face_detection"
+
+
 @dataclass
 class ImageHeadCount:
     zip_path: Path
@@ -45,6 +49,37 @@ def parse_args() -> argparse.Namespace:
         "--csv-output",
         type=Path,
         help="Optional CSV path for per-image counts.",
+    )
+    parser.add_argument(
+        "--dataset-version",
+        default="face_dataset_v7",
+        help="Dataset version recorded in W&B. Default: face_dataset_v7.",
+    )
+    wandb_group = parser.add_argument_group("Weights & Biases")
+    wandb_group.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Log the annotation summary and tables to Weights & Biases.",
+    )
+    wandb_group.add_argument(
+        "--wandb-entity",
+        default=DEFAULT_WANDB_ENTITY,
+        help=f"W&B user or team name. Default: {DEFAULT_WANDB_ENTITY}.",
+    )
+    wandb_group.add_argument(
+        "--wandb-project",
+        default=DEFAULT_WANDB_PROJECT,
+        help=f"W&B project name. Default: {DEFAULT_WANDB_PROJECT}.",
+    )
+    wandb_group.add_argument(
+        "--wandb-run-name",
+        help="Optional display name for the W&B run.",
+    )
+    wandb_group.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+        help="W&B logging mode. Default: online.",
     )
     return parser.parse_args()
 
@@ -136,6 +171,64 @@ def write_csv(path: Path, rows: list[ImageHeadCount]) -> None:
             )
 
 
+def log_counts_to_wandb(
+    args: argparse.Namespace,
+    zip_counts: list[ZipHeadCount],
+) -> None:
+    try:
+        import wandb
+    except ImportError as error:
+        raise RuntimeError(
+            "W&B logging was requested, but wandb is not installed. "
+            "Run: python -m pip install -r requirements.txt"
+        ) from error
+
+    scalar_metrics = {
+        "dataset/zip_files": len(zip_counts),
+        "dataset/xml_files": sum(count.xml_files for count in zip_counts),
+        "dataset/images": sum(count.images for count in zip_counts),
+        "dataset/images_with_head": sum(count.images_with_head for count in zip_counts),
+        "dataset/heads": sum(count.heads for count in zip_counts),
+    }
+    init_kwargs = {
+        "project": args.wandb_project,
+        "name": args.wandb_run_name,
+        "job_type": "annotation-audit",
+        "mode": args.wandb_mode,
+        "config": {
+            "input_path": str(args.input_path),
+            "label": args.label,
+            "dataset_version": args.dataset_version,
+            "csv_output": str(args.csv_output) if args.csv_output else None,
+        },
+    }
+    if args.wandb_entity:
+        init_kwargs["entity"] = args.wandb_entity
+
+    with wandb.init(**init_kwargs) as run:
+        log_data = dict(scalar_metrics)
+        if len(zip_counts) > 1:
+            log_data["tables/per_zip"] = wandb.Table(
+                columns=["zip_path", "xml_files", "images", "images_with_head", "heads"],
+                data=[
+                    [
+                        str(count.zip_path),
+                        count.xml_files,
+                        count.images,
+                        count.images_with_head,
+                        count.heads,
+                    ]
+                    for count in zip_counts
+                ],
+            )
+
+        run.log(log_data)
+        if run.url:
+            print(f"wandb_run: {run.url}")
+        else:
+            print(f"wandb_run: completed ({args.wandb_mode} mode)")
+
+
 def main() -> int:
     args = parse_args()
     zip_files = find_zip_files(args.input_path)
@@ -170,6 +263,9 @@ def main() -> int:
     if args.csv_output:
         write_csv(args.csv_output, image_rows)
         print(f"csv_output: {args.csv_output}")
+
+    if args.wandb:
+        log_counts_to_wandb(args, zip_counts)
 
     return 0
 

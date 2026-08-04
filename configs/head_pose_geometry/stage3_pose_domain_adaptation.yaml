@@ -1,0 +1,10 @@
+extends: stage2_fixed_geometry.yaml
+experiment_name: hpg_stage3_final_pose_stage_adaptation
+model:
+  head_pose_geometry:
+    pose_encoder:
+      training_mode: partial
+data:
+  pose_pseudo_cache: outputs/head_pose_geometry/pseudo_pose/train.json
+output:
+  root: outputs/experiments/head_pose_geometry/stage3_pose_adaptation

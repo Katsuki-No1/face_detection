@@ -19,6 +19,7 @@ DINO_EMBED_DIMS = {
     "dinov2_vitl14": 1024,
     "dinov2_vitg14": 1536,
     "dinov3_vits16": 384,
+    "dinov3_vits16plus": 384,
     "dinov3_vitb16": 768,
     "dinov3_vitl16": 1024,
 }
@@ -415,7 +416,7 @@ def build_dino_backbone(config: Mapping[str, Any] | None = None, *, backbone: nn
         num_prefix_tokens=int(cfg.get("num_prefix_tokens", 1)),
         call_method=str(cfg.get("call_method", "auto")),
         freeze=bool(cfg.get("freeze", True)),
-        unfreeze_last_n_blocks=int(cfg.get("unfreeze_last_n_blocks", 0)),
+        unfreeze_last_n_blocks=int(cfg.get("unfreeze_last_n_blocks", cfg.get("trainable_last_blocks", 0))),
         strict_weights=bool(cfg.get("strict_weights", False)),
         allow_non_divisible=bool(cfg.get("allow_non_divisible", False)),
     )

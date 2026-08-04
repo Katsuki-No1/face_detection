@@ -1,0 +1,15 @@
+extends: base_30ep.yaml
+
+experiment_name: dinov3_deimv2_m_face_pose_drive_v1_photometric_medium
+
+train:
+  name: dinov3_deimv2_m_face_pose_drive_v1_photometric_medium
+
+augmentation:
+  hsv_h: 0.015
+  hsv_s: 0.50
+  hsv_v: 0.35
+  brightness: 0.25
+  contrast: 0.25
+  gamma: 0.20
+  noise: 0.03

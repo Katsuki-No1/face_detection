@@ -2,8 +2,16 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts_YOLO.yolo26_pose.inference import iter_batched_image_predictions
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -16,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "val", "test"], required=True)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--prediction-conf-min", type=float, default=0.001)
     parser.add_argument(
@@ -149,10 +158,52 @@ def tensor_to_list(value: Any) -> list[Any]:
 def result_predictions(result: Any) -> list[dict[str, Any]]:
     boxes = tensor_to_list(result.boxes.xyxy) if result.boxes is not None else []
     scores = tensor_to_list(result.boxes.conf) if result.boxes is not None else []
-    return [
-        {"bbox": [float(value) for value in box], "score": float(scores[index])}
-        for index, box in enumerate(boxes)
-    ]
+    keypoint_xy = (
+        tensor_to_list(result.keypoints.xy)
+        if result.keypoints is not None
+        else []
+    )
+    keypoint_conf = (
+        tensor_to_list(getattr(result.keypoints, "conf", None))
+        if result.keypoints is not None
+        else []
+    )
+    output = []
+    for index, box in enumerate(boxes):
+        points = []
+        coordinates = keypoint_xy[index] if index < len(keypoint_xy) else []
+        confidences = (
+            keypoint_conf[index] if index < len(keypoint_conf) else []
+        )
+        for point_index, name in enumerate(("e1", "e2", "n", "m1", "m2")):
+            xy = (
+                coordinates[point_index]
+                if point_index < len(coordinates)
+                else (0.0, 0.0)
+            )
+            confidence = (
+                confidences[point_index]
+                if point_index < len(confidences)
+                else None
+            )
+            points.append(
+                {
+                    "name": name,
+                    "x": float(xy[0]),
+                    "y": float(xy[1]),
+                    "score": (
+                        None if confidence is None else float(confidence)
+                    ),
+                }
+            )
+        output.append(
+            {
+                "bbox": [float(value) for value in box],
+                "score": float(scores[index]),
+                "keypoints": points,
+            }
+        )
+    return output
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -168,6 +219,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_args()
+    evaluation_started = time.perf_counter()
     cv2 = import_cv2()
     try:
         from ultralytics import YOLO  # type: ignore
@@ -180,16 +232,21 @@ def main() -> int:
     predictions_by_image: dict[str, list[dict[str, Any]]] = {}
     ground_truth_by_image: dict[str, list[dict[str, Any]]] = {}
     prediction_records = []
+    reported_inference_milliseconds = 0.0
 
-    results = model.predict(
-        source=[str(path) for path in images],
+    inference_started = time.perf_counter()
+    results = iter_batched_image_predictions(
+        model,
+        images,
         imgsz=args.imgsz,
         conf=args.prediction_conf_min,
         device=args.device,
-        stream=True,
-        verbose=False,
+        batch_size=args.batch_size,
     )
-    for image_path, result in zip(images, results):
+    for image_path, result in results:
+        reported_inference_milliseconds += float(
+            getattr(result, "speed", {}).get("inference", 0.0)
+        )
         image = cv2.imread(str(image_path))
         if image is None:
             raise RuntimeError(f"Failed to read image: {image_path}")
@@ -209,6 +266,7 @@ def main() -> int:
                 "ground_truth_count": len(ground_truth),
             }
         )
+    inference_seconds = time.perf_counter() - inference_started
 
     rows = []
     for threshold in thresholds:
@@ -231,7 +289,30 @@ def main() -> int:
         }
         rows.append(row)
 
-    best = max(rows, key=lambda row: (row["f1"], row["recall"], row["precision"], -row["threshold"]))
+    best = dict(
+        max(
+            rows,
+            key=lambda row: (
+                row["f1"],
+                row["recall"],
+                row["precision"],
+                -row["threshold"],
+            ),
+        )
+    )
+    elapsed = time.perf_counter() - evaluation_started
+    best["runtime"] = {
+        "total_seconds": elapsed,
+        "images_per_second": len(images) / max(elapsed, 1.0e-12),
+        "model_inference_seconds": reported_inference_milliseconds / 1000.0,
+        "model_inference_milliseconds_per_image": (
+            reported_inference_milliseconds / max(1, len(images))
+        ),
+        "inference_and_decode_seconds": inference_seconds,
+        "peak_vram_mib": None,
+        "batch_size": int(args.batch_size),
+        "input_size": int(args.imgsz),
+    }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(args.output_dir / f"{args.split}_threshold_sweep.csv", rows)
     (args.output_dir / f"{args.split}_best_threshold.json").write_text(

@@ -3,9 +3,17 @@ import csv
 import json
 import math
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts_YOLO.yolo26_pose.inference import iter_batched_image_predictions
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -22,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--conf-threshold", type=float, default=0.25)
     parser.add_argument("--prediction-conf-min", type=float, default=0.001)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
@@ -398,6 +407,7 @@ def category_summary(failure_rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    evaluation_started = time.perf_counter()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     cv2 = import_cv2()
     try:
@@ -416,17 +426,22 @@ def main() -> int:
     failure_rows: list[dict[str, Any]] = []
     mean_ious: list[float] = []
     error_images_written = 0
+    reported_inference_milliseconds = 0.0
 
-    results = model.predict(
-        source=[str(path) for path in images],
+    inference_started = time.perf_counter()
+    results = iter_batched_image_predictions(
+        model,
+        images,
         imgsz=args.imgsz,
         conf=args.prediction_conf_min,
         device=args.device,
-        stream=True,
-        verbose=False,
+        batch_size=args.batch_size,
     )
 
-    for image_path, result in zip(images, results):
+    for image_path, result in results:
+        reported_inference_milliseconds += float(
+            getattr(result, "speed", {}).get("inference", 0.0)
+        )
         image = cv2.imread(str(image_path))
         if image is None:
             raise RuntimeError(f"Failed to read image: {image_path}")
@@ -539,6 +554,7 @@ def main() -> int:
         filtered_predictions_by_image[image_path.name] = predictions
         ground_truth_by_image[image_path.name] = ground_truth
         image_size_by_image[image_path.name] = (width, height)
+    inference_seconds = time.perf_counter() - inference_started
 
     tp = len(match_rows)
     fp = sum(
@@ -561,6 +577,7 @@ def main() -> int:
             "mean_matched_iou": sum(mean_ious) / len(mean_ious) if mean_ious else None,
         }
     )
+    elapsed = time.perf_counter() - evaluation_started
     summary = {
         "weights": str(args.weights),
         "data": str(args.data),
@@ -574,6 +591,20 @@ def main() -> int:
         "keypoints": summarize_keypoints(keypoint_rows, match_rows),
         "failure_categories": category_summary(failure_rows),
         "error_images_written": error_images_written,
+        "runtime": {
+            "total_seconds": elapsed,
+            "images_per_second": len(images) / max(elapsed, 1.0e-12),
+            "model_inference_seconds": (
+                reported_inference_milliseconds / 1000.0
+            ),
+            "model_inference_milliseconds_per_image": (
+                reported_inference_milliseconds / max(1, len(images))
+            ),
+            "inference_and_decode_seconds": inference_seconds,
+            "peak_vram_mib": None,
+            "batch_size": int(args.batch_size),
+            "input_size": int(args.imgsz),
+        },
     }
     (args.output_dir / f"{args.split}_metrics_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

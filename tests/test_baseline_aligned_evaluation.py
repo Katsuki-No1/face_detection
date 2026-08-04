@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -12,6 +15,10 @@ from src.evaluation.baseline_aligned import (
     _state_metrics,
 )
 from tools.evaluate_deim_query_baseline_aligned import _cuda_device_index
+from tools.evaluate_baseline_aligned_predictions import (
+    _head_coco,
+    _keypoint_comparison2,
+)
 
 
 def _row() -> dict:
@@ -69,3 +76,70 @@ def test_face_macro_f1_keeps_no_face_class_and_ignores_ambiguous() -> None:
     result = _face_metrics(rows)
     assert result["supervised_heads"] == 2
     assert result["macro_f1"] == pytest.approx(1.0)
+
+
+def test_head_coco_adapter_preserves_empty_image_inventory(tmp_path: Path) -> None:
+    annotations = tmp_path / "annotations.json"
+    annotations.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {"id": 1, "file_name": "one.jpg"},
+                    {"id": 2, "file_name": "two.jpg"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.json"
+    predictions.write_text(
+        json.dumps(
+            [
+                {
+                    "image_id": 1,
+                    "bbox": [10.0, 20.0, 30.0, 40.0],
+                    "score": 0.9,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    adapted = _head_coco(predictions, annotations)
+    assert adapted[1]["heads"] == [
+        {"bbox_xyxy": [10.0, 20.0, 40.0, 60.0], "score": 0.9}
+    ]
+    assert adapted[2] == {"heads": [], "faces": [], "poses": []}
+
+
+def test_keypoint_comparison2_adapter_exposes_face_ellipse_and_points(
+    tmp_path: Path,
+) -> None:
+    annotations = tmp_path / "annotations.json"
+    annotations.write_text(
+        json.dumps({"images": [{"id": 7, "file_name": "images/val/a.jpg"}]}),
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "file_name": "images/val/a.jpg",
+                "predictions": [
+                    {
+                        "bbox_xyxy": [1.0, 2.0, 3.0, 4.0],
+                        "score": 0.85,
+                        "ellipse": [2.0, 3.0, 1.0, 0.5, 0.0],
+                        "keypoints": [[2.0, 3.0]] * 5,
+                        "visibility": [0.9] * 5,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    adapted = _keypoint_comparison2(predictions, annotations)[7]
+    assert adapted["heads"] == []
+    assert adapted["faces"][0]["ellipse"] == [2.0, 3.0, 1.0, 0.5, 0.0]
+    assert adapted["poses"][0]["point_scores"] == [0.9] * 5
+    assert adapted["poses"][0]["state_probabilities"] is None

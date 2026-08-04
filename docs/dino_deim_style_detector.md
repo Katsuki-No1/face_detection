@@ -1,7 +1,98 @@
 # DINO-DEIM-Style Detector
 
-This is an experimental DINO-first bbox detector inspired by DEIMv2 and
-RT-DETR. It is not a complete DEIMv2 reproduction.
+This repository now has two separate DINO + DEIM-related detector paths:
+
+- `model.type: dinov3_deimv2`: official-style DEIMv2 path. It vendors the
+  upstream DEIMv2 decoder, matcher, criterion, postprocessor, denoising, and
+  deformable-attention/local-loss components under `src/third_party/deimv2/`.
+- `model.type: dino_deim_style`: legacy lightweight experimental path. This is
+  inspired by DEIMv2 / RT-DETR, but is not a complete DEIMv2 reproduction.
+
+Use `dinov3_deimv2` when evaluating whether DEIMv2 itself works on this data.
+Use `dino_deim_style` only for continuity with older local ablations.
+
+## Official-Style `dinov3_deimv2`
+
+```text
+image
+  -> DINOv3/ViT backbone
+  -> official DEIMv2-style STA
+  -> official HybridEncoder
+  -> official DEIMTransformer
+  -> official DEIMCriterion / PostProcessor
+```
+
+The official-style path supports several explicitly configured backbone modes.
+The pretrained DEIMv2-M mode uses the official distilled ViT-TinyPlus wrapper.
+The production DEIMv2-L mode uses the real DINOv3 ViT-S/16 backbone and fully
+fine-tunes it, matching the official L architecture rather than treating a
+separate frozen feature extractor as part of the parameter count. Targets are
+converted inside the model from pixel
+`xyxy` boxes and COCO category ids to normalized `cxcywh` boxes and contiguous
+0-based labels. For the default head/face config, `head=1 -> 0` and
+`face=2 -> 1`.
+
+The official-style path intentionally disables feature cache support because the
+STA consumes raw images through its spatial prior branch. It also exposes
+`set_epoch(epoch)` so the upstream matcher can switch matching cost according
+to `matcher_change_epoch`.
+
+Default configs:
+
+```text
+configs/dinov3_deimv2/dinov3_deimv2_s_face_head.yaml
+configs/dinov3_deimv2/dinov3_deimv2_s_face_head_debug.yaml
+configs/dinov3_deimv2/dinov3_deimv2_m_face_pretrained.yaml
+configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml
+configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v1_960_full.yaml
+```
+
+DEIMv2-L asset preparation, parameter verification, preflight, and production
+commands are documented in `docs/dinov3_deimv2_l_vits16.md`.
+
+`dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml` は、動画単位で分割済みの3,090フレーム版COCOを
+使用します。学習入口はモデル初期化前にtrain/val/testの元動画IDと実画像SHA-256を再監査し、
+split間重複または変換後の画像変更を検出した場合は学習を開始しません。
+
+```bash
+.venv/bin/python tools/train_dinov3_deimv2.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_m_face_pose_drive_v1_960_aug.yaml \
+  --output-dir outputs/experiments/dinov3_deimv2_m_face_pose_drive_v1_960_aug \
+  --device cuda:0
+```
+
+設定と実データをforwardまで確認し、本学習を開始しない場合は `--dry-run` を追加します。監査成功時の
+詳細はrun directoryの `data_leakage_audit.json` に保存されます。
+
+`dinov3_deimv2_m_face_pretrained.yaml` is the preferred config when using the
+official DEIMv2 DINOv3-M COCO checkpoint at
+`checkpoint/DEIMv2/deimv2_dinov3_m_coco.pth`. The checkpoint architecture is
+different from the local ViT-B/16 frozen-backbone config, so the weights are not
+enough by themselves; the matching DEIMv2-M-style backbone/encoder/decoder
+config is also required. COCO class heads are skipped and re-initialized for the
+repository's face-only target (`category_ids: [2]`, `num_classes: 1`).
+
+This face config intentionally differs from the COCO recipe in task-level
+settings: it uses one face class instead of 80 COCO classes, freezes the DINO
+backbone for the small local dataset, and keeps a higher 960px input size for
+small face boxes. The model structure still matches the DEIMv2-M checkpoint
+except for the re-initialized class heads.
+
+Smoke command:
+
+```bash
+.venv/bin/python scripts/train_dino.py \
+  --config configs/dinov3_deimv2/dinov3_deimv2_s_face_head_debug.yaml \
+  --dry-run \
+  --synthetic \
+  --device cpu
+```
+
+## Legacy `dino_deim_style`
+
+The sections below describe the legacy lightweight detector. Existing E1-E5
+results belong to this legacy path and should not be interpreted as official
+DEIMv2 performance.
 
 ## Model
 
@@ -28,10 +119,10 @@ but full self-attention over 960px multi-scale tokens is expensive.
 
 ## Purpose
 
-The purpose is to compare a stronger DINO-based detector against the existing
-DINO CenterFace-style head while keeping DINO as the main feature extractor.
-The first target is bbox detection for `head` and `face`. Keypoint refinement
-can stay in the existing RTMPose or downstream keypoint pipeline.
+The legacy path was built to compare a stronger DINO-based detector against the
+existing DINO CenterFace-style head while keeping DINO as the main feature
+extractor. It remains useful as a local baseline, but it is no longer the path
+to use for official DEIMv2 evaluation.
 
 ## E1-E5 Ablation Variants
 
@@ -62,9 +153,10 @@ DEIMv2 itself is ineffective.
 
 ## What This Is Not
 
-This implementation is still not a full DEIMv2 reproduction. It does not include
+The legacy implementation is not a full DEIMv2 reproduction. It does not include
 RT-DETR top-k proposal initialization, deformable attention, denoising queries,
-or the complete official DEIMv2 training recipe.
+or the complete official DEIMv2 training recipe. The official-style
+`dinov3_deimv2` path is the replacement for that purpose.
 
 ## Compared With Existing Models
 

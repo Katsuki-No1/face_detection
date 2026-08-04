@@ -1,0 +1,20 @@
+{
+  "name": "spreadsheet-summary-gas",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "pull": "clasp pull",
+    "push": "clasp push",
+    "status": "clasp show-file-status",
+    "open": "clasp open-script"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "private": true,
+  "devDependencies": {
+    "@google/clasp": "^3.3.0"
+  }
+}

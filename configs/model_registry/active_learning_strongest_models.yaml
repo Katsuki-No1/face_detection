@@ -1,0 +1,30 @@
+# Change only active_model (or pass --model-ref) when a stronger production
+# model becomes available. Every adapter must emit the common face + ellipse +
+# keypoint schema consumed by the active-learning selector.
+active_model: deimv2_l_query_refinement
+
+models:
+  deimv2_l_query_refinement:
+    adapter_class: src.active_learning.strongest_adapters:Deimv2QueryRefinementAdapter
+    capabilities: [face, ellipse, keypoints]
+    assets:
+      detector_config: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco/config_resolved.yaml
+      detector_checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco/checkpoints/best_val_ellipse_map.pt
+      threshold_selection_config: keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2.yaml
+      query_checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square/query_refinement/checkpoints/best_nme.pt
+    options:
+      detector_input_size: 960
+      detector_batch_size: 2
+      maximum_detections: 100
+      query_input_size: 256
+      query_batch_size: 32
+      crop_scale: 1.25
+    thresholds:
+      # Detector candidates are retained below the val-selected operating
+      # threshold so uncertainty sampling can inspect both sides of it.
+      inference_confidence_floor: 0.05
+      face_confidence: 0.33
+      keypoint_confidence: 0.50
+      selection_split: val
+      face_selection_rule: maximum recall while precision >= 0.90 at IoU 0.50
+      keypoint_score_contract: legacy COCO v>0 point-existence probability
