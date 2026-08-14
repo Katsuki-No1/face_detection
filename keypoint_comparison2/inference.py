@@ -189,7 +189,7 @@ class TopDownFaceKeypointPipeline:
 
 
 class JointFaceKeypointPipeline:
-    """Single-pass DEIMv2 face bbox + five landmark query inference."""
+    """Single-pass DEIMv2 Face geometry + five landmark query inference."""
 
     def __init__(
         self,
@@ -218,19 +218,44 @@ class JointFaceKeypointPipeline:
             enabled=self.device.type == "cuda",
         ):
             output = self.model(tensor.to(self.device))
+        face_geometry_type = str(
+            getattr(self.model, "face_output_geometry", "bbox")
+        ).lower()
+        if (
+            face_geometry_type == "ellipse"
+            and "pred_face_geometry" not in output
+        ):
+            raise RuntimeError(
+                "Ellipse-output DEIM Joint did not return pred_face_geometry"
+            )
         boxes = output["pred_boxes"][0].detach().cpu().float()
         keypoints = output["pred_keypoints"][0].detach().cpu().float()
         scores = output["scores"][0].detach().cpu().float()
         visibility = output["visibility"][0].detach().cpu().float()
+        presence = (
+            output["presence"][0].detach().cpu().float()
+            if "presence" in output
+            else None
+        )
+        state_probabilities = (
+            output["state_probabilities"][0].detach().cpu().float()
+            if "state_probabilities" in output
+            else None
+        )
         ellipse_values: torch.Tensor | None = None
         ellipse_boxes: torch.Tensor | None = None
-        if "pred_ellipses" in output:
+        raw_ellipses = output.get(
+            "pred_face_geometry"
+            if face_geometry_type == "ellipse"
+            else "pred_ellipses"
+        )
+        if raw_ellipses is not None:
             from src.models.dinov3_deimv2_ellipse import (
                 ellipse_to_aabb,
                 scale_ellipses_anisotropic,
             )
 
-            ellipse_values = output["pred_ellipses"][0].detach().cpu().float().clone()
+            ellipse_values = raw_ellipses[0].detach().cpu().float().clone()
             ellipse_values[:, :4] *= float(self.input_size)
             ellipse_values = scale_ellipses_anisotropic(
                 ellipse_values,
@@ -242,7 +267,7 @@ class JointFaceKeypointPipeline:
             ellipse_boxes[:, 1::2].clamp_(0, float(original_height))
         results = []
         for index, (box, points, score, point_visibility) in enumerate(
-            zip(boxes, keypoints, scores, visibility)
+            zip(boxes, keypoints, scores, visibility, strict=True)
         ):
             if float(score) < self.score_threshold:
                 continue
@@ -253,6 +278,12 @@ class JointFaceKeypointPipeline:
                 (cx + width / 2) * original_width,
                 (cy + height / 2) * original_height,
             ]
+            detector_bbox = bbox
+            if (
+                face_geometry_type == "ellipse"
+                and ellipse_boxes is not None
+            ):
+                bbox = ellipse_boxes[index].tolist()
             scaled_points = points * torch.tensor([original_width, original_height])
             result = {
                 "bbox_xyxy": bbox,
@@ -261,8 +292,15 @@ class JointFaceKeypointPipeline:
                 "visibility": point_visibility.tolist(),
                 "visible": (point_visibility >= self.visibility_threshold).tolist(),
             }
+            if presence is not None:
+                result["presence"] = presence[index].tolist()
+            if state_probabilities is not None:
+                result["state_probabilities"] = state_probabilities[index].tolist()
             if ellipse_values is not None and ellipse_boxes is not None:
                 result["ellipse"] = ellipse_values[index].tolist()
                 result["ellipse_bbox_xyxy"] = ellipse_boxes[index].tolist()
+            if face_geometry_type == "ellipse":
+                result["face_geometry_type"] = "ellipse"
+                result["detector_bbox_xyxy"] = detector_bbox
             results.append(result)
         return results

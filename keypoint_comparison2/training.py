@@ -115,6 +115,15 @@ def comparison_wandb_metric_row(
         / 60.0,
         "timing/elapsed_hours": elapsed / 3600.0,
     }
+    if "train_seconds" in row:
+        result["timing/train_seconds"] = float(row["train_seconds"])
+    if "validation_seconds" in row:
+        result["timing/validation_seconds"] = float(row["validation_seconds"])
+    conditional_metric = "conditional_semantic_macro_f1_nme_0.10"
+    if conditional_metric in row:
+        result[f"overview/{conditional_metric}"] = float(
+            row[conditional_metric]
+        )
     for key, value in row.items():
         if key.startswith(("loss_", "face_loss_")) and key != "loss_total":
             result[f"loss_components/train_{key.removeprefix('loss_')}"] = float(
@@ -509,6 +518,7 @@ def build_loaders(
             category_ids=data_cfg["category_ids"],
             target_category_id=int(data_cfg.get("target_category_id", data_cfg["category_ids"][0])),
             training=True,
+            head_annotation=data_cfg.get("head_annotations", {}).get("train"),
         )
         val_dataset = JointFaceDataset(
             annotation=data_cfg["annotations"]["val"],
@@ -517,6 +527,7 @@ def build_loaders(
             category_ids=data_cfg["category_ids"],
             target_category_id=int(data_cfg.get("target_category_id", data_cfg["category_ids"][0])),
             training=False,
+            head_annotation=data_cfg.get("head_annotations", {}).get("val"),
         )
         collate_fn = collate_joint
     else:
@@ -656,6 +667,16 @@ def _selection_metric(config: ComparisonConfig, model_name: str) -> str:
     selection = config.raw["train"].get("checkpoint_selection", {})
     key = "joint_metric" if model_name == "deimv2_joint" else "topdown_metric"
     return str(selection.get(key, "validation_loss" if model_name == "deimv2_joint" else "nme"))
+
+
+def _selection_direction(config: ComparisonConfig, model_name: str) -> str:
+    selection = config.raw["train"].get("checkpoint_selection", {})
+    key = "joint_direction" if model_name == "deimv2_joint" else "topdown_direction"
+    default = "minimize"
+    direction = str(selection.get(key, default))
+    if direction not in {"minimize", "maximize"}:
+        raise ValueError(f"Invalid checkpoint selection direction: {direction}")
+    return direction
 
 
 def best_checkpoint_path(config: ComparisonConfig, model_name: str) -> Path:
@@ -860,6 +881,16 @@ def validate(
     total_loss = 0.0
     batches = 0
     metrics = KeypointMetrics()
+    selection_cfg = dict(train_cfg.get("checkpoint_selection", {}) or {})
+    conditional_metric = "conditional_semantic_macro_f1_nme_0.10"
+    measure_conditional = (
+        model_name == "deimv2_joint"
+        and str(selection_cfg.get("joint_metric")) == conditional_metric
+    )
+    semantic_tp = torch.zeros(5, dtype=torch.int64)
+    semantic_fp = torch.zeros(5, dtype=torch.int64)
+    semantic_fn = torch.zeros(5, dtype=torch.int64)
+    eligible_faces = 0
     for batch in loader:
         loss_mode = (
             _joint_validation_loss_mode(model)
@@ -870,6 +901,76 @@ def validate(
             output = _forward_batch(model, model_name, batch, device)
         total_loss += float(output["loss_total"])
         batches += 1
+        if measure_conditional:
+            presence_logits = output.get("presence_logits")
+            matches = output.get("match_indices")
+            if presence_logits is None or matches is None:
+                raise RuntimeError(
+                    "Conditional Joint validation requires factorized presence "
+                    "logits and Face-to-GT assignments"
+                )
+            candidates = output["candidate_indices"]
+            face_scores = output["pred_logits"].sigmoid().amax(-1)
+            predicted_keypoints = output["pred_keypoints"]
+            predicted_presence = presence_logits.sigmoid()
+            images, targets = batch
+            input_side = float(max(images.shape[-2:]))
+            face_threshold = float(
+                selection_cfg.get("face_score_threshold", 0.33)
+            )
+            point_threshold = float(
+                selection_cfg.get("point_presence_threshold", 0.70)
+            )
+            nme_threshold = float(selection_cfg.get("nme_threshold", 0.10))
+            normalization_scale = float(
+                selection_cfg.get("head_normalization_scale", 1.20)
+            )
+            for batch_index, ((prediction_indices, target_indices), target) in enumerate(
+                zip(matches, targets)
+            ):
+                for prediction_index, target_index in zip(
+                    prediction_indices.tolist(), target_indices.tolist()
+                ):
+                    positions = torch.nonzero(
+                        candidates[batch_index] == int(prediction_index),
+                        as_tuple=False,
+                    )
+                    if positions.numel() == 0:
+                        continue
+                    position = int(positions[0, 0])
+                    if float(face_scores[batch_index, position]) < face_threshold:
+                        continue
+                    labeled = target["labeled"][int(target_index)].bool()
+                    if not bool(labeled.any()):
+                        continue
+                    head_box = target["head_boxes"][int(target_index)].float()
+                    if not bool(torch.isfinite(head_box).all()):
+                        continue
+                    head_side = normalization_scale * float(
+                        torch.maximum(
+                            head_box[2] - head_box[0],
+                            head_box[3] - head_box[1],
+                        )
+                    )
+                    if head_side <= 0.0:
+                        continue
+                    eligible_faces += 1
+                    target_keypoints = target["keypoints"][int(target_index)].to(
+                        predicted_keypoints.device
+                    )
+                    error = torch.linalg.vector_norm(
+                        predicted_keypoints[batch_index, position]
+                        - target_keypoints,
+                        dim=-1,
+                    ) / (head_side / input_side)
+                    predicted = (
+                        predicted_presence[batch_index, position]
+                        >= point_threshold
+                    ).cpu()
+                    correct = predicted & labeled & (error.cpu() <= nme_threshold)
+                    semantic_tp += correct.to(torch.int64)
+                    semantic_fp += (predicted & ~correct).to(torch.int64)
+                    semantic_fn += (labeled & ~correct).to(torch.int64)
         if model_name != "deimv2_joint":
             metrics.update(
                 output["coordinates"],
@@ -879,6 +980,22 @@ def validate(
                 visibility_target=batch["visible"],
             )
     result = {"validation_loss": total_loss / max(1, batches)}
+    if measure_conditional:
+        denominator = 2 * semantic_tp + semantic_fp + semantic_fn
+        semantic_f1 = torch.where(
+            denominator > 0,
+            2.0 * semantic_tp.float() / denominator.float(),
+            torch.zeros_like(denominator, dtype=torch.float32),
+        )
+        result.update(
+            {
+                conditional_metric: float(semantic_f1.mean()),
+                "conditional_eligible_faces": float(eligible_faces),
+                "conditional_semantic_tp": float(semantic_tp.sum()),
+                "conditional_semantic_fp": float(semantic_fp.sum()),
+                "conditional_semantic_fn": float(semantic_fn.sum()),
+            }
+        )
     if model_name != "deimv2_joint":
         result.update(metrics.compute())
     return result
@@ -1044,8 +1161,10 @@ def train_model(
     model_cfg = config.raw["models"][model_name]
     accumulation = int(model_cfg["gradient_accumulation_steps"])
     selection_metric = _selection_metric(config, model_name)
+    selection_direction = _selection_direction(config, model_name)
     best_checkpoint = best_checkpoint_path(config, model_name)
-    start_epoch, best = 0, float("inf")
+    start_epoch = 0
+    best = float("-inf") if selection_direction == "maximize" else float("inf")
     if resume and last_checkpoint.is_file():
         state = torch.load(last_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(state["model"], strict=True)
@@ -1054,7 +1173,17 @@ def train_model(
         scheduler.load_state_dict(state["scheduler"])
         scaler.load_state_dict(state["scaler"])
         start_epoch = int(state["epoch"]) + 1
-        best = float(state.get("best_metric", state.get("best_validation_loss", float("inf"))))
+        best = float(
+            state.get(
+                "best_metric",
+                state.get(
+                    "best_validation_loss",
+                    float("-inf")
+                    if selection_direction == "maximize"
+                    else float("inf"),
+                ),
+            )
+        )
     patience = 0
     completed_epoch = start_epoch - 1
     stopped_early = False
@@ -1068,6 +1197,7 @@ def train_model(
     training_started = time.monotonic()
     for epoch in range(start_epoch, epochs):
         completed_epoch = epoch
+        epoch_train_started = time.monotonic()
         if hasattr(model, "face_detector") and hasattr(model.face_detector, "set_epoch"):
             model.face_detector.set_epoch(epoch)
         model.train()
@@ -1099,8 +1229,11 @@ def train_model(
                     if isinstance(value, torch.Tensor) and value.ndim == 0:
                         running[key] += float(value.detach())
         scheduler.step()
+        train_seconds = time.monotonic() - epoch_train_started
+        validation_started = time.monotonic()
         with ema.apply(model):
             validation = validate(model, model_name, val_loader, device=device, train_cfg=train_cfg)
+        validation_seconds = time.monotonic() - validation_started
         row: dict[str, Any] = {
             "epoch": epoch + 1,
             "updates": updates,
@@ -1112,6 +1245,8 @@ def train_model(
             "backbone_frozen": backbone_frozen,
             "elapsed_seconds": elapsed_before_start
             + (time.monotonic() - training_started),
+            "train_seconds": train_seconds,
+            "validation_seconds": validation_seconds,
             **{key: value / max(1, len(train_loader)) for key, value in running.items()},
             **validation,
         }
@@ -1130,12 +1265,19 @@ def train_model(
         selected_value = float(validation[selection_metric])
         if not math.isfinite(selected_value):
             raise RuntimeError(f"Checkpoint selection metric is not finite: {selection_metric}={selected_value}")
-        improved = selected_value < best - float(early_cfg.get("min_delta", 0.0001))
+        min_delta = float(early_cfg.get("min_delta", 0.0001))
+        improved = (
+            selected_value > best + min_delta
+            if selection_direction == "maximize"
+            else selected_value < best - min_delta
+        )
         if improved:
             best = selected_value
             patience = 0
-        else:
+        elif epoch + 1 >= int(early_cfg.get("minimum_epoch", 100)):
             patience += 1
+        else:
+            patience = 0
         _save_checkpoint(
             last_checkpoint,
             model=model,

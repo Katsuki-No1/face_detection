@@ -45,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-partial-inventory", action="store_true")
     parser.add_argument("--validation-face-threshold", type=float)
     parser.add_argument("--validation-point-threshold", type=float)
+    parser.add_argument(
+        "--face-score-candidate-floor",
+        type=float,
+        help=(
+            "Lowest FACE score retained in the prediction artifact. Val "
+            "threshold selection must not search below this floor."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -89,10 +97,18 @@ def _cooperative(
 ) -> dict[int, dict[str, Any]]:
     exact, basename = _image_lookup(annotation_path)
     output: dict[int, dict[str, Any]] = {}
-    face_key, pose_key = f"{stage}_face", f"{stage}_pose"
+    if stage == "causal":
+        face_key, pose_key = "independent_face", "refined_pose"
+    else:
+        face_key, pose_key = f"{stage}_face", f"{stage}_pose"
     for row in _jsonl(path):
         image_id = _resolve_image_id(str(row["file_name"]), exact, basename)
         decoded = row["predictions"]
+        if face_key not in decoded or pose_key not in decoded:
+            raise KeyError(
+                f"Cooperative prediction lacks {face_key}/{pose_key} for "
+                f"comparison stage {stage!r}"
+            )
         face = decoded.get(face_key, {})
         pose = decoded.get(pose_key, {})
         faces = [
@@ -226,8 +242,17 @@ def _keypoint_comparison2(
                     "bbox_xyxy": prediction["bbox_xyxy"],
                     "score": float(prediction["score"]),
                     "keypoints": prediction["keypoints"],
-                    "point_scores": prediction["visibility"],
-                    "state_probabilities": None,
+                    # Legacy DEIM joint had only a visibility output, so its
+                    # historical artifacts retain the old fallback.  The
+                    # factorized variant must use presence for point gating;
+                    # using visibility would turn correctly occluded points
+                    # into false missing predictions.
+                    "point_scores": prediction.get(
+                        "presence", prediction["visibility"]
+                    ),
+                    "state_probabilities": prediction.get(
+                        "state_probabilities"
+                    ),
                 }
             )
         output[image_id] = {"heads": [], "faces": faces, "poses": poses}
@@ -255,10 +280,16 @@ def main() -> int:
     if args.source_metrics and args.source_metrics.is_file():
         source = json.loads(args.source_metrics.read_text(encoding="utf-8"))
         runtime = source.get("runtime")
+    evaluator_path = REPO_ROOT / "src/evaluation/baseline_aligned.py"
+    adapter_path = Path(__file__).resolve()
     provenance: dict[str, Any] = {
         "prediction_format": args.format,
         "prediction_path": str(args.predictions),
         "prediction_sha256": sha256_file(args.predictions),
+        "evaluator_path": str(evaluator_path),
+        "evaluator_sha256": sha256_file(evaluator_path),
+        "adapter_path": str(adapter_path),
+        "adapter_sha256": sha256_file(adapter_path),
         "seed": args.seed,
     }
     for name in ("config", "checkpoint"):
@@ -280,6 +311,7 @@ def main() -> int:
         allow_partial_inventory=args.allow_partial_inventory,
         validation_selected_face_threshold=args.validation_face_threshold,
         validation_selected_point_threshold=args.validation_point_threshold,
+        face_score_candidate_floor=args.face_score_candidate_floor,
     )
     print(
         json.dumps(

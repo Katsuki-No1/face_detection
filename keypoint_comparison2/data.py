@@ -528,6 +528,7 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         category_ids: Sequence[int] = (1,),
         target_category_id: int | None = None,
         training: bool = False,
+        head_annotation: str | Path | None = None,
     ) -> None:
         data = json.loads(Path(annotation).read_text(encoding="utf-8"))
         self.image_root = Path(image_root)
@@ -535,17 +536,72 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         allowed = {int(value) for value in category_ids}
         self.target_category_id = int(target_category_id) if target_category_id is not None else None
         self.training = bool(training)
+        head_rows_by_file: dict[str, list[dict[str, Any]]] = {}
+        if head_annotation is not None:
+            head_data = json.loads(
+                Path(head_annotation).read_text(encoding="utf-8")
+            )
+            head_images = {
+                int(row["id"]): str(row["file_name"])
+                for row in head_data.get("images", [])
+            }
+            for row in head_data.get("annotations", []):
+                ellipse = row.get("ellipse")
+                if (
+                    not bool(row.get("attribute_valid", True))
+                    or not isinstance(ellipse, (list, tuple))
+                    or len(ellipse) != 5
+                ):
+                    continue
+                file_name = head_images.get(int(row["image_id"]))
+                if file_name is not None:
+                    head_rows_by_file.setdefault(file_name, []).append(row)
         grouped: dict[int, list[dict[str, Any]]] = {}
         for row in data.get("annotations", []):
             if int(row.get("category_id", -1)) in allowed:
                 grouped.setdefault(int(row["image_id"]), []).append(row)
         self.images = []
         for image in data.get("images", []):
+            file_name = str(image["file_name"])
+            annotations = []
+            for original in grouped.get(int(image["id"]), []):
+                row = dict(original)
+                face_ellipse = row.get("ellipse")
+                candidates = head_rows_by_file.get(file_name, [])
+                matched_head = None
+                if (
+                    candidates
+                    and isinstance(face_ellipse, (list, tuple))
+                    and len(face_ellipse) == 5
+                ):
+                    matched_head = min(
+                        candidates,
+                        key=lambda candidate: math.hypot(
+                            float(candidate["ellipse"][0])
+                            - float(face_ellipse[0]),
+                            float(candidate["ellipse"][1])
+                            - float(face_ellipse[1]),
+                        ),
+                    )
+                    center_distance = math.hypot(
+                        float(matched_head["ellipse"][0])
+                        - float(face_ellipse[0]),
+                        float(matched_head["ellipse"][1])
+                        - float(face_ellipse[1]),
+                    )
+                    if center_distance > 1.0e-3:
+                        matched_head = None
+                row["_head_bbox_xyxy"] = (
+                    _xywh_to_xyxy(matched_head["bbox"])
+                    if matched_head is not None
+                    else np.full((4,), np.nan, dtype=np.float32)
+                )
+                annotations.append(row)
             self.images.append(
                 (
                     image,
-                    _resolve_image(self.image_root, str(image["file_name"])),
-                    grouped.get(int(image["id"]), []),
+                    _resolve_image(self.image_root, file_name),
+                    annotations,
                 )
             )
         if not self.images:
@@ -561,9 +617,10 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
         image = image.resize((self.image_size, self.image_size), Image.Resampling.BILINEAR)
         scale_x = self.image_size / original_width
         scale_y = self.image_size / original_height
-        boxes, ellipses, labels, keypoints, labeled, visible = [], [], [], [], [], []
+        boxes, head_boxes, ellipses, labels, keypoints, labeled, visible = [], [], [], [], [], [], []
         for row in annotations:
             box = _xywh_to_xyxy(row["bbox"])
+            head_box = np.asarray(row["_head_bbox_xyxy"], dtype=np.float32).copy()
             raw_ellipse = row.get("ellipse")
             if isinstance(raw_ellipse, (list, tuple)) and len(raw_ellipse) == 5:
                 ellipse = _scale_ellipse(raw_ellipse, scale_x, scale_y)
@@ -583,10 +640,13 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
                 )
             box[0::2] *= scale_x
             box[1::2] *= scale_y
+            head_box[0::2] *= scale_x
+            head_box[1::2] *= scale_y
             points, point_labeled, point_visible = _keypoints(row.get("keypoints", ()))
             points[:, 0] *= scale_x / self.image_size
             points[:, 1] *= scale_y / self.image_size
             boxes.append(box)
+            head_boxes.append(head_box)
             ellipses.append(ellipse)
             labels.append(self.target_category_id if self.target_category_id is not None else int(row["category_id"]))
             keypoints.append(points)
@@ -600,6 +660,13 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
                 for box in boxes:
                     old_x1, old_x2 = float(box[0]), float(box[2])
                     box[0], box[2] = self.image_size - old_x2, self.image_size - old_x1
+                for head_box in head_boxes:
+                    if np.isfinite(head_box).all():
+                        old_x1, old_x2 = float(head_box[0]), float(head_box[2])
+                        head_box[0], head_box[2] = (
+                            self.image_size - old_x2,
+                            self.image_size - old_x1,
+                        )
                 ellipses = [
                     _flip_ellipse(ellipse, float(self.image_size))
                     for ellipse in ellipses
@@ -612,6 +679,9 @@ class JointFaceDataset(Dataset[tuple[torch.Tensor, dict[str, torch.Tensor]]]):
                 visible = [values[FLIP_INDEX] for values in visible]
         target = {
             "boxes": torch.tensor(np.asarray(boxes), dtype=torch.float32).reshape(-1, 4),
+            "head_boxes": torch.tensor(
+                np.asarray(head_boxes), dtype=torch.float32
+            ).reshape(-1, 4),
             "ellipses": torch.tensor(np.asarray(ellipses), dtype=torch.float32).reshape(-1, 5),
             "labels": torch.tensor(labels, dtype=torch.long),
             "keypoints": torch.tensor(np.asarray(keypoints), dtype=torch.float32).reshape(-1, 5, 2),

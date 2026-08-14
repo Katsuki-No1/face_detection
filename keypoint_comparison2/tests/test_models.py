@@ -10,6 +10,7 @@ from PIL import Image
 
 from keypoint_comparison2.config import load_config
 from keypoint_comparison2.data import CropAugmentation, FaceCropDataset, JointFaceDataset
+from keypoint_comparison2.inference import JointFaceKeypointPipeline
 from keypoint_comparison2.models.dinov3 import DinoV3FPNRTMCC, DinoV3ORFormerRTMCC
 from keypoint_comparison2.models.joint_deim import (
     DEIMv2JointFaceLandmarks,
@@ -27,6 +28,7 @@ from keypoint_comparison2.training import (
 from src.models.dino_backbone import DummyDinoBackbone
 from src.models.dinov3_deimv2.official import SpatialPriorModuleV2
 from keypoint_comparison1.landmark_detection.heads import FACTORIZED_STATE_HEAD
+from tools.evaluate_baseline_aligned_predictions import _keypoint_comparison2
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -471,6 +473,7 @@ def test_deim_joint_routes_global_queries_through_ellipse_local_refinement() -> 
             "landmark_decoder_layers": 2,
             "heads": 4,
             "feedforward": 64,
+            "face_output_geometry": "ellipse",
             "state_head_mode": FACTORIZED_STATE_HEAD,
             "ellipse_local_refinement": {
                 "enabled": True,
@@ -485,6 +488,12 @@ def test_deim_joint_routes_global_queries_through_ellipse_local_refinement() -> 
         detector=DummyDetector(),
     )
     output = model(torch.rand(2, 3, 64, 64))
+    assert output["face_geometry_type"] == "ellipse"
+    assert output["pred_ellipses"].shape == (2, 3, 5)
+    torch.testing.assert_close(
+        output["pred_face_geometry"], output["pred_ellipses"]
+    )
+    assert output["pred_detector_boxes"].shape == (2, 3, 4)
     assert output["pred_keypoints"].shape == (2, 3, 5, 2)
     assert output["global_coarse_keypoints"].shape == (2, 3, 5, 2)
     assert output["local_base_keypoints"].shape == (2, 3, 5, 2)
@@ -500,6 +509,53 @@ def test_deim_joint_routes_global_queries_through_ellipse_local_refinement() -> 
     assert model.landmark_decoder.landmark_queries.grad is not None
     with pytest.raises(RuntimeError, match="requires a square input"):
         model(torch.rand(1, 3, 64, 80))
+
+
+def test_joint_ellipse_pipeline_publishes_ellipse_as_primary_geometry() -> None:
+    class EllipseJoint(torch.nn.Module):
+        face_output_geometry = "ellipse"
+
+        def forward(self, images):
+            batch = images.shape[0]
+            return {
+                "pred_boxes": images.new_tensor(
+                    [[[0.50, 0.50, 0.80, 0.80]]]
+                ).expand(batch, -1, -1),
+                "pred_ellipses": images.new_tensor(
+                    [[[0.50, 0.50, 0.20, 0.10, 0.0]]]
+                ).expand(batch, -1, -1),
+                "pred_face_geometry": images.new_tensor(
+                    [[[0.50, 0.50, 0.20, 0.10, 0.0]]]
+                ).expand(batch, -1, -1),
+                "pred_keypoints": images.new_tensor(
+                    [[[[0.4, 0.4]] * 5]]
+                ).expand(batch, -1, -1, -1),
+                "scores": images.new_tensor([[0.9]]).expand(batch, -1),
+                "visibility": images.new_ones((batch, 1, 5)),
+            }
+
+    pipeline = JointFaceKeypointPipeline(
+        EllipseJoint(),
+        input_size=100,
+        device=torch.device("cpu"),
+    )
+    predictions = pipeline(Image.new("RGB", (200, 100)))
+
+    assert len(predictions) == 1
+    prediction = predictions[0]
+    assert prediction["face_geometry_type"] == "ellipse"
+    assert prediction["ellipse"] == pytest.approx(
+        [100.0, 50.0, 40.0, 10.0, 0.0]
+    )
+    assert prediction["bbox_xyxy"] == pytest.approx(
+        prediction["ellipse_bbox_xyxy"]
+    )
+    assert prediction["bbox_xyxy"] == pytest.approx(
+        [60.0, 40.0, 140.0, 60.0]
+    )
+    assert prediction["detector_bbox_xyxy"] == pytest.approx(
+        [20.0, 10.0, 180.0, 90.0]
+    )
 
 
 def test_deim_joint_presence_loss_separates_missing_from_present() -> None:
@@ -536,6 +592,45 @@ def test_deim_joint_presence_loss_separates_missing_from_present() -> None:
     assert visibility_logits.grad is not None
     assert visibility_logits.grad[0, 0, 0] == 0  # missing is masked here
     assert visibility_logits.grad[0, 0, 1] > 0  # occluded: lower visibility only
+
+
+def test_baseline_adapter_uses_presence_instead_of_visibility(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "annotations.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {"id": 1, "file_name": "image.jpg", "width": 100, "height": 100}
+                ],
+                "annotations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    predictions_path = tmp_path / "predictions.jsonl"
+    predictions_path.write_text(
+        json.dumps(
+            {
+                "file_name": "image.jpg",
+                "predictions": [
+                    {
+                        "bbox_xyxy": [10.0, 10.0, 90.0, 90.0],
+                        "score": 0.9,
+                        "keypoints": [[20.0, 20.0]] * 5,
+                        "presence": [0.9, 0.8, 0.7, 0.6, 0.5],
+                        "visibility": [0.1, 0.9, 0.2, 0.8, 0.3],
+                        "state_probabilities": [[0.1, 0.8, 0.1]] * 5,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    adapted = _keypoint_comparison2(predictions_path, annotation_path)
+    pose = adapted[1]["poses"][0]
+    assert pose["point_scores"] == [0.9, 0.8, 0.7, 0.6, 0.5]
+    assert pose["state_probabilities"] == [[0.1, 0.8, 0.1]] * 5
 
 
 def test_face106_semantic_transfer() -> None:

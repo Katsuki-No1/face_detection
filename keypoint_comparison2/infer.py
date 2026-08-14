@@ -69,7 +69,33 @@ def _draw(image: Image.Image, predictions: list[dict]) -> Image.Image:
     result = image.copy()
     draw = ImageDraw.Draw(result)
     for prediction in predictions:
-        draw.rectangle(prediction["bbox_xyxy"], outline=(0, 255, 80), width=3)
+        ellipse = prediction.get("ellipse")
+        if (
+            prediction.get("face_geometry_type") == "ellipse"
+            and isinstance(ellipse, list)
+            and len(ellipse) == 5
+        ):
+            center_x, center_y, major, minor, theta = (
+                float(value) for value in ellipse
+            )
+            angles = np.linspace(0.0, 2.0 * np.pi, 73)
+            cosine, sine = np.cos(theta), np.sin(theta)
+            local_x = major * np.cos(angles)
+            local_y = minor * np.sin(angles)
+            contour = [
+                (
+                    center_x + cosine * x - sine * y,
+                    center_y + sine * x + cosine * y,
+                )
+                for x, y in zip(local_x, local_y, strict=True)
+            ]
+            draw.line(contour, fill=(0, 255, 80), width=3)
+        else:
+            draw.rectangle(
+                prediction["bbox_xyxy"],
+                outline=(0, 255, 80),
+                width=3,
+            )
         draw.text(
             (prediction["bbox_xyxy"][0], prediction["bbox_xyxy"][1]),
             f"{prediction['score']:.3f}",

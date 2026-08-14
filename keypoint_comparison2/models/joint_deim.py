@@ -115,12 +115,34 @@ class LandmarkQueryDecoder(nn.Module):
         top_left = center - 0.5 * size
         return (top_left + local * size).clamp(0.0, 1.0)
 
+    @staticmethod
+    def _inside_ellipses(
+        local: torch.Tensor,
+        ellipses: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map local landmark coordinates through the predicted Face ellipse."""
+
+        centered = local.mul(2.0).sub(1.0)
+        major = ellipses[..., 2].clamp_min(1.0e-5).unsqueeze(-1)
+        minor = ellipses[..., 3].clamp_min(1.0e-5).unsqueeze(-1)
+        local_x = centered[..., 0] * major
+        local_y = centered[..., 1] * minor
+        theta = ellipses[..., 4].unsqueeze(-1)
+        cosine = torch.cos(theta)
+        sine = torch.sin(theta)
+        x = cosine * local_x - sine * local_y
+        y = sine * local_x + cosine * local_y
+        return (
+            ellipses[..., None, :2] + torch.stack((x, y), dim=-1)
+        ).clamp(0.0, 1.0)
+
     def forward(
         self,
         face_queries: torch.Tensor,
         face_boxes: torch.Tensor,
         memory: torch.Tensor,
         *,
+        face_ellipses: torch.Tensor | None = None,
         return_query_features: bool = False,
     ) -> tuple[
         torch.Tensor,
@@ -145,7 +167,11 @@ class LandmarkQueryDecoder(nn.Module):
             query = layer(query, memory, tgt_mask=mask)
             normalized = self.norm(query).reshape(batch, faces, 5, dimension)
             local = self.coordinate_head(normalized).sigmoid()
-            auxiliary.append(self._inside_boxes(local, face_boxes))
+            auxiliary.append(
+                self._inside_ellipses(local, face_ellipses)
+                if face_ellipses is not None
+                else self._inside_boxes(local, face_boxes)
+            )
             if self.presence_head is not None:
                 presence = self.presence_head(normalized).squeeze(-1)
             visibility = self.visibility_head(normalized).squeeze(-1)
@@ -492,7 +518,7 @@ class EllipseConditionedLocalRefinement(nn.Module):
 
 
 class DEIMv2JointFaceLandmarks(nn.Module):
-    """DEIMv2 face queries with five child landmark queries per selected face."""
+    """DEIMv2 Face geometry with five child landmark queries per selected face."""
 
     def __init__(
         self,
@@ -517,6 +543,13 @@ class DEIMv2JointFaceLandmarks(nn.Module):
                     f"DEIMv2-L detector checkpoint mismatch: missing={missing}, unexpected={unexpected}"
                 )
         self.face_detector = detector
+        self.face_output_geometry = str(
+            cfg.get("face_output_geometry", "bbox")
+        ).lower()
+        if self.face_output_geometry not in {"bbox", "ellipse"}:
+            raise ValueError(
+                "face_output_geometry must be either 'bbox' or 'ellipse'"
+            )
         dimension = int(cfg.get("dimension", getattr(self.face_detector.decoder, "hidden_dim", 224)))
         self.maximum_face_queries = int(cfg.get("maximum_face_queries", 100))
         state_head_mode = str(
@@ -535,6 +568,11 @@ class DEIMv2JointFaceLandmarks(nn.Module):
             EllipseConditionedLocalRefinement | None
         ) = None
         if bool(local_cfg.get("enabled", False)):
+            if self.face_output_geometry != "ellipse":
+                raise ValueError(
+                    "ellipse_local_refinement requires "
+                    "face_output_geometry='ellipse'"
+                )
             high_resolution_channels = int(
                 local_cfg.get(
                     "high_resolution_channels",
@@ -736,6 +774,20 @@ class DEIMv2JointFaceLandmarks(nn.Module):
         selected_queries = _gather(face_queries, candidates)
         selected_boxes = _gather(raw["pred_boxes"], candidates)
         selected_logits = _gather(raw["pred_logits"], candidates)
+        if self.face_output_geometry == "ellipse" and "pred_ellipses" not in raw:
+            raise RuntimeError(
+                "The new DEIM Joint requires pred_ellipses from its Face decoder"
+            )
+        selected_ellipses = (
+            _gather(raw["pred_ellipses"], candidates)
+            if "pred_ellipses" in raw
+            else None
+        )
+        landmark_ellipses = (
+            selected_ellipses
+            if self.face_output_geometry == "ellipse"
+            else None
+        )
         if self.ellipse_local_refinement is not None:
             (
                 keypoints,
@@ -747,6 +799,7 @@ class DEIMv2JointFaceLandmarks(nn.Module):
                 selected_queries,
                 selected_boxes,
                 self._memory(encoded),
+                face_ellipses=landmark_ellipses,
                 return_query_features=True,
             )
         else:
@@ -759,12 +812,8 @@ class DEIMv2JointFaceLandmarks(nn.Module):
                 selected_queries,
                 selected_boxes,
                 self._memory(encoded),
+                face_ellipses=landmark_ellipses,
             )
-        selected_ellipses = (
-            _gather(raw["pred_ellipses"], candidates)
-            if "pred_ellipses" in raw
-            else None
-        )
         local_output: dict[str, Any] | None = None
         if self.ellipse_local_refinement is not None:
             if selected_ellipses is None:
@@ -803,6 +852,13 @@ class DEIMv2JointFaceLandmarks(nn.Module):
             "auxiliary_keypoints": auxiliary,
             "raw_detector_output": raw,
         }
+        if self.face_output_geometry == "ellipse":
+            assert selected_ellipses is not None
+            output["face_geometry_type"] = "ellipse"
+            output["pred_face_geometry"] = selected_ellipses
+            output["pred_detector_boxes"] = selected_boxes
+        if matches is not None:
+            output["match_indices"] = matches
         if presence_logits is not None:
             output["presence_logits"] = presence_logits
         if selected_ellipses is not None:

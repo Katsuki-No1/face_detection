@@ -13,7 +13,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from keypoint_comparison2.config import MODEL_NAMES, load_config  # noqa: E402
+from keypoint_comparison2.config import (  # noqa: E402
+    MODEL_NAMES,
+    load_config,
+    resolved_config_sha256,
+)
 from keypoint_comparison2.evaluation import evaluate_model  # noqa: E402
 from keypoint_comparison2.preflight import run_preflight  # noqa: E402
 from keypoint_comparison2.training import train_model  # noqa: E402
@@ -37,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--batch-plan", type=Path)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--num-workers", type=int)
     parser.add_argument("--epochs", type=int)
     parser.add_argument(
         "--freeze-backbone-epochs",
@@ -62,6 +70,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config, project_root=REPO_ROOT)
+    original_config_sha256 = resolved_config_sha256(config.raw)
     if args.output_root is not None:
         config.raw["output"]["root"] = str(args.output_root.resolve())
     if args.epochs is not None:
@@ -69,6 +78,59 @@ def main() -> int:
             raise ValueError("--epochs must be positive")
         config.raw["train"]["epochs"] = int(args.epochs)
         config.raw["train"]["early_stopping"]["enabled"] = False
+    if (args.batch_size is None) != (args.gradient_accumulation_steps is None):
+        raise ValueError(
+            "--batch-size and --gradient-accumulation-steps must be provided together"
+        )
+    if args.batch_plan is not None:
+        plan_path = args.batch_plan.expanduser().resolve()
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        if plan.get("status") != "passed":
+            raise RuntimeError("Batch plan has not passed")
+        if plan.get("resolved_config_sha256") != original_config_sha256:
+            raise RuntimeError(
+                "Batch plan was produced for a different resolved config"
+            )
+        selected = dict(plan["selected"])
+        batch_size = int(selected["microbatch"])
+        accumulation = int(selected["accumulation_steps"])
+        fallback_plans = [
+            {
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": accumulation,
+            },
+            *[
+                {
+                    "batch_size": int(value["microbatch"]),
+                    "gradient_accumulation_steps": int(
+                        value["accumulation_steps"]
+                    ),
+                }
+                for value in plan.get("fallback_plans", [])
+            ],
+        ]
+        joint = config.raw["models"]["deimv2_joint"]
+        joint["batch_size"] = batch_size
+        joint["gradient_accumulation_steps"] = accumulation
+        joint["batch_size_fallback"] = {
+            "enabled": True,
+            "candidates": fallback_plans,
+        }
+        config.raw["train"]["resolved_batch_plan"] = plan
+        config.raw["train"]["resolved_batch_plan_path"] = str(plan_path)
+    if args.batch_size is not None:
+        if args.batch_size < 1 or args.gradient_accumulation_steps < 1:
+            raise ValueError("Batch size and accumulation must be positive")
+        joint = config.raw["models"]["deimv2_joint"]
+        joint["batch_size"] = int(args.batch_size)
+        joint["gradient_accumulation_steps"] = int(
+            args.gradient_accumulation_steps
+        )
+        joint["batch_size_fallback"] = {"enabled": False}
+    if args.num_workers is not None:
+        if args.num_workers < 0:
+            raise ValueError("--num-workers must be non-negative")
+        config.raw["train"]["num_workers"] = int(args.num_workers)
     if args.freeze_backbone_epochs is not None:
         if args.freeze_backbone_epochs < 0:
             raise ValueError("--freeze-backbone-epochs must be non-negative")

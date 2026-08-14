@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -57,12 +59,57 @@ _PATH_KEYS = {
     "initialize_from_deim_checkpoint",
     "ellipse_error_model",
     "error_model",
+    "face_threshold_source",
 }
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _load_yaml_with_extends(path: Path, *, seen: tuple[Path, ...] = ()) -> dict[str, Any]:
+    resolved = path.expanduser().resolve()
+    if resolved in seen:
+        chain = " -> ".join(str(item) for item in (*seen, resolved))
+        raise ComparisonConfigError(f"Config inheritance cycle: {chain}")
+    with resolved.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    if not isinstance(raw, dict):
+        raise ComparisonConfigError(f"Config must contain a mapping: {resolved}")
+    parent_value = raw.pop("extends", None)
+    if parent_value is None:
+        return raw
+    parent = Path(str(parent_value)).expanduser()
+    if not parent.is_absolute():
+        parent = resolved.parent / parent
+    return _deep_merge(
+        _load_yaml_with_extends(parent, seen=(*seen, resolved)),
+        raw,
+    )
+
+
+def resolved_config_sha256(config: dict[str, Any]) -> str:
+    payload = json.dumps(
+        config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _resolve_paths(value: Any, root: Path, key: str | None = None) -> Any:
     if isinstance(value, dict):
-        if key in {"annotations", "paths"}:
+        if key in {"annotations", "head_annotations", "paths"}:
             return {name: _resolve_paths(item, root, "annotation") for name, item in value.items()}
         return {name: _resolve_paths(item, root, name) for name, item in value.items()}
     if isinstance(value, list):
@@ -75,10 +122,7 @@ def _resolve_paths(value: Any, root: Path, key: str | None = None) -> Any:
 
 def load_config(path: str | Path, *, project_root: str | Path | None = None) -> ComparisonConfig:
     config_path = Path(path).expanduser().resolve()
-    with config_path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-    if not isinstance(raw, dict):
-        raise ComparisonConfigError(f"Config must contain a mapping: {config_path}")
+    raw = _load_yaml_with_extends(config_path)
     root = Path(project_root).expanduser().resolve() if project_root else config_path.parents[2]
     resolved = _resolve_paths(deepcopy(raw), root)
     validate_config(resolved)
@@ -110,12 +154,28 @@ def validate_config(config: dict[str, Any]) -> None:
                 f"{name} batch_size and gradient_accumulation_steps must be positive"
             )
     joint = models["deimv2_joint"]
+    face_output_geometry = str(
+        joint.get("face_output_geometry", "bbox")
+    ).lower()
+    if face_output_geometry not in {"bbox", "ellipse"}:
+        raise ComparisonConfigError(
+            "deimv2_joint.face_output_geometry must be bbox or ellipse"
+        )
     local_refinement = joint.get("ellipse_local_refinement", {})
     if not isinstance(local_refinement, dict):
         raise ComparisonConfigError(
             "deimv2_joint.ellipse_local_refinement must be a mapping"
         )
     if bool(local_refinement.get("enabled", False)):
+        if face_output_geometry != "ellipse":
+            raise ComparisonConfigError(
+                "Ellipse-local DEIMv2 Joint requires "
+                "face_output_geometry: ellipse"
+            )
+        if str(config.get("detector", {}).get("crop_geometry")) != "ellipse":
+            raise ComparisonConfigError(
+                "Ellipse-output DEIMv2 Joint requires an ellipse Face detector"
+            )
         if int(local_refinement.get("roi_size", 0)) < 2:
             raise ComparisonConfigError(
                 "DEIMv2 Joint ellipse ROI size must be at least two"
@@ -140,6 +200,37 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ComparisonConfigError(
                     "Invalid DEIMv2 Joint ellipse local refinement stage"
                 )
+        selection = config.get("train", {}).get("checkpoint_selection", {})
+        if str(selection.get("joint_metric")) != (
+            "conditional_semantic_macro_f1_nme_0.10"
+        ):
+            raise ComparisonConfigError(
+                "Ellipse-local Joint checkpoint selection must use conditional "
+                "semantic Macro F1 at NME 0.10"
+            )
+        if str(selection.get("joint_direction")) != "maximize":
+            raise ComparisonConfigError(
+                "Ellipse-local Joint checkpoint direction must be maximize"
+            )
+        if abs(float(selection.get("point_presence_threshold", 0.0)) - 0.70) > 1.0e-8:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint point presence threshold must remain 0.70"
+            )
+        if abs(float(selection.get("head_normalization_scale", 0.0)) - 1.20) > 1.0e-8:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint Head normalization scale must remain 1.20"
+            )
+        head_annotations = config.get("data", {}).get("joint", {}).get(
+            "head_annotations"
+        )
+        if not isinstance(head_annotations, dict) or set(head_annotations) != {
+            "train",
+            "val",
+            "test",
+        }:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint requires fixed train/val/test Head annotations"
+            )
     fallback = joint.get("batch_size_fallback", {})
     if isinstance(fallback, dict) and bool(fallback.get("enabled", False)):
         candidates = fallback.get("candidates")
@@ -210,6 +301,24 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ComparisonConfigError("Dataset subsampling is disabled in production mode")
     if not bool(train.get("amp", False)) or not bool(train.get("ema", {}).get("enabled", False)):
         raise ComparisonConfigError("Production training requires AMP and EMA")
+    if bool(local_refinement.get("enabled", False)):
+        early = train.get("early_stopping", {})
+        if int(train.get("epochs", 0)) != 40:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint production uses a nominal maximum of 40 epochs"
+            )
+        if int(early.get("minimum_epoch", 0)) != 10:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint early stopping minimum_epoch must be 10"
+            )
+        if int(early.get("patience", 0)) != 5:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint early stopping patience must be 5 validations"
+            )
+        if abs(float(early.get("min_delta", 0.0)) - 1.0e-4) > 1.0e-12:
+            raise ComparisonConfigError(
+                "Ellipse-local Joint early stopping min_delta must be 1.0e-4"
+            )
     detector = config.get("detector", {})
     if str(detector.get("variant")) != "DEIMv2-L":
         raise ComparisonConfigError("All top-down inference must use the fixed DEIMv2-L detector")
