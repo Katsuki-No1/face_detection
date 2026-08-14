@@ -62,12 +62,30 @@ class SpatialPriorModuleV2(nn.Module):
             nn.SyncBatchNorm(4 * inplanes),
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward_with_high_resolution(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        """Return the existing stride-4 stem and the detector pyramid.
+
+        ``c1`` was always computed because it feeds ``c2`` but the historical
+        detector contract discarded it.  Exposing it through a separate method
+        lets optional dense landmark heads reuse the RGB detail without adding
+        another image encoder or changing the normal backbone output.
+        """
+
         c1 = self.stem(x)
         c2 = self.conv2(c1)
         c3 = self.conv3(c2)
         c4 = self.conv4(c3)
-        return c2, c3, c4
+        return c1, (c2, c3, c4)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _high_resolution, pyramid = self.forward_with_high_resolution(x)
+        return pyramid
 
 
 class DINOv3STABackbone(nn.Module):
@@ -95,6 +113,9 @@ class DINOv3STABackbone(nn.Module):
         self.interaction_indexes = tuple(int(index) for index in interaction_indexes)
         self.use_sta = bool(use_sta)
         self.hidden_dim = int(hidden_dim)
+        self.spatial_high_resolution_channels = (
+            int(conv_inplane) if self.use_sta else 0
+        )
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
 
@@ -138,6 +159,48 @@ class DINOv3STABackbone(nn.Module):
         if isinstance(layer_output, (tuple, list)) and layer_output and isinstance(layer_output[0], torch.Tensor):
             return layer_output[0]
         raise TypeError(f"Unsupported DINO intermediate layer output: {type(layer_output)!r}")
+
+    def forward_with_high_resolution(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Return normal DEIM features plus the shared RGB stride-4 map."""
+
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(
+                f"Expected images with shape [B, 3, H, W], got "
+                f"{tuple(images.shape)}"
+            )
+        if not self.use_sta:
+            raise RuntimeError(
+                "High-resolution STA features require use_sta=true"
+            )
+        images = self._normalize(images)
+        semantic_features = self._semantic_features(images)
+        high_resolution, detail_features = (
+            self.sta.forward_with_high_resolution(images)
+        )
+        fused_features = [
+            torch.cat((semantic, detail), dim=1)
+            for semantic, detail in zip(
+                semantic_features,
+                detail_features,
+                strict=True,
+            )
+        ]
+        outputs = tuple(
+            norm(conv(feature))
+            for conv, norm, feature in zip(
+                self.convs,
+                self.norms,
+                fused_features,
+                strict=True,
+            )
+        )
+        return outputs, high_resolution
 
     def _semantic_features(self, images: torch.Tensor) -> list[torch.Tensor]:
         grid_h = int(images.shape[-2]) // self.patch_size[0]

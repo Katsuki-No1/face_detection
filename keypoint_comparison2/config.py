@@ -110,6 +110,36 @@ def validate_config(config: dict[str, Any]) -> None:
                 f"{name} batch_size and gradient_accumulation_steps must be positive"
             )
     joint = models["deimv2_joint"]
+    local_refinement = joint.get("ellipse_local_refinement", {})
+    if not isinstance(local_refinement, dict):
+        raise ComparisonConfigError(
+            "deimv2_joint.ellipse_local_refinement must be a mapping"
+        )
+    if bool(local_refinement.get("enabled", False)):
+        if int(local_refinement.get("roi_size", 0)) < 2:
+            raise ComparisonConfigError(
+                "DEIMv2 Joint ellipse ROI size must be at least two"
+            )
+        if abs(float(local_refinement.get("roi_scale", 0.0)) - 1.25) > 1.0e-8:
+            raise ComparisonConfigError(
+                "DEIMv2 Joint ellipse ROI scale must remain 1.25"
+            )
+        stages = local_refinement.get("stages")
+        if not isinstance(stages, list) or len(stages) != 2:
+            raise ComparisonConfigError(
+                "DEIMv2 Joint ellipse local refinement requires exactly two stages"
+            )
+        for stage in stages:
+            if (
+                not isinstance(stage, dict)
+                or float(stage.get("radius_in_feature_cells", 0.0)) <= 0.0
+                or float(stage.get("maximum_delta", 0.0)) <= 0.0
+                or int(stage.get("samples_per_axis", 0)) < 1
+                or int(stage.get("samples_per_axis", 0)) % 2 == 0
+            ):
+                raise ComparisonConfigError(
+                    "Invalid DEIMv2 Joint ellipse local refinement stage"
+                )
     fallback = joint.get("batch_size_fallback", {})
     if isinstance(fallback, dict) and bool(fallback.get("enabled", False)):
         candidates = fallback.get("candidates")

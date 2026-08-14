@@ -57,6 +57,29 @@ pretrained featureを破壊しない構成です。
 DEIMv2のbbox loss、landmark coordinate loss、各点visibility BCE、全decoder層のauxiliary lossを
 同時最適化します。
 
+任意の`ellipse_local_refinement` branchは、2回目のDINOやRGB cropを追加せず、STAがすでに
+計算しているstride 4の`c1`とHybridEncoderのDEIM stride 8 featureを利用します。予測Face
+楕円で両featureを同じ長軸整列ROIへ`grid_sample`し、projection後に融合します。全画面で更新済みの
+5個のKeypoint queryへFace queryと楕円geometry embeddingを加え、Faceごとのlocal memoryへ
+cross-attentionした後、3×3 samplingによる2段のbounded residual refinementを実行します。
+最終座標は逆ellipse変換で全画面正規化座標へ戻します。base補正と各refinementの出力層は
+ゼロ初期化されるため、未学習時はglobal coarse座標を恒等的に維持します。現行のellipse半径は
+最大画像辺で正規化されるため、このbranchは既存jointと同じ正方形960入力を要求します。
+
+`LandmarkQueryDecoder`は任意の
+`state_head_mode: factorized_presence_visibility`をサポートします。このモードでは各意味固定queryに
+`presence: missing(0) vs present(1/2)`と
+`visibility: occluded(1) vs visible(2)`を別々に出力し、推論時に
+`P(missing), P(occluded), P(visible)`へ合成します。座標lossとvisibility lossは`v>0`だけ、presence
+lossは5 slotすべてを教師にします。baseline-aligned評価のpoint gateにはvisibilityではなくpresenceを
+渡します。
+
+既存`deimv2_joint` checkpointと評価値を再現できるよう、設定が省略された場合は従来の
+`legacy_binary`を維持し、presence層もstate-dict keyも生成しません。presence単独では座標局所化の
+問題を解決しないため、完成済みhistorical production設定ではpresenceと
+`ellipse_local_refinement`を無効のまま維持します。新しい局所refinement runでは別outputを使い、
+必要な4 gateとmicrobatch `4/8/16`の同条件preflightを通してから明示的に有効化します。
+
 960px joint学習は有効batch 16を固定し、開始前にunfreeze状態でforward/backward、
 AdamW初期state生成、optimizer step、EMA更新までを実測します。`batch 8 / accumulation 2`
 から試し、CUDA OOMの場合だけ`4/4 → 2/8 → 1/16`へ移行します。選択結果とpeak GPU memoryは

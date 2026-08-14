@@ -11,7 +11,11 @@ from PIL import Image
 from keypoint_comparison2.config import load_config
 from keypoint_comparison2.data import CropAugmentation, FaceCropDataset, JointFaceDataset
 from keypoint_comparison2.models.dinov3 import DinoV3FPNRTMCC, DinoV3ORFormerRTMCC
-from keypoint_comparison2.models.joint_deim import LandmarkQueryDecoder
+from keypoint_comparison2.models.joint_deim import (
+    DEIMv2JointFaceLandmarks,
+    EllipseConditionedLocalRefinement,
+    LandmarkQueryDecoder,
+)
 from keypoint_comparison2.models.rtmpose import _semantic_face5_tensor
 from keypoint_comparison2.models.simcc import SimCCLabel, SimCCSpec
 from keypoint_comparison2.training import (
@@ -21,6 +25,8 @@ from keypoint_comparison2.training import (
     select_batch_plan,
 )
 from src.models.dino_backbone import DummyDinoBackbone
+from src.models.dinov3_deimv2.official import SpatialPriorModuleV2
+from keypoint_comparison1.landmark_detection.heads import FACTORIZED_STATE_HEAD
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -243,13 +249,293 @@ def test_landmark_query_decoder_generates_five_queries_per_face() -> None:
         [[[0.3, 0.3, 0.2, 0.2], [0.7, 0.3, 0.2, 0.2], [0.5, 0.7, 0.3, 0.3]]] * 2
     )
     memory = torch.randn(2, 20, 32)
-    keypoints, visibility, auxiliary = decoder(face_queries, face_boxes, memory)
+    keypoints, presence, visibility, auxiliary = decoder(
+        face_queries, face_boxes, memory
+    )
     assert keypoints.shape == (2, 3, 5, 2)
+    assert presence is None
     assert visibility.shape == (2, 3, 5)
     assert len(auxiliary) == 1
     assert bool(((keypoints >= 0) & (keypoints <= 1)).all())
+    assert not any("presence_head" in key for key in decoder.state_dict())
     (keypoints.sum() + visibility.sum()).backward()
     assert decoder.landmark_queries.grad is not None
+
+
+def test_landmark_query_decoder_factorizes_presence_and_visibility() -> None:
+    decoder = LandmarkQueryDecoder(
+        32,
+        layers=2,
+        heads=4,
+        feedforward=64,
+        state_head_mode=FACTORIZED_STATE_HEAD,
+    )
+    face_queries = torch.randn(2, 3, 32, requires_grad=True)
+    face_boxes = torch.tensor(
+        [[[0.3, 0.3, 0.2, 0.2], [0.7, 0.3, 0.2, 0.2], [0.5, 0.7, 0.3, 0.3]]] * 2
+    )
+    memory = torch.randn(2, 20, 32)
+    keypoints, presence, visibility, _auxiliary = decoder(
+        face_queries, face_boxes, memory
+    )
+    assert presence is not None
+    assert presence.shape == visibility.shape == (2, 3, 5)
+    state_probabilities = torch.stack(
+        (
+            1.0 - presence.sigmoid(),
+            presence.sigmoid() * (1.0 - visibility.sigmoid()),
+            presence.sigmoid() * visibility.sigmoid(),
+        ),
+        dim=-1,
+    )
+    torch.testing.assert_close(
+        state_probabilities.sum(dim=-1),
+        torch.ones_like(presence),
+    )
+    (keypoints.sum() + presence.sum() + visibility.sum()).backward()
+    assert decoder.presence_head is not None
+    assert any(parameter.grad is not None for parameter in decoder.presence_head.parameters())
+
+
+def test_spatial_prior_exposes_existing_stride_four_feature() -> None:
+    module = SpatialPriorModuleV2(inplanes=8).eval()
+    images = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        high_resolution, pyramid = module.forward_with_high_resolution(images)
+        historical = module(images)
+    assert high_resolution.shape == (2, 8, 16, 16)
+    assert [tuple(value.shape) for value in pyramid] == [
+        (2, 16, 8, 8),
+        (2, 32, 4, 4),
+        (2, 32, 2, 2),
+    ]
+    for actual, expected in zip(historical, pyramid, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_ellipse_local_refinement_fuses_stride_four_and_eight_features() -> None:
+    refiner = EllipseConditionedLocalRefinement(
+        32,
+        high_resolution_channels=8,
+        roi_size=8,
+        roi_scale=1.25,
+        layers=1,
+        heads=4,
+        feedforward=64,
+        state_head_mode=FACTORIZED_STATE_HEAD,
+        stages=[
+            {
+                "radius_in_feature_cells": 2.0,
+                "maximum_delta": 0.08,
+                "samples_per_axis": 3,
+            },
+            {
+                "radius_in_feature_cells": 1.0,
+                "maximum_delta": 0.04,
+                "samples_per_axis": 3,
+            },
+        ],
+    )
+    ellipses = torch.tensor(
+        [
+            [
+                [0.30, 0.30, 0.16, 0.10, 0.00],
+                [0.70, 0.35, 0.14, 0.08, 0.25],
+                [0.50, 0.70, 0.18, 0.11, -0.30],
+            ]
+        ]
+        * 2,
+        dtype=torch.float32,
+    )
+    offsets = torch.tensor(
+        [
+            [-0.04, -0.03],
+            [0.04, -0.03],
+            [0.00, 0.00],
+            [-0.03, 0.04],
+            [0.03, 0.04],
+        ],
+        dtype=torch.float32,
+    )
+    coarse = ellipses[..., None, :2] + offsets.view(1, 1, 5, 2)
+    global_queries = torch.randn(2, 3, 5, 32, requires_grad=True)
+    face_queries = torch.randn(2, 3, 32, requires_grad=True)
+    presence = torch.randn(2, 3, 5, requires_grad=True)
+    visibility = torch.randn(2, 3, 5, requires_grad=True)
+    deim_feature = torch.randn(2, 32, 8, 8, requires_grad=True)
+    high_resolution = torch.randn(2, 8, 16, 16, requires_grad=True)
+    output = refiner(
+        global_query_features=global_queries,
+        face_queries=face_queries,
+        coarse_coordinates=coarse,
+        presence_logits=presence,
+        visibility_logits=visibility,
+        ellipses=ellipses,
+        deim_feature=deim_feature,
+        high_resolution_feature=high_resolution,
+    )
+    assert output["coordinates"].shape == (2, 3, 5, 2)
+    assert output["presence_logits"].shape == (2, 3, 5)
+    assert output["visibility_logits"].shape == (2, 3, 5)
+    assert output["roi_shape"] == (8, 8)
+    assert len(output["refinement_coordinates"]) == 2
+    assert len(output["auxiliary_coordinates"]) == 2
+    # Every residual output starts at zero, so enabling the new branch is an
+    # identity mapping before training instead of a random checkpoint break.
+    torch.testing.assert_close(output["coordinates"], coarse, atol=1.0e-6, rtol=0.0)
+    torch.testing.assert_close(output["presence_logits"], presence)
+    torch.testing.assert_close(output["visibility_logits"], visibility)
+    output["coordinates"].sum().backward()
+    base_output = refiner.base_delta_head[-1]
+    assert isinstance(base_output, torch.nn.Linear)
+    assert base_output.weight.grad is not None
+    for stage in refiner.refinement_stages:
+        assert stage.delta_head.weight.grad is not None
+
+
+def test_deim_joint_routes_global_queries_through_ellipse_local_refinement() -> None:
+    class DummyBackbone(torch.nn.Module):
+        spatial_high_resolution_channels = 8
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.f4 = torch.nn.Conv2d(3, 8, kernel_size=3, stride=4, padding=1)
+            self.f8 = torch.nn.Conv2d(3, 32, kernel_size=3, stride=8, padding=1)
+
+        def forward_with_high_resolution(self, images):
+            high = self.f4(images)
+            first = self.f8(images)
+            return (
+                first,
+                torch.nn.functional.avg_pool2d(first, 2),
+                torch.nn.functional.avg_pool2d(first, 4),
+            ), high
+
+        def forward(self, images):
+            features, _high = self.forward_with_high_resolution(images)
+            return features
+
+    class DummyEncoder(torch.nn.Module):
+        def forward(self, features):
+            return features
+
+    class DummyQueryLayer(torch.nn.Module):
+        def forward(self, queries):
+            return queries
+
+    class DummyDecoder(torch.nn.Module):
+        hidden_dim = 32
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoder = torch.nn.Module()
+            self.decoder.layers = torch.nn.ModuleList([DummyQueryLayer()])
+            self.query_embedding = torch.nn.Parameter(torch.randn(3, 32))
+
+        def forward(self, features, _targets=None):
+            batch = features[0].shape[0]
+            context = features[0].mean(dim=(-2, -1)).unsqueeze(1)
+            queries = context + self.query_embedding.unsqueeze(0)
+            queries = self.decoder.layers[-1](queries)
+            boxes = queries.new_tensor(
+                [
+                    [0.30, 0.30, 0.24, 0.24],
+                    [0.70, 0.35, 0.22, 0.22],
+                    [0.50, 0.70, 0.28, 0.28],
+                ]
+            ).unsqueeze(0).expand(batch, -1, -1)
+            ellipses = queries.new_tensor(
+                [
+                    [0.30, 0.30, 0.12, 0.08, 0.00],
+                    [0.70, 0.35, 0.11, 0.07, 0.20],
+                    [0.50, 0.70, 0.14, 0.09, -0.25],
+                ]
+            ).unsqueeze(0).expand(batch, -1, -1)
+            return {
+                "pred_logits": queries.mean(dim=-1, keepdim=True),
+                "pred_boxes": boxes,
+                "pred_ellipses": ellipses,
+            }
+
+    class DummyDetector(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = DummyBackbone()
+            self.encoder = DummyEncoder()
+            self.decoder = DummyDecoder()
+
+    model = DEIMv2JointFaceLandmarks(
+        {
+            "dimension": 32,
+            "maximum_face_queries": 3,
+            "landmark_decoder_layers": 2,
+            "heads": 4,
+            "feedforward": 64,
+            "state_head_mode": FACTORIZED_STATE_HEAD,
+            "ellipse_local_refinement": {
+                "enabled": True,
+                "roi_size": 8,
+                "roi_scale": 1.25,
+                "layers": 1,
+                "heads": 4,
+                "feedforward": 64,
+                "detach_ellipse": True,
+            },
+        },
+        detector=DummyDetector(),
+    )
+    output = model(torch.rand(2, 3, 64, 64))
+    assert output["pred_keypoints"].shape == (2, 3, 5, 2)
+    assert output["global_coarse_keypoints"].shape == (2, 3, 5, 2)
+    assert output["local_base_keypoints"].shape == (2, 3, 5, 2)
+    assert len(output["local_refinement_keypoints"]) == 2
+    assert output["local_roi_shape"] == (8, 8)
+    torch.testing.assert_close(
+        output["pred_keypoints"],
+        output["global_coarse_keypoints"],
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    (output["pred_keypoints"].sum() + output["visibility_logits"].sum()).backward()
+    assert model.landmark_decoder.landmark_queries.grad is not None
+    with pytest.raises(RuntimeError, match="requires a square input"):
+        model(torch.rand(1, 3, 64, 80))
+
+
+def test_deim_joint_presence_loss_separates_missing_from_present() -> None:
+    model = DEIMv2JointFaceLandmarks.__new__(DEIMv2JointFaceLandmarks)
+    torch.nn.Module.__init__(model)
+    predictions = torch.zeros(1, 1, 5, 2, requires_grad=True)
+    presence_logits = torch.zeros(1, 1, 5, requires_grad=True)
+    visibility_logits = torch.zeros(1, 1, 5, requires_grad=True)
+    losses = model._landmark_losses(
+        predictions,
+        presence_logits,
+        visibility_logits,
+        [],
+        torch.tensor([[0]]),
+        [(torch.tensor([0]), torch.tensor([0]))],
+        [
+            {
+                "keypoints": torch.zeros(1, 5, 2),
+                "labeled": torch.tensor([[False, True, True, True, True]]),
+                "visible": torch.tensor([[False, False, True, True, True]]),
+            }
+        ],
+    )
+    assert set(losses) == {
+        "loss_keypoint",
+        "loss_presence",
+        "loss_visibility",
+        "loss_landmark_aux",
+    }
+    (losses["loss_presence"] + losses["loss_visibility"]).backward()
+    assert presence_logits.grad is not None
+    assert presence_logits.grad[0, 0, 0] > 0  # missing: lower the presence logit
+    assert presence_logits.grad[0, 0, 1] < 0  # occluded: keep the point present
+    assert visibility_logits.grad is not None
+    assert visibility_logits.grad[0, 0, 0] == 0  # missing is masked here
+    assert visibility_logits.grad[0, 0, 1] > 0  # occluded: lower visibility only
 
 
 def test_face106_semantic_transfer() -> None:

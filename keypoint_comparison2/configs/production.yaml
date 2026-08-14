@@ -259,6 +259,27 @@ models:
     keypoint_loss_weight: 10.0
     visibility_loss_weight: 1.0
     auxiliary_loss_weight: 0.5
+    # The completed historical joint run must keep its original checkpoint
+    # contract. Enable this only in a new output/config after the required
+    # schema, GPU-step, overfit, small-scale, and batch-plan gates.
+    ellipse_local_refinement:
+      enabled: false
+      roi_size: 16
+      roi_scale: 1.25
+      layers: 2
+      heads: 8
+      feedforward: 896
+      dropout: 0.0
+      maximum_base_delta: 0.10
+      minimum_radius: 0.001
+      detach_ellipse: true
+      stages:
+        - radius_in_feature_cells: 2.0
+          maximum_delta: 0.08
+          samples_per_axis: 3
+        - radius_in_feature_cells: 1.0
+          maximum_delta: 0.04
+          samples_per_axis: 3
 
 train:
   production_mode: true
