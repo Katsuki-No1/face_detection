@@ -1,0 +1,30 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_2.yaml
+
+# Template: prepare_mal_alpha2_wider_pipeline.py binds the future WIDER hash
+# only after training completes. Gates/production use that generated config.
+experiment_name: mal_alpha2_ellipse_from_wider
+deployment:
+  topology: non-cascade
+  stages: [full-image FACE/ellipse]
+  external_head_detector: forbidden
+model:
+  init_checkpoint:
+    path: outputs/pretrained/mal_alpha2_wider/detector.pt
+    prefer_ema: true
+    skip_class_heads: false
+    verbose: true
+train:
+  name: mal_alpha2_ellipse_from_wider
+verification:
+  checkpoint_transfer_contract: local_bbox_to_ellipse_warm_start
+  expected_init_checkpoint_sha256: null
+  minimum_loaded_state_numel_fraction: 0.995
+  architecture_id: mal_alpha2_ellipse_from_wider
+  output: outputs/training_gates/mal_alpha2_ellipse_from_wider/schema
+batch_preflight:
+  required_candidates: [4, 8, 16]
+  effective_batch_size: 16
+  max_vram_fraction: 0.90
+  max_temperature_c: 83
+  timing_equivalence_fraction: 0.03
+  runtime_oom_fallback: true

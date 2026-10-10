@@ -24,6 +24,7 @@ from src.third_party.deimv2.engine.deim.box_ops import (
 from src.third_party.deimv2.engine.deim.dfine_decoder import MSDeformableAttention
 
 from .cascade import ExternalHeadCascadeRouter, detections_from_targets
+from .dense_local import EllipseAlignedDensePoseRefiner, PoseEvidenceFaceFusion
 from .sequential import StrictSequentialCascade
 from .shared_head import SharedDINOHeadBranch
 
@@ -1545,6 +1546,15 @@ class CooperativeCriterion(nn.Module):
             "visibility": float(configured.get("visibility", 1.0)),
             "pose_box": float(configured.get("pose_box", 2.0)),
             "ellipse_refined": float(configured.get("ellipse_refined", 2.0)),
+            "keypoint_local": float(configured.get("keypoint_local", 1.0)),
+            "keypoint_uncertainty": float(
+                configured.get("keypoint_uncertainty", 0.1)
+            ),
+            "face_evidence": float(configured.get("face_evidence", 1.0)),
+            "localization_quality": float(
+                configured.get("localization_quality", 0.5)
+            ),
+            "non_regression": float(configured.get("non_regression", 0.5)),
         }
         self.auxiliary_weight = float(auxiliary_weight)
         self.pose_matcher = pose_matcher
@@ -1773,6 +1783,116 @@ class CooperativeCriterion(nn.Module):
         }
 
     @staticmethod
+    def _keypoint_uncertainty_loss(
+        output: Mapping[str, torch.Tensor],
+        targets: Sequence[Mapping[str, torch.Tensor]],
+        matches: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        keypoints = output["pred_keypoints"]
+        log_scales = output.get("pred_keypoint_log_scales")
+        if log_scales is None:
+            return keypoints.sum() * 0.0
+        terms = []
+        for batch_index, ((source, destination), target) in enumerate(
+            zip(matches, targets, strict=True)
+        ):
+            if source.numel() == 0:
+                continue
+            labeled = target["labeled"][destination].to(keypoints.dtype)
+            error = (
+                keypoints[batch_index, source]
+                - target["keypoints"][destination]
+            ).abs()
+            scale = log_scales[batch_index, source]
+            laplace = error * torch.exp(-scale) + scale
+            terms.append(
+                (laplace.sum(dim=-1) * labeled).sum()
+                / labeled.sum().clamp_min(1.0)
+            )
+        return torch.stack(terms).mean() if terms else keypoints.sum() * 0.0
+
+    @staticmethod
+    def _elementwise_box_iou(
+        first: torch.Tensor,
+        second: torch.Tensor,
+    ) -> torch.Tensor:
+        first = box_cxcywh_to_xyxy(first)
+        second = box_cxcywh_to_xyxy(second)
+        upper = torch.maximum(first[..., :2], second[..., :2])
+        lower = torch.minimum(first[..., 2:], second[..., 2:])
+        intersection = (lower - upper).clamp_min(0.0).prod(dim=-1)
+        first_area = (first[..., 2:] - first[..., :2]).clamp_min(0.0).prod(dim=-1)
+        second_area = (
+            (second[..., 2:] - second[..., :2]).clamp_min(0.0).prod(dim=-1)
+        )
+        return intersection / (first_area + second_area - intersection).clamp_min(1.0e-8)
+
+    def _face_evidence_losses(
+        self,
+        output: Mapping[str, torch.Tensor],
+        targets: Sequence[Mapping[str, torch.Tensor]],
+        face_matches: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        pose_matches: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        evidence_logits = output["pred_face_pose_evidence_logits"]
+        quality_logits = output["pred_face_localization_quality_logits"]
+        evidence_target = torch.zeros_like(evidence_logits)
+        quality_target = torch.zeros_like(quality_logits)
+        non_regression_terms = []
+        positive_count = 0
+        for batch_index, (face_match, pose_match, target) in enumerate(
+            zip(face_matches, pose_matches, targets, strict=True)
+        ):
+            source, destination = face_match
+            if source.numel() == 0:
+                continue
+            pose_targets = set(pose_match[1].tolist())
+            evidence_target[batch_index, source] = torch.tensor(
+                [
+                    float(target_index in pose_targets)
+                    for target_index in destination.tolist()
+                ],
+                device=evidence_logits.device,
+                dtype=evidence_logits.dtype,
+            )
+            target_boxes = target["boxes"][destination]
+            before = output["pre_evidence_face_boxes"][batch_index, source]
+            after = output["pred_face_boxes"][batch_index, source]
+            quality_target[batch_index, source] = self._elementwise_box_iou(
+                before,
+                target_boxes,
+            ).detach()
+            before_error = (before - target_boxes).abs().mean(dim=-1)
+            after_error = (after - target_boxes).abs().mean(dim=-1)
+            non_regression_terms.append(
+                F.relu(after_error - before_error).mean()
+            )
+            positive_count += int(source.numel())
+        normalizer = max(1, positive_count)
+        evidence_loss = _soft_focal_loss(
+            evidence_logits,
+            evidence_target,
+            alpha=0.50,
+            reduction="sum",
+        ) / normalizer
+        quality_loss = _soft_focal_loss(
+            quality_logits,
+            quality_target,
+            alpha=0.50,
+            reduction="sum",
+        ) / normalizer
+        zero = evidence_logits.sum() * 0.0
+        return {
+            "loss_face_pose_evidence": evidence_loss,
+            "loss_face_localization_quality": quality_loss,
+            "loss_face_non_regression": (
+                torch.stack(non_regression_terms).mean()
+                if non_regression_terms
+                else zero
+            ),
+        }
+
+    @staticmethod
     def _association_loss(
         logits: torch.Tensor,
         face_matches: Sequence[tuple[torch.Tensor, torch.Tensor]],
@@ -1872,6 +1992,7 @@ class CooperativeCriterion(nn.Module):
         *,
         independent_face_losses: Mapping[str, torch.Tensor],
         independent_pose: Mapping[str, Any],
+        dense_pose: Mapping[str, Any] | None = None,
         refined: Mapping[str, Any],
         targets: Sequence[Mapping[str, torch.Tensor]],
         face_matches: Sequence[tuple[torch.Tensor, torch.Tensor]],
@@ -1904,6 +2025,71 @@ class CooperativeCriterion(nn.Module):
                     for key, value in auxiliary_losses.items()
                 }
             )
+
+        dense_keypoint_total = independent_pose["pred_pose_logits"].sum() * 0.0
+        dense_visibility = dense_keypoint_total
+        dense_uncertainty = dense_keypoint_total
+        if dense_pose is not None:
+            dense_losses = self._pose_losses(
+                dense_pose,
+                targets,
+                pose_matches,
+                prefix="loss_pose_dense_local",
+            )
+            losses.update(dense_losses)
+            auxiliary_uncertainty_terms = []
+            for layer_index, auxiliary in enumerate(
+                dense_pose.get("dense_local_auxiliary_outputs", [])
+            ):
+                auxiliary_losses = self._pose_losses(
+                    auxiliary,
+                    targets,
+                    pose_matches,
+                    prefix=f"loss_pose_dense_local_aux_{layer_index}",
+                )
+                losses.update(
+                    {
+                        key: value * self.auxiliary_weight
+                        for key, value in auxiliary_losses.items()
+                    }
+                )
+                auxiliary_uncertainty = (
+                    self._keypoint_uncertainty_loss(
+                        auxiliary,
+                        targets,
+                        pose_matches,
+                    )
+                    * self.auxiliary_weight
+                )
+                losses[
+                    f"loss_keypoint_uncertainty_aux_{layer_index}"
+                ] = auxiliary_uncertainty
+                auxiliary_uncertainty_terms.append(auxiliary_uncertainty)
+            dense_keypoint_total = self._sum_branch_losses(
+                losses,
+                prefix="loss_pose_dense_local",
+                suffixes=(
+                    "_object",
+                    "_keypoint",
+                    "_keypoint_presence",
+                    "_pose_box",
+                ),
+            )
+            dense_visibility = self._sum_branch_losses(
+                losses,
+                prefix="loss_pose_dense_local",
+                suffixes=("_visibility",),
+            )
+            dense_uncertainty = self._keypoint_uncertainty_loss(
+                dense_pose,
+                targets,
+                pose_matches,
+            )
+            dense_uncertainty = dense_uncertainty + sum(
+                auxiliary_uncertainty_terms,
+                dense_uncertainty.new_zeros(()),
+            )
+            losses["loss_keypoint_uncertainty"] = dense_uncertainty
 
         refined_face = self._refined_face_losses(
             refined,
@@ -1948,6 +2134,21 @@ class CooperativeCriterion(nn.Module):
         )
         losses["loss_association"] = association_loss
         losses["association_accuracy"] = association_accuracy.detach()
+
+        evidence_total = association_loss * 0.0
+        quality_total = association_loss * 0.0
+        non_regression_total = association_loss * 0.0
+        if "pred_face_pose_evidence_logits" in refined:
+            evidence_losses = self._face_evidence_losses(
+                refined,
+                targets,
+                face_matches,
+                pose_matches,
+            )
+            losses.update(evidence_losses)
+            evidence_total = evidence_losses["loss_face_pose_evidence"]
+            quality_total = evidence_losses["loss_face_localization_quality"]
+            non_regression_total = evidence_losses["loss_face_non_regression"]
 
         face_independent_total = independent_face_losses["loss_total"]
         independent_keypoint_total = self._sum_branch_losses(
@@ -1995,8 +2196,10 @@ class CooperativeCriterion(nn.Module):
         losses["loss_keypoint_independent"] = independent_keypoint_total
         losses["loss_face_refined"] = face_refined_total
         losses["loss_keypoint_refined"] = pose_refined_total
+        losses["loss_keypoint_local"] = dense_keypoint_total
+        losses["loss_face_evidence"] = evidence_total
         losses["loss_visibility"] = (
-            independent_visibility + refined_visibility
+            independent_visibility + dense_visibility + refined_visibility
         )
         losses["loss_total"] = (
             face_independent_total
@@ -2004,8 +2207,13 @@ class CooperativeCriterion(nn.Module):
             + self.weights["association"] * association_loss
             + self.weights["face_refined"] * face_refined_total
             + self.weights["keypoint_refined"] * pose_refined_total
+            + self.weights["keypoint_local"] * dense_keypoint_total
+            + self.weights["keypoint_uncertainty"] * dense_uncertainty
+            + self.weights["face_evidence"] * evidence_total
+            + self.weights["localization_quality"] * quality_total
+            + self.weights["non_regression"] * non_regression_total
             + self.weights["visibility"]
-            * (independent_visibility + refined_visibility)
+            * (independent_visibility + dense_visibility + refined_visibility)
         )
         return losses
 
@@ -2025,6 +2233,8 @@ class FaceKeypointCooperativeDETR(nn.Module):
         external_head_cascade: ExternalHeadCascadeRouter | None = None,
         shared_head_branch: SharedDINOHeadBranch | None = None,
         strict_sequential_cascade: StrictSequentialCascade | None = None,
+        dense_local_refiner: EllipseAlignedDensePoseRefiner | None = None,
+        face_evidence_fusion: PoseEvidenceFaceFusion | None = None,
         maximum_face_queries: int = 100,
         face_score_threshold: float = 0.05,
         pose_score_threshold: float = 0.05,
@@ -2047,6 +2257,8 @@ class FaceKeypointCooperativeDETR(nn.Module):
         self.external_head_cascade = external_head_cascade
         self.shared_head_branch = shared_head_branch
         self.strict_sequential_cascade = strict_sequential_cascade
+        self.dense_local_refiner = dense_local_refiner
+        self.face_evidence_fusion = face_evidence_fusion
         if self.strict_sequential_cascade is not None:
             if self.shared_head_branch is None:
                 raise ValueError(
@@ -2364,28 +2576,34 @@ class FaceKeypointCooperativeDETR(nn.Module):
         if self.shared_head_branch is not None:
             shared_forward = getattr(
                 self.face_detector.backbone,
-                "forward_with_semantic",
+                "forward_with_semantic_and_final_stride16",
                 None,
             )
             if shared_forward is None:
                 raise TypeError(
                     "model.shared_head_branch requires a face backbone with "
-                    "forward_with_semantic(); no second DINO pass is allowed"
+                    "forward_with_semantic_and_final_stride16(); no second "
+                    "DINO pass is allowed"
                 )
-            features, semantic_features = shared_forward(images)
+            features, semantic_features, final_stride16 = shared_forward(images)
             if len(semantic_features) != 3:
                 raise ValueError(
                     "The shared DINO backbone must return three semantic levels"
                 )
+            if final_stride16.ndim != 4:
+                raise ValueError(
+                    "The shared DINO backbone block-11 feature must have shape "
+                    f"[B,C,H/16,W/16], got {tuple(final_stride16.shape)}"
+                )
             # MMCV's CUDA multi-scale deformable-attention extension supports
             # the production FP16 path used by this shared branch.
             with torch.autocast(
-                device_type=semantic_features[1].device.type,
+                device_type=final_stride16.device.type,
                 dtype=torch.float16,
-                enabled=semantic_features[1].is_cuda,
+                enabled=final_stride16.is_cuda,
             ):
                 shared_head_output = self.shared_head_branch(
-                    semantic_features[1],
+                    final_stride16,
                     image_size=image_size,
                     targets=targets,
                     padding_mask=padding_mask,
@@ -2429,6 +2647,14 @@ class FaceKeypointCooperativeDETR(nn.Module):
                 targets,
                 image_size=image_size,
             )
+        head_threshold_diagnostics = None
+        if self.strict_sequential_cascade is not None:
+            assert head_detections is not None
+            head_detections, head_threshold_diagnostics = (
+                self.strict_sequential_cascade.filter_head_detections(
+                    head_detections
+                )
+            )
         sequential_diagnostics: dict[str, Any] | None = None
         face_encoded = encoded
         sequential_training_rois = self.training and targets is not None
@@ -2444,6 +2670,7 @@ class FaceKeypointCooperativeDETR(nn.Module):
             )
             sequential_diagnostics = {
                 "execution_order": ("head", "face", "keypoint"),
+                "head_threshold": head_threshold_diagnostics,
                 "head_to_face": head_stage,
                 "unidirectional_refinement": True,
             }
@@ -2506,6 +2733,34 @@ class FaceKeypointCooperativeDETR(nn.Module):
                 independent_pose,
                 geometry_outputs,
             )
+        dense_pose = None
+        pose_for_cooperation = independent_pose
+        if self.dense_local_refiner is not None:
+            dense_device = independent_pose["memory"].device.type
+            with torch.autocast(device_type=dense_device, enabled=False):
+                initial_association = self.association(
+                    independent_face["embeddings"].float(),
+                    independent_pose["pose_embeddings"].float(),
+                    face_boxes=independent_face["pred_boxes"].float(),
+                    face_ellipses=independent_face["pred_ellipses"].float(),
+                    face_logits=independent_face["pred_logits"].float(),
+                    pose_boxes=independent_pose["pred_pose_boxes"].float(),
+                    keypoints=independent_pose["pred_keypoints"].float(),
+                    pose_logits=independent_pose["pred_pose_logits"].float(),
+                    keypoint_logits=independent_pose[
+                        "pred_keypoint_logits"
+                    ].float(),
+                    visibility_logits=independent_pose[
+                        "pred_visibility_logits"
+                    ].float(),
+                )
+                dense_pose = self.dense_local_refiner(
+                    images.float(),
+                    _float_top_level_tensors(independent_face),
+                    _float_top_level_tensors(independent_pose),
+                    initial_association,
+                )
+            pose_for_cooperation = dense_pose
         # FP16 remains the outer AMP policy, but the bidirectional refinement
         # repeatedly applies inverse-sigmoid box updates and deformable
         # attention. Running this compact block in FP32 prevents a single
@@ -2524,12 +2779,14 @@ class FaceKeypointCooperativeDETR(nn.Module):
                 branch_override = (True, False)
             refined = self.cooperative_decoder(
                 _float_top_level_tensors(independent_face),
-                _float_top_level_tensors(independent_pose),
-                memory=independent_pose["memory"].float(),
-                memory_mask=independent_pose["memory_mask"],
-                spatial_shapes=independent_pose["spatial_shapes"],
+                _float_top_level_tensors(pose_for_cooperation),
+                memory=pose_for_cooperation["memory"].float(),
+                memory_mask=pose_for_cooperation["memory_mask"],
+                spatial_shapes=pose_for_cooperation["spatial_shapes"],
                 branch_override=branch_override,
             )
+            if self.face_evidence_fusion is not None:
+                refined = self.face_evidence_fusion(refined)
         if self.pose_decoder.state_head_mode == FACTORIZED_STATE_HEAD:
             refined["pred_state_probabilities"] = (
                 factorized_state_probabilities(
@@ -2542,6 +2799,8 @@ class FaceKeypointCooperativeDETR(nn.Module):
             "independent_pose": independent_pose,
             "refined": refined,
         }
+        if dense_pose is not None:
+            output["dense_local_pose"] = dense_pose
         if shared_head_output is not None:
             output["shared_head"] = shared_head_output
         if geometry_outputs is not None:
@@ -2600,6 +2859,7 @@ class FaceKeypointCooperativeDETR(nn.Module):
             losses = self.criterion(
                 independent_face_losses=independent_face_losses,
                 independent_pose=independent_pose,
+                dense_pose=dense_pose,
                 refined=refined,
                 targets=joint_targets,
                 face_matches=face_matches,
@@ -2800,6 +3060,15 @@ class FaceKeypointCooperativeDETR(nn.Module):
             image_size=image_size,
             threshold=self.pose_score_threshold,
         )
+        dense_pose = (
+            self._decode_pose(
+                output["dense_local_pose"],
+                image_size=image_size,
+                threshold=self.pose_score_threshold,
+            )
+            if "dense_local_pose" in output
+            else None
+        )
         pose_after = self._decode_pose(
             refined,
             image_size=image_size,
@@ -2917,6 +3186,26 @@ class FaceKeypointCooperativeDETR(nn.Module):
                         "branch_pose_to_face_enabled"
                     ][batch_index],
                 }
+            if dense_pose is not None:
+                row["dense_local_pose"] = dense_pose[batch_index]
+            if "pred_face_pose_evidence_logits" in refined:
+                evidence_indices = face_after[batch_index]["query_indices"]
+                row["face_evidence"] = {
+                    "pose_evidence": refined[
+                        "pred_face_pose_evidence_logits"
+                    ][batch_index, evidence_indices].sigmoid(),
+                    "localization_quality": refined[
+                        "pred_face_localization_quality_logits"
+                    ][batch_index, evidence_indices].sigmoid(),
+                    "fusion_gate": refined["face_evidence_gate"][
+                        batch_index,
+                        evidence_indices,
+                    ],
+                    "box_update_gate": refined["face_box_update_gate"][
+                        batch_index,
+                        evidence_indices,
+                    ],
+                }
             if cascade_diagnostics is not None:
                 row["cooperative_refined_face"] = cooperative_face
                 row["cooperative_refined_pose"] = cooperative_pose
@@ -2975,6 +3264,16 @@ class FaceKeypointCooperativeDETR(nn.Module):
             "keypoint_decoder": list(self.pose_decoder.parameters()),
             "association": list(self.association.parameters()),
             "cooperative_decoder": [],
+            "dense_local_refiner": (
+                list(self.dense_local_refiner.parameters())
+                if self.dense_local_refiner is not None
+                else []
+            ),
+            "face_evidence_fusion": (
+                list(self.face_evidence_fusion.parameters())
+                if self.face_evidence_fusion is not None
+                else []
+            ),
             "head_pose_geometry": (
                 list(self.head_pose_geometry.parameters())
                 if self.head_pose_geometry is not None
@@ -3009,9 +3308,11 @@ class FaceKeypointCooperativeDETR(nn.Module):
 __all__ = [
     "BidirectionalCooperativeDecoder",
     "CooperativeCriterion",
+    "EllipseAlignedDensePoseRefiner",
     "FaceKeypointCooperativeDETR",
     "FacePoseAssociation",
     "IndependentPoseQueryDecoder",
     "KEYPOINT_NAMES",
     "PoseHungarianMatcher",
+    "PoseEvidenceFaceFusion",
 ]

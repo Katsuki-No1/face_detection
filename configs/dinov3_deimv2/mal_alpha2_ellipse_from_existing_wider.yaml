@@ -1,0 +1,51 @@
+extends: mal_alpha2_ellipse_from_wider.yaml
+experiment_name: mal_alpha2_ellipse_from_existing_wider
+model:
+  init_checkpoint:
+    path: /home/katsuki/projects/face_detection/outputs/pretrained/wider_face_retinaface_v1_max256/detector_deimv2_l_vits16_from_coco.pt
+    prefer_ema: true
+    skip_class_heads: false
+train:
+  name: mal_alpha2_ellipse_from_existing_wider
+  bounded_subset_strategy: seeded_random
+  lr_backbone: 5.0e-06
+  param_groups:
+  - name: ellipse_head_decay
+    params: ^(?=.*decoder\.ellipse_head)(?!.*(?:norm|bn|bias)).*$
+    lr: 0.0005
+  - name: ellipse_head_no_decay
+    params: ^(?=.*decoder\.ellipse_head)(?=.*(?:norm|bn|bias)).*$
+    lr: 0.0005
+    weight_decay: 0.0
+  - name: dinov3_decay
+    params: ^(?=.*backbone\.dino\.backbone)(?!.*(?:norm|bn|bias)).*$
+    lr: 5.0e-06
+  - name: dinov3_no_decay
+    params: ^(?=.*backbone\.dino\.backbone)(?=.*(?:norm|bn|bias)).*$
+    lr: 5.0e-06
+    weight_decay: 0.0
+  - name: deim_no_decay
+    params: ^(?=.*(?:backbone\.sta|backbone\.convs|backbone\.norms|encoder|decoder))(?=.*(?:norm|bn|bias)).*$
+    lr: 0.0001
+    weight_decay: 0.0
+  amp_initial_scale: 512.0
+verification:
+  architecture_id: mal_alpha2_ellipse_from_existing_wider
+  output: outputs/training_gates/mal_alpha2_ellipse_from_existing_wider/schema
+  expected_init_checkpoint_sha256: e372684d0482d27ae750ae923f4f42cd7bb8055abbaabd57c83acb111a17a97e
+gate_policy:
+  overfit:
+    epochs: 200
+    samples: 16
+    minimum_optimizer_updates: 190
+    window: 5
+    minimum_relative_improvement: 0.05
+    minimum_improving_transition_fraction: 0.4
+  small_scale:
+    epochs: 16
+    samples: 256
+    validation_images: 128
+    minimum_optimizer_updates: 240
+    window: 3
+    minimum_relative_improvement: 0.001
+    minimum_improving_transition_fraction: 0.25

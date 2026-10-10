@@ -85,6 +85,8 @@ data:
       category_ids: [2]
       sha256: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
     external_v1_v2:
+      enabled: false
+      disabled_reason: legacy_external_evaluation_dataset_not_available
       root: datasets/testdata_for_v1-2
       annotation: datasets/testdata_for_v1-2/annotations/deim_dino/face_keypoints_test.json
       category_ids: [2]
@@ -210,7 +212,10 @@ train:
     min_delta: 0.0001
 
 evaluation:
-  default_sets: [v2_test, external_v1_v2]
+  pipeline_contract:
+    type: cascade
+    stages: [full_image_face_ellipse, face_crop_keypoint]
+  default_sets: [v2_test]
   # The live primary queue predates the appended Query job and its loaded
   # evaluation command still requests all heads. That call exits cleanly when
   # a checkpoint is missing; the successor runs Query-vs-ViTPose-376 directly.

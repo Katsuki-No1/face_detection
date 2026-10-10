@@ -47,8 +47,9 @@ class SharedDINOHeadBranch(nn.Module):
     """Co-DINO HEAD branch fed by the Face branch's single DINO forward.
 
     This module intentionally contains no backbone.  It consumes the stride-16
-    semantic map returned by ``DINOv3STABackbone.forward_with_semantic`` and
-    adds only the SFP and compact one-class Co-DINO query head.
+    block-11 stride-16 map returned by
+    ``DINOv3STABackbone.forward_with_semantic_and_final_stride16`` and adds
+    only the SFP and compact one-class Co-DINO query head.
     """
 
     def __init__(
@@ -60,12 +61,15 @@ class SharedDINOHeadBranch(nn.Module):
         max_detections: int = 100,
         loss_weight: float = 1.0,
         teacher_force_targets: bool = False,
+        stable_self_attention: bool = False,
     ) -> None:
         super().__init__()
         self.sfp = SharedDetectorFeaturePyramid(
             in_channels=int(in_channels)
         )
-        self.query_head = CompactCoDINO()
+        self.query_head = CompactCoDINO(
+            stable_self_attention=bool(stable_self_attention)
+        )
         self.category_id = int(category_id)
         self.score_threshold = float(score_threshold)
         self.max_detections = int(max_detections)

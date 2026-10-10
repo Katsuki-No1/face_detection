@@ -4,7 +4,9 @@ extends: face_pose_drive_v2_balanced_811.yaml
 #   1. integrated full-frame Three-stage HEAD branch initialization;
 #   2. predicted-HEAD caches for HEAD-crop cooperative DINO.
 model:
-  score_threshold: 0.001
+  # HEAD uses the locked deployment/ROI gate. Unlike FACE/keypoint, no
+  # validation threshold sweep consumes candidates below 0.30.
+  score_threshold: 0.30
 
 data:
   image_size: 960

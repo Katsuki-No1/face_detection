@@ -157,6 +157,25 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write the shared all-architecture metric table here.",
     )
+    parser.add_argument(
+        "--head-predictions",
+        type=Path,
+        help="COCO-format predicted HEAD boxes for deployment-style evaluation.",
+    )
+    parser.add_argument("--head-detector-config", type=Path)
+    parser.add_argument("--head-detector-checkpoint", type=Path)
+    parser.add_argument(
+        "--pipeline-contract",
+        choices=(
+            "two_stage_face_keypoint",
+            "three_stage_head_face_keypoint",
+        ),
+        default="two_stage_face_keypoint",
+        help=(
+            "Exact deployed cascade. Two-stage evaluation starts from the "
+            "full-image FACE detector and leaves HEAD-only metrics unsupported."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -166,6 +185,36 @@ def sha256_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _load_head_predictions(
+    path: Path,
+    *,
+    image_ids: set[int],
+) -> dict[int, list[dict[str, Any]]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("HEAD predictions must be a COCO prediction list")
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in payload:
+        if int(row.get("category_id", -1)) != 1:
+            continue
+        image_id = int(row["image_id"])
+        if image_id not in image_ids:
+            raise RuntimeError(
+                f"HEAD prediction references unknown image_id={image_id}"
+            )
+        x, y, width, height = (float(value) for value in row["bbox"])
+        grouped[image_id].append(
+            {
+                "bbox_xyxy": [x, y, x + width, y + height],
+                "score": float(row["score"]),
+            }
+        )
+    for image_id in image_ids:
+        grouped[image_id].sort(key=lambda row: float(row["score"]), reverse=True)
+        grouped[image_id] = grouped[image_id][:100]
+    return dict(grouped)
 
 
 def _cuda_device_index(device: torch.device) -> int | None:
@@ -402,6 +451,7 @@ def infer_query_predictions(
     mean: Sequence[float],
     std: Sequence[float],
 ) -> dict[int, dict[str, Any]]:
+    from keypoint_comparison1.landmark_detection.face_overlap import crop_face_context, face_context_kwargs
     results: dict[int, dict[str, Any]] = {}
     image_cache: dict[str, np.ndarray] = {}
     batch_images: list[torch.Tensor] = []
@@ -415,7 +465,7 @@ def infer_query_predictions(
             "cuda",
             enabled=device.type == "cuda",
         ):
-            output = model(images)
+            output = model(images, **face_context_kwargs(model, batch_metadata, device))
         coordinates = output["decoded_coordinates"].detach().float().cpu().numpy()
         point_logits = output.get(
             "presence_logits",
@@ -475,6 +525,7 @@ def infer_query_predictions(
             {
                 "annotation_id": int(item["annotation_id"]),
                 "transform": transform,
+                **(crop_face_context(item, transform) if getattr(model, "face_overlap_enabled", False) else {}),
             }
         )
         if len(batch_images) >= batch_size:
@@ -966,6 +1017,14 @@ def main() -> int:
     if args.max_images is not None:
         images = images[: int(args.max_images)]
     selected_image_ids = {int(image["id"]) for image in images}
+    head_predictions_by_image = (
+        _load_head_predictions(
+            args.head_predictions,
+            image_ids=selected_image_ids,
+        )
+        if args.head_predictions is not None
+        else {image_id: [] for image_id in selected_image_ids}
+    )
     annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for annotation in head_coco.get("annotations", []):
         if int(annotation["image_id"]) in selected_image_ids:
@@ -1056,6 +1115,8 @@ def main() -> int:
                         "annotation_id": annotation_id,
                         "file_name": file_name,
                         "ellipse": predicted_ellipse,
+                        **({key: detection[key] for key in ("face_query_index", "face_query_features", "detector_bbox_xyxy")}
+                           if detection is not None and "face_query_features" in detection else {}),
                     }
                 )
 
@@ -1244,42 +1305,152 @@ def main() -> int:
                     }
                 )
             common_predictions[image_id] = {
-                "heads": [],
+                "heads": head_predictions_by_image.get(image_id, []),
                 "faces": faces,
                 "poses": poses,
             }
+        uses_head_stage = (
+            args.pipeline_contract == "three_stage_head_face_keypoint"
+        )
+        head_arguments = (
+            args.head_predictions,
+            args.head_detector_config,
+            args.head_detector_checkpoint,
+        )
+        if uses_head_stage and any(value is None for value in head_arguments):
+            raise RuntimeError(
+                "The three-stage pipeline requires HEAD predictions, config, "
+                "and checkpoint provenance"
+            )
+        if not uses_head_stage and any(value is not None for value in head_arguments):
+            raise RuntimeError(
+                "The two-stage FACE/keypoint pipeline must not receive an "
+                "external HEAD detector"
+            )
+
+        head_runtime: Mapping[str, Any] = {}
+        head_provenance: dict[str, Any] = {
+            "head_stage": {
+                "supported": False,
+                "unsupported_reason": "declared_pipeline_has_no_head_stage",
+            }
+        }
+        if uses_head_stage:
+            assert args.head_predictions is not None
+            assert args.head_detector_config is not None
+            assert args.head_detector_checkpoint is not None
+            head_metrics_path = args.head_predictions.with_name(
+                "predictions_metrics.json"
+            )
+            head_metrics_payload = json.loads(
+                head_metrics_path.read_text(encoding="utf-8")
+            )
+            if str(head_metrics_payload.get("split")) != args.split:
+                raise RuntimeError("HEAD prediction metrics split mismatch")
+            if int(head_metrics_payload.get("category_id", -1)) != 1:
+                raise RuntimeError("HEAD prediction metrics must use category_id=1")
+            if int(head_metrics_payload.get("max_dets", -1)) != 100:
+                raise RuntimeError("HEAD prediction metrics must use max_dets=100")
+            head_checkpoint_sha256 = sha256_file(args.head_detector_checkpoint)
+            if (
+                head_metrics_payload.get("checkpoint_sha256")
+                != head_checkpoint_sha256
+            ):
+                raise RuntimeError(
+                    "HEAD prediction checkpoint provenance mismatch"
+                )
+            head_runtime = head_metrics_payload.get("runtime", {})
+            head_provenance = {
+                "head_predictions": str(args.head_predictions),
+                "head_predictions_sha256": sha256_file(args.head_predictions),
+                "head_predictions_metrics": str(head_metrics_path),
+                "head_predictions_metrics_sha256": sha256_file(
+                    head_metrics_path
+                ),
+                "head_detector_config": str(args.head_detector_config),
+                "head_detector_config_sha256": sha256_file(
+                    args.head_detector_config
+                ),
+                "head_detector_checkpoint": str(
+                    args.head_detector_checkpoint
+                ),
+                "head_detector_checkpoint_sha256": head_checkpoint_sha256,
+            }
+        attribute_elapsed = time.perf_counter() - evaluation_started
+        head_elapsed = float(head_runtime.get("total_seconds", 0.0))
+        total_elapsed = attribute_elapsed + head_elapsed
+        head_inference = float(head_runtime.get("model_inference_seconds", 0.0))
+        combined_inference = inference_seconds + head_inference
+        continuous_local_contract = None
+        if query_config.get("model", {}).get("continuous_recovery", {}).get("enabled", False):
+            from keypoint_comparison1.landmark_detection.config import load_landmark_config
+
+            baseline_config = load_landmark_config(
+                REPO_ROOT / "keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2_messenger_control.yaml"
+            ).raw
+            detector_fields = ("config", "checkpoint", "image_size", "maximum_detections", "crop_geometry")
+            if any(query_config["detector"].get(key) != baseline_config["detector"].get(key) for key in detector_fields):
+                raise RuntimeError("Continuous local FACE comparison requires the unchanged local-baseline detector")
+            continuous_local_contract = {
+                "checkpoint_sha256": sha256_file(Path(query_config["detector"]["checkpoint"])),
+                "config_sha256": sha256_file(Path(query_config["detector"]["config"])),
+                "prediction_cap": int(query_config["detector"]["maximum_detections"]),
+            }
+            if cache_metadata.get("detector_checkpoint_sha256") != continuous_local_contract["checkpoint_sha256"]:
+                raise RuntimeError("FACE cache checkpoint hash does not match the local baseline")
         evaluate_normalized_predictions(
             annotation_path=args.head_annotation,
             predictions_by_image=common_predictions,
             split=args.split,
             architecture_id=args.architecture_id,
-            comparison_stage="deim_face_plus_query_refinement",
+            comparison_stage=(
+                "head_plus_deim_face_plus_query_refinement"
+                if uses_head_stage
+                else "full_image_deim_face_plus_query_refinement"
+            ),
             output_dir=args.common_output_dir,
             provenance={
+                "evaluator_path": str(
+                    REPO_ROOT / "src/evaluation/baseline_aligned.py"
+                ),
+                "evaluator_sha256": sha256_file(
+                    REPO_ROOT / "src/evaluation/baseline_aligned.py"
+                ),
+                "driver_path": str(Path(__file__).resolve()),
+                "driver_sha256": sha256_file(Path(__file__).resolve()),
                 "detector_cache": str(args.detector_cache),
                 "detector_cache_metadata": cache_metadata,
                 "query_checkpoint": query_provenance,
+                "pipeline_contract": args.pipeline_contract,
+                **head_provenance,
                 "diagnostic_metrics": str(args.output_dir / "metrics.json"),
                 "seed": query_config.get("train", {}).get("seed"),
+                **({"continuous_local_face_contract": continuous_local_contract} if continuous_local_contract else {}),
             },
             runtime={
-                "total_seconds": time.perf_counter() - evaluation_started,
+                "total_seconds": total_elapsed,
                 "images_per_second": len(images)
-                / max(time.perf_counter() - evaluation_started, 1.0e-12),
-                "model_inference_seconds": inference_seconds,
+                / max(total_elapsed, 1.0e-12),
+                "model_inference_seconds": combined_inference,
                 "model_inference_milliseconds_per_image": (
-                    1000.0 * inference_seconds / max(1, len(images))
+                    1000.0 * combined_inference / max(1, len(images))
                 ),
                 "peak_vram_mib": (
-                    torch.cuda.max_memory_allocated(cuda_device_index) / (1024.0**2)
+                    max(
+                        torch.cuda.max_memory_allocated(cuda_device_index)
+                        / (1024.0**2),
+                        float(head_runtime.get("peak_vram_mib", 0.0)),
+                    )
                     if cuda_device_index is not None
-                    else 0.0
+                    else float(head_runtime.get("peak_vram_mib", 0.0))
                 ),
                 "batch_size": int(args.batch_size),
                 "input_size": int(data_config["input_size"]),
             },
-            validation_selected_face_threshold=float(args.face_threshold),
             validation_selected_point_threshold=float(args.point_threshold),
+            face_score_candidate_floor=float(
+                cache_metadata["score_threshold"]
+            ),
         )
     print(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False))
     return 0

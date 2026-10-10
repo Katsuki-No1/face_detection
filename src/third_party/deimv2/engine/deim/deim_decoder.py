@@ -40,6 +40,9 @@ class TransformerDecoderLayer(nn.Module):
                  cross_attn_method='default',
                  layer_scale=None,
                  use_gateway=False,
+                 self_attention_fp32=False,
+                 global_context_attention=False,
+                 global_context_initial_gate=0.0,
                  ):
         super(TransformerDecoderLayer, self).__init__()
 
@@ -52,10 +55,23 @@ class TransformerDecoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = RMSNorm(d_model)
+        self.self_attention_fp32 = bool(self_attention_fp32)
 
         # cross attention
         self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points, method=cross_attn_method)
         self.dropout2 = nn.Dropout(dropout)
+        self.global_context_attention = bool(global_context_attention)
+        if self.global_context_attention:
+            self.global_context_attn = nn.MultiheadAttention(
+                d_model,
+                n_head,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.global_context_gate = nn.Parameter(
+                torch.tensor(float(global_context_initial_gate))
+            )
+            self.global_context_norm = RMSNorm(d_model)
 
         self.use_gateway = use_gateway
         if use_gateway:
@@ -77,12 +93,27 @@ class TransformerDecoderLayer(nn.Module):
                 value,
                 spatial_shapes,
                 attn_mask=None,
-                query_pos_embed=None):
+                query_pos_embed=None,
+                global_context=None):
 
         # self attention
         q = k = self.with_pos_embed(target, query_pos_embed)
 
-        target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
+        if self.self_attention_fp32:
+            # Some real validation frames produce finite encoder features above
+            # 100 in magnitude. FP16 QK products can overflow even though the
+            # attention result is representable, so keep only the self-attention
+            # kernel in FP32 and restore the surrounding AMP dtype afterwards.
+            with torch.autocast(device_type=target.device.type, enabled=False):
+                target2, _ = self.self_attn(
+                    q.float(),
+                    k.float(),
+                    value=target.float(),
+                    attn_mask=attn_mask,
+                )
+            target2 = target2.to(dtype=target.dtype)
+        else:
+            target2, _ = self.self_attn(q, k, value=target, attn_mask=attn_mask)
         target = target + self.dropout1(target2)
         target = self.norm1(target)
 
@@ -98,6 +129,28 @@ class TransformerDecoderLayer(nn.Module):
         else:
             target = target + self.dropout2(target2)
             target = self.norm2(target)
+
+        if self.global_context_attention:
+            if global_context is None:
+                raise ValueError(
+                    "global_context_attention requires Conv P6 memory"
+                )
+            # P6 activations can be large enough for FP16 QK products to
+            # overflow on real validation frames. Keep only this attention
+            # kernel in FP32, matching the protected DEIM self-attention path.
+            with torch.autocast(device_type=target.device.type, enabled=False):
+                global_result, _ = self.global_context_attn(
+                    self.with_pos_embed(target, query_pos_embed).float(),
+                    global_context.float(),
+                    global_context.float(),
+                    need_weights=False,
+                )
+            global_result = global_result.to(dtype=target.dtype)
+            target = (
+                target
+                + self.global_context_gate.to(dtype=target.dtype)
+                * self.dropout2(self.global_context_norm(global_result))
+            )
 
         # ffn
         target2 = self.swish_ffn(target)
@@ -117,7 +170,8 @@ class TransformerDecoder(nn.Module):
     """
 
     def __init__(self, hidden_dim, decoder_layer, decoder_layer_wide, num_layers, num_head, reg_max, reg_scale, up,
-                 eval_idx=-1, layer_scale=2, act='relu'):
+                 eval_idx=-1, layer_scale=2, act='relu', added_layer_start=None,
+                 added_layer_residual_gate=0.1):
         super(TransformerDecoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -128,6 +182,41 @@ class TransformerDecoder(nn.Module):
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(self.eval_idx + 1)] \
                     + [copy.deepcopy(decoder_layer_wide) for _ in range(num_layers - self.eval_idx - 1)])
         self.lqe_layers = nn.ModuleList([copy.deepcopy(LQE(4, 64, 2, reg_max, act=act)) for _ in range(num_layers)])
+        self.added_layer_start = (
+            None if added_layer_start is None else int(added_layer_start)
+        )
+        if self.added_layer_start is not None:
+            if not 0 < self.added_layer_start < num_layers:
+                raise ValueError(
+                    "added_layer_start must identify a non-empty suffix of decoder layers"
+                )
+            initial_gate = float(added_layer_residual_gate)
+            if not math.isfinite(initial_gate) or initial_gate < 0.0:
+                raise ValueError(
+                    "added_layer_residual_gate must be finite and non-negative"
+                )
+            self.added_layer_residual_gates = nn.ParameterDict(
+                {
+                    str(index): nn.Parameter(torch.tensor(initial_gate))
+                    for index in range(self.added_layer_start, num_layers)
+                }
+            )
+        else:
+            self.added_layer_residual_gates = None
+
+    def apply_added_layer_residual(
+        self,
+        index: int,
+        previous: torch.Tensor,
+        refined: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.added_layer_residual_gates is None:
+            return refined
+        key = str(index)
+        if key not in self.added_layer_residual_gates:
+            return refined
+        gate = self.added_layer_residual_gates[key].to(dtype=refined.dtype)
+        return previous + gate * (refined - previous)
 
     def value_op(self, memory, value_proj, value_scale, memory_mask, memory_spatial_shapes):
         """
@@ -160,7 +249,9 @@ class TransformerDecoder(nn.Module):
                 reg_scale,
                 attn_mask=None,
                 memory_mask=None,
-                dn_meta=None):
+                dn_meta=None,
+                query_conditioner=None,
+                global_context=None):
         output = target
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
@@ -177,8 +268,25 @@ class TransformerDecoder(nn.Module):
         ref_points_detach = F.sigmoid(ref_points_unact)
         query_pos_embed = query_pos_head(ref_points_detach).clamp(min=-10, max=10)
 
+        # Optional architecture-owned conditioning.  The DEIM module owns no
+        # parameters for this path, so omitting the callback preserves the
+        # historical computation and state-dict contract exactly.  The
+        # callback may change query content and may provide a separate
+        # deformable-attention reference; box refinement continues to use
+        # ``ref_points_detach`` below.
+        search_reference = ref_points_detach
+        if query_conditioner is not None:
+            output, search_reference = query_conditioner(
+                stage_index=0,
+                content=output,
+                face_reference=ref_points_detach,
+                dn_meta=dn_meta,
+                final=False,
+            )
+
         for i, layer in enumerate(self.layers):
-            ref_points_input = ref_points_detach.unsqueeze(2)
+            eval_terminal = not self.training and i == self.eval_idx
+            ref_points_input = search_reference.unsqueeze(2)
 
             if i >= self.eval_idx + 1 and self.layer_scale > 1:
                 query_pos_embed = F.interpolate(query_pos_embed, scale_factor=self.layer_scale)
@@ -186,7 +294,19 @@ class TransformerDecoder(nn.Module):
                 output = F.interpolate(output, size=query_pos_embed.shape[-1])
                 output_detach = output.detach()
 
-            output = layer(output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed)
+            previous_output = output
+            refined_output = layer(
+                output,
+                ref_points_input,
+                value,
+                spatial_shapes,
+                attn_mask,
+                query_pos_embed,
+                global_context,
+            )
+            output = self.apply_added_layer_residual(
+                i, previous_output, refined_output
+            )
 
             if i == 0 :
                 # Initial bounding box predictions with inverse sigmoid refinement
@@ -207,11 +327,22 @@ class TransformerDecoder(nn.Module):
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
 
-                if not self.training:
+                if not self.training and query_conditioner is None:
                     break
 
             pred_corners_undetach = pred_corners
             ref_points_detach = inter_ref_bbox.detach()
+            search_reference = ref_points_detach
+            if query_conditioner is not None:
+                output, search_reference = query_conditioner(
+                    stage_index=i + 1,
+                    content=output,
+                    face_reference=ref_points_detach,
+                    dn_meta=dn_meta,
+                    final=eval_terminal or i + 1 == len(self.layers),
+                )
+            if eval_terminal:
+                break
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
@@ -252,6 +383,13 @@ class DEIMTransformer(nn.Module):
                  use_gateway=True,
                  share_bbox_head=False,
                  share_score_head=False,
+                 added_layer_start=None,
+                 added_layer_residual_gate=0.1,
+                 zero_added_bbox_output=False,
+                 copy_added_score_head=False,
+                 self_attention_fp32=False,
+                 global_context_attention=False,
+                 global_context_initial_gate=0.0,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -272,6 +410,12 @@ class DEIMTransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.added_layer_start = (
+            None if added_layer_start is None else int(added_layer_start)
+        )
+        self.zero_added_bbox_output = bool(zero_added_bbox_output)
+        self.copy_added_score_head = bool(copy_added_score_head)
+        self.global_context_attention = bool(global_context_attention)
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -289,11 +433,36 @@ class DEIMTransformer(nn.Module):
         self.up = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
         self.reg_scale = nn.Parameter(torch.tensor([reg_scale]), requires_grad=False)
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
-            activation, num_levels, num_points, cross_attn_method=cross_attn_method, use_gateway=use_gateway)
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method, use_gateway=use_gateway,
+            self_attention_fp32=self_attention_fp32,
+            global_context_attention=self.global_context_attention,
+            global_context_initial_gate=global_context_initial_gate)
         decoder_layer_wide = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
-            activation, num_levels, num_points, cross_attn_method=cross_attn_method, layer_scale=layer_scale, use_gateway=use_gateway)
+            activation, num_levels, num_points, cross_attn_method=cross_attn_method, layer_scale=layer_scale, use_gateway=use_gateway,
+            self_attention_fp32=self_attention_fp32,
+            global_context_attention=self.global_context_attention,
+            global_context_initial_gate=global_context_initial_gate)
         self.decoder = TransformerDecoder(hidden_dim, decoder_layer, decoder_layer_wide, num_layers, nhead,
-                                          reg_max, self.reg_scale, self.up, eval_idx, layer_scale, act=activation)
+                                          reg_max, self.reg_scale, self.up, eval_idx, layer_scale, act=activation,
+                                          added_layer_start=self.added_layer_start,
+                                          added_layer_residual_gate=added_layer_residual_gate)
+        if self.global_context_attention:
+            source_channels = int(feat_channels[-1])
+            groups = 8 if source_channels % 8 == 0 else 1
+            self.global_context_projection = nn.Sequential(
+                nn.Conv2d(
+                    source_channels,
+                    source_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    groups=source_channels,
+                    bias=False,
+                ),
+                nn.GroupNorm(groups, source_channels),
+                nn.GELU(),
+                nn.Conv2d(source_channels, hidden_dim, kernel_size=1, bias=False),
+            )
       # denoising
         self.num_denoising = num_denoising
         self.label_noise_ratio = label_noise_ratio
@@ -342,6 +511,45 @@ class DEIMTransformer(nn.Module):
 
 
         self._reset_parameters(feat_channels)
+
+    def apply_added_layer_initialization(self):
+        """Finalize output-preserving initialization after checkpoint expansion."""
+
+        start = self.added_layer_start
+        if start is None:
+            return {
+                "applied": False,
+                "added_layer_indices": [],
+                "zeroed_bbox_output_layers": [],
+                "copied_score_head_layers": [],
+            }
+
+        added_indices = list(range(start, self.num_layers))
+        zeroed_bbox = []
+        copied_score = []
+        source_index = start - 1
+        with torch.no_grad():
+            for index in added_indices:
+                if self.copy_added_score_head:
+                    self.dec_score_head[index].load_state_dict(
+                        self.dec_score_head[source_index].state_dict()
+                    )
+                    copied_score.append(index)
+                if self.zero_added_bbox_output:
+                    bbox_head = self.dec_bbox_head[index]
+                    if not hasattr(bbox_head, 'layers'):
+                        raise TypeError(
+                            f"Decoder bbox head {index} does not expose an MLP layers list"
+                        )
+                    init.constant_(bbox_head.layers[-1].weight, 0)
+                    init.constant_(bbox_head.layers[-1].bias, 0)
+                    zeroed_bbox.append(index)
+        return {
+            "applied": True,
+            "added_layer_indices": added_indices,
+            "zeroed_bbox_output_layers": zeroed_bbox,
+            "copied_score_head_layers": copied_score,
+        }
 
     def convert_to_deploy(self):
         self.dec_score_head = nn.ModuleList([nn.Identity()] * (self.eval_idx) + [self.dec_score_head[self.eval_idx]])
@@ -425,6 +633,28 @@ class DEIMTransformer(nn.Module):
         feat_flatten = torch.concat(feat_flatten, 1)
         return feat_flatten, spatial_shapes
 
+    @staticmethod
+    def _flatten_feature_padding_masks(
+        feats: List[torch.Tensor],
+        feature_padding_masks=None,
+    ):
+        if feature_padding_masks is None:
+            return None
+        if len(feature_padding_masks) != len(feats):
+            raise ValueError(
+                "feature_padding_masks must align with decoder feature levels"
+            )
+        flattened = []
+        for feature, mask in zip(feats, feature_padding_masks):
+            mask = mask.to(device=feature.device, dtype=torch.bool)
+            expected = (feature.shape[0], feature.shape[-2], feature.shape[-1])
+            if tuple(mask.shape) != tuple(expected):
+                raise ValueError(
+                    f"feature padding mask {tuple(mask.shape)} does not match {tuple(expected)}"
+                )
+            flattened.append(mask.flatten(1))
+        return torch.concat(flattened, dim=1)
+
     def _generate_anchors(self,
                           spatial_shapes=None,
                           grid_size=0.05,
@@ -457,7 +687,8 @@ class DEIMTransformer(nn.Module):
                            memory: torch.Tensor,
                            spatial_shapes,
                            denoising_logits=None,
-                           denoising_bbox_unact=None):
+                           denoising_bbox_unact=None,
+                           memory_padding_mask=None):
 
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
@@ -470,11 +701,25 @@ class DEIMTransformer(nn.Module):
         # avoiding a Python branch that legacy ONNX tracing would freeze at
         # the example batch size.
         anchors = anchors.expand(memory.shape[0], -1, -1)
+        valid_mask = valid_mask.expand(memory.shape[0], -1, -1)
+        if memory_padding_mask is not None:
+            memory_padding_mask = memory_padding_mask.to(
+                device=memory.device, dtype=torch.bool
+            )
+            if tuple(memory_padding_mask.shape) != tuple(memory.shape[:2]):
+                raise ValueError(
+                    f"memory_padding_mask {tuple(memory_padding_mask.shape)} does not match "
+                    f"memory {tuple(memory.shape[:2])}"
+                )
+            valid_mask = valid_mask & ~memory_padding_mask.unsqueeze(-1)
 
         # memory = torch.where(valid_mask, memory, 0)
         memory = valid_mask.to(memory.dtype) * memory
 
         enc_outputs_logits :torch.Tensor = self.enc_score_head(memory)
+        enc_outputs_logits = enc_outputs_logits.masked_fill(
+            ~valid_mask, torch.finfo(enc_outputs_logits.dtype).min
+        )
 
         # select topk queries
         enc_topk_memory, enc_topk_logits, enc_topk_anchors = \
@@ -525,9 +770,26 @@ class DEIMTransformer(nn.Module):
 
         return topk_memory, topk_logits, topk_anchors
 
-    def forward(self, feats, targets=None):
+    def forward(
+        self,
+        feats,
+        targets=None,
+        feature_padding_masks=None,
+        query_conditioner=None,
+    ):
         # input projection and embedding
         memory, spatial_shapes = self._get_encoder_input(feats)
+        global_context = (
+            self.global_context_projection(feats[-1])
+            .flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+            if self.global_context_attention
+            else None
+        )
+        memory_padding_mask = self._flatten_feature_padding_masks(
+            feats, feature_padding_masks
+        )
 
         # prepare denoising training
         if self.training and self.num_denoising > 0:
@@ -544,7 +806,13 @@ class DEIMTransformer(nn.Module):
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+            self._get_decoder_input(
+                memory,
+                spatial_shapes,
+                denoising_logits,
+                denoising_bbox_unact,
+                memory_padding_mask,
+            )
 
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
@@ -560,7 +828,9 @@ class DEIMTransformer(nn.Module):
             self.up,
             self.reg_scale,
             attn_mask=attn_mask,
-            dn_meta=dn_meta)
+            dn_meta=dn_meta,
+            query_conditioner=query_conditioner,
+            global_context=global_context)
 
         if self.training and dn_meta is not None:
             # the output from the first decoder layer, only one

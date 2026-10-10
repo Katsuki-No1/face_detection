@@ -10,6 +10,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .letterbox import letterbox_image, transform_target
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 FACE_KEYPOINT_NAMES = ("left_eye", "right_eye", "nose", "left_mouth", "right_mouth")
@@ -118,9 +120,26 @@ def _resize_image_and_target(
     image: Image.Image,
     target: dict[str, Any],
     image_size: int | tuple[int, int] | None,
+    *,
+    resize_mode: str = "stretch",
+    pad_color: int | tuple[int, int, int] | list[int] | None = None,
+    size_divisor: int = 32,
 ) -> tuple[Image.Image, dict[str, Any]]:
     if image_size is None:
         return image, target
+    resize_mode = str(resize_mode).lower()
+    if resize_mode == "letterbox":
+        canvas, geometry, padding_mask = letterbox_image(
+            image,
+            image_size,
+            pad_color=pad_color,
+            divisor=size_divisor,
+        )
+        return canvas, transform_target(target, geometry, padding_mask=padding_mask)
+    if resize_mode != "stretch":
+        raise ValueError(
+            f"resize_mode must be 'stretch' or 'letterbox', got {resize_mode!r}"
+        )
     if isinstance(image_size, int):
         new_h = new_w = int(image_size)
     else:
@@ -168,6 +187,8 @@ def _tensor_target(
     labels: list[int] | None = None,
     keypoints: list[list[list[float]]],
     keypoint_mask: list[list[bool]],
+    keypoint_visibility: list[list[int]] | None = None,
+    face_visibility: list[int] | None = None,
     image_id: str,
     height: int,
     width: int,
@@ -184,6 +205,23 @@ def _tensor_target(
     ellipse_tensor = torch.as_tensor(ellipse_values, dtype=torch.float32).reshape(box_tensor.shape[0], 5)
     kpt_tensor = torch.as_tensor(keypoints, dtype=torch.float32).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES), 2)
     mask_tensor = torch.as_tensor(keypoint_mask, dtype=torch.bool).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES))
+    if keypoint_visibility is None:
+        keypoint_visibility_tensor = mask_tensor.to(dtype=torch.long) * 2
+    else:
+        keypoint_visibility_tensor = torch.as_tensor(
+            keypoint_visibility, dtype=torch.long
+        ).reshape(box_tensor.shape[0], len(FACE_KEYPOINT_NAMES))
+        if not bool(((0 <= keypoint_visibility_tensor) & (keypoint_visibility_tensor <= 2)).all()):
+            raise ValueError("keypoint_visibility values must use COCO states 0, 1, or 2")
+    if face_visibility is None:
+        face_visibility_tensor = torch.full((box_tensor.shape[0],), 2, dtype=torch.long)
+    else:
+        face_visibility_tensor = torch.as_tensor(face_visibility, dtype=torch.long).reshape(-1)
+        if face_visibility_tensor.numel() != box_tensor.shape[0]:
+            raise ValueError(
+                "face_visibility length must match boxes: "
+                f"visibility={face_visibility_tensor.numel()}, boxes={box_tensor.shape[0]}"
+            )
     if labels is None:
         label_tensor = torch.ones((box_tensor.shape[0],), dtype=torch.long)
     else:
@@ -196,6 +234,8 @@ def _tensor_target(
         "labels": label_tensor,
         "keypoints": kpt_tensor,
         "keypoint_mask": mask_tensor,
+        "keypoint_visibility": keypoint_visibility_tensor,
+        "face_visibility": face_visibility_tensor,
         "image_id": str(image_id),
         "orig_size": (int(height), int(width)),
         "size": (int(height), int(width)),
@@ -248,13 +288,20 @@ def _parse_yolo_label(
     label_path: Path,
     width: int,
     height: int,
-) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]], list[list[float]]]:
+) -> tuple[
+    list[list[float]],
+    list[list[list[float]]],
+    list[list[bool]],
+    list[list[float]],
+    list[list[int]],
+]:
     boxes: list[list[float]] = []
     keypoints: list[list[list[float]]] = []
     keypoint_mask: list[list[bool]] = []
     ellipses: list[list[float]] = []
+    keypoint_visibility: list[list[int]] = []
     if not label_path.exists():
-        return boxes, keypoints, keypoint_mask, ellipses
+        return boxes, keypoints, keypoint_mask, ellipses, keypoint_visibility
     for line in label_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -274,17 +321,21 @@ def _parse_yolo_label(
         raw_keypoints = values[5:]
         sample_keypoints: list[list[float]] = []
         sample_mask: list[bool] = []
+        sample_visibility: list[int] = []
         for index in range(len(FACE_KEYPOINT_NAMES)):
             offset = index * 3
             if offset + 2 >= len(raw_keypoints) or raw_keypoints[offset + 2] <= 0:
                 sample_keypoints.append([0.0, 0.0])
                 sample_mask.append(False)
+                sample_visibility.append(0)
                 continue
             sample_keypoints.append([raw_keypoints[offset] * width, raw_keypoints[offset + 1] * height])
             sample_mask.append(True)
+            sample_visibility.append(min(2, max(1, int(round(raw_keypoints[offset + 2])))))
         keypoints.append(sample_keypoints)
         keypoint_mask.append(sample_mask)
-    return boxes, keypoints, keypoint_mask, ellipses
+        keypoint_visibility.append(sample_visibility)
+    return boxes, keypoints, keypoint_mask, ellipses, keypoint_visibility
 
 
 def _record_image_path(record: dict[str, Any], image_root: Path | None) -> Path:
@@ -297,11 +348,14 @@ def _record_image_path(record: dict[str, Any], image_root: Path | None) -> Path:
     return Path(str(record.get("image_path", record.get("image_name", ""))))
 
 
-def _object_keypoints_from_metadata(meta_object: dict[str, Any] | None) -> tuple[list[list[float]], list[bool]]:
+def _object_keypoints_from_metadata(
+    meta_object: dict[str, Any] | None,
+) -> tuple[list[list[float]], list[bool], list[int]]:
     sample_keypoints = [[0.0, 0.0] for _ in FACE_KEYPOINT_NAMES]
     sample_mask = [False for _ in FACE_KEYPOINT_NAMES]
+    sample_visibility = [0 for _ in FACE_KEYPOINT_NAMES]
     if not meta_object:
-        return sample_keypoints, sample_mask
+        return sample_keypoints, sample_mask, sample_visibility
     source_names = YOLO_KEYPOINT_NAMES
     points = meta_object.get("keypoints", {})
     for target_index, source_name in enumerate(source_names):
@@ -310,14 +364,22 @@ def _object_keypoints_from_metadata(meta_object: dict[str, Any] | None) -> tuple
             continue
         sample_keypoints[target_index] = [float(point.get("x", 0.0)), float(point.get("y", 0.0))]
         sample_mask[target_index] = True
-    return sample_keypoints, sample_mask
+        sample_visibility[target_index] = min(2, max(1, int(point.get("v", 2))))
+    return sample_keypoints, sample_mask, sample_visibility
 
 
 def _metadata_objects_to_targets(
     metadata: dict[str, Any] | None,
     width: int,
     height: int,
-) -> tuple[list[list[float]], list[list[list[float]]], list[list[bool]], list[list[float]]] | None:
+) -> tuple[
+    list[list[float]],
+    list[list[list[float]]],
+    list[list[bool]],
+    list[list[float]],
+    list[list[int]],
+    list[int],
+] | None:
     if not metadata:
         return None
     objects = metadata.get("objects", [])
@@ -327,6 +389,8 @@ def _metadata_objects_to_targets(
     keypoints: list[list[list[float]]] = []
     keypoint_mask: list[list[bool]] = []
     ellipses: list[list[float]] = []
+    keypoint_visibility: list[list[int]] = []
+    face_visibility: list[int] = []
     for item in objects:
         if not isinstance(item, dict):
             continue
@@ -344,14 +408,17 @@ def _metadata_objects_to_targets(
         clipped = clip_xyxy(raw_box, width, height)
         if clipped is None:
             continue
-        sample_keypoints, sample_mask = _object_keypoints_from_metadata(item)
+        sample_keypoints, sample_mask, sample_visibility = _object_keypoints_from_metadata(item)
         boxes.append(clipped)
         ellipses.append(ellipse)
         keypoints.append(sample_keypoints)
         keypoint_mask.append(sample_mask)
+        keypoint_visibility.append(sample_visibility)
+        face_meta = item.get("face", {}) if isinstance(item.get("face"), dict) else {}
+        face_visibility.append(1 if bool(item.get("occluded", face_meta.get("occluded", False))) else 2)
     if not boxes:
         return None
-    return boxes, keypoints, keypoint_mask, ellipses
+    return boxes, keypoints, keypoint_mask, ellipses, keypoint_visibility, face_visibility
 
 
 class FaceKeypointDataset(Dataset):
@@ -367,6 +434,9 @@ class FaceKeypointDataset(Dataset):
         image_root: str | Path | None = None,
         metadata_path: str | Path | None = None,
         image_size: int | tuple[int, int] | None = None,
+        resize_mode: str = "stretch",
+        pad_color: int | tuple[int, int, int] | list[int] | None = None,
+        size_divisor: int = 32,
         include_negative: bool = True,
         category_ids: list[int] | tuple[int, ...] | None = None,
     ) -> None:
@@ -376,6 +446,9 @@ class FaceKeypointDataset(Dataset):
         self.annotation_format = annotation_format
         self.image_root = Path(image_root) if image_root else None
         self.image_size = image_size
+        self.resize_mode = str(resize_mode).lower()
+        self.pad_color = pad_color
+        self.size_divisor = int(size_divisor)
         self.include_negative = bool(include_negative)
         self.category_ids = {int(value) for value in category_ids} if category_ids is not None else None
         self.samples = self._build_samples(metadata_path)
@@ -450,15 +523,18 @@ class FaceKeypointDataset(Dataset):
         image = Image.open(sample["image_path"]).convert("RGB")
         width, height = image.size
         if sample["format"] == "yolo":
-            boxes, keypoints, keypoint_mask, ellipses = _parse_yolo_label(sample["label_path"], width, height)
+            boxes, keypoints, keypoint_mask, ellipses, keypoint_visibility = _parse_yolo_label(sample["label_path"], width, height)
+            face_visibility = [2 for _ in boxes]
             metadata_targets = _metadata_objects_to_targets(sample.get("metadata"), width, height)
             if metadata_targets is not None and len(metadata_targets[0]) == len(boxes):
-                boxes, keypoints, keypoint_mask, ellipses = metadata_targets
+                boxes, keypoints, keypoint_mask, ellipses, keypoint_visibility, face_visibility = metadata_targets
             target = _tensor_target(
                 boxes=boxes,
                 ellipses=ellipses,
                 keypoints=keypoints,
                 keypoint_mask=keypoint_mask,
+                keypoint_visibility=keypoint_visibility,
+                face_visibility=face_visibility,
                 image_id=sample["image_id"],
                 height=height,
                 width=width,
@@ -469,7 +545,14 @@ class FaceKeypointDataset(Dataset):
         else:
             target = self._target_from_cvat_sample(sample, width, height)
 
-        image, target = _resize_image_and_target(image, target, self.image_size)
+        image, target = _resize_image_and_target(
+            image,
+            target,
+            self.image_size,
+            resize_mode=self.resize_mode,
+            pad_color=self.pad_color,
+            size_divisor=self.size_divisor,
+        )
         return _image_to_tensor(image), target
 
     def _target_from_coco_sample(self, sample: dict[str, Any], width: int, height: int) -> dict[str, Any]:
@@ -478,6 +561,8 @@ class FaceKeypointDataset(Dataset):
         labels: list[int] = []
         keypoints: list[list[list[float]]] = []
         keypoint_mask: list[list[bool]] = []
+        keypoint_visibility: list[list[int]] = []
+        face_visibility: list[int] = []
         metadata = {"annotations": sample.get("annotations", [])}
         for annotation in sample.get("annotations", []):
             bbox = annotation.get("bbox")
@@ -504,22 +589,34 @@ class FaceKeypointDataset(Dataset):
             raw = annotation.get("keypoints", [])
             sample_keypoints = []
             sample_mask = []
+            sample_visibility = []
             for point_index in range(len(FACE_KEYPOINT_NAMES)):
                 offset = point_index * 3
                 if offset + 2 >= len(raw) or raw[offset + 2] <= 0:
                     sample_keypoints.append([0.0, 0.0])
                     sample_mask.append(False)
+                    sample_visibility.append(0)
                     continue
                 sample_keypoints.append([float(raw[offset]), float(raw[offset + 1])])
                 sample_mask.append(True)
+                sample_visibility.append(min(2, max(1, int(raw[offset + 2]))))
             keypoints.append(sample_keypoints)
             keypoint_mask.append(sample_mask)
+            keypoint_visibility.append(sample_visibility)
+            attributes = annotation.get("attributes", {})
+            face_visibility.append(
+                1
+                if isinstance(attributes, dict) and bool(attributes.get("face_occluded", False))
+                else 2
+            )
         return _tensor_target(
             boxes=boxes,
             ellipses=ellipses,
             labels=labels,
             keypoints=keypoints,
             keypoint_mask=keypoint_mask,
+            keypoint_visibility=keypoint_visibility,
+            face_visibility=face_visibility,
             image_id=str(sample["image_id"]),
             height=height,
             width=width,
@@ -532,6 +629,8 @@ class FaceKeypointDataset(Dataset):
         ellipses: list[list[float]] = []
         keypoints: list[list[list[float]]] = []
         keypoint_mask: list[list[bool]] = []
+        keypoint_visibility: list[list[int]] = []
+        face_visibility: list[int] = []
         ellipse_metadata: list[dict[str, Any] | None] = []
 
         objects = record.get("objects", [])
@@ -562,9 +661,12 @@ class FaceKeypointDataset(Dataset):
             else:
                 x1, y1, x2, y2 = raw_box
                 ellipses.append([(x1 + x2) * 0.5, (y1 + y2) * 0.5, abs(x2 - x1) * 0.5, abs(y2 - y1) * 0.5, 0.0])
-            sample_keypoints, sample_mask = _object_keypoints_from_metadata(item if objects else None)
+            sample_keypoints, sample_mask, sample_visibility = _object_keypoints_from_metadata(item if objects else None)
             keypoints.append(sample_keypoints)
             keypoint_mask.append(sample_mask)
+            keypoint_visibility.append(sample_visibility)
+            face_meta = item.get("face", {}) if isinstance(item.get("face"), dict) else {}
+            face_visibility.append(1 if bool(item.get("occluded", face_meta.get("occluded", False))) else 2)
             ellipse_metadata.append(ellipse_meta)
 
         if not boxes and not self.include_negative:
@@ -574,6 +676,8 @@ class FaceKeypointDataset(Dataset):
             ellipses=ellipses,
             keypoints=keypoints,
             keypoint_mask=keypoint_mask,
+            keypoint_visibility=keypoint_visibility,
+            face_visibility=face_visibility,
             image_id=str(sample["image_id"]),
             height=height,
             width=width,
@@ -588,26 +692,36 @@ class FaceKeypointDataset(Dataset):
 class SyntheticFaceKeypointDataset(Dataset):
     """Tiny in-memory dataset for smoke tests when real data is unavailable."""
 
-    def __init__(self, *, length: int = 2, image_size: int = 56, positive: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        length: int = 2,
+        image_size: int | tuple[int, int] = 56,
+        positive: bool = True,
+    ) -> None:
         self.length = int(length)
-        self.image_size = int(image_size)
+        self.image_size = image_size
         self.positive = bool(positive)
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, Any]]:
-        image = torch.zeros((3, self.image_size, self.image_size), dtype=torch.float32)
+        if isinstance(self.image_size, int):
+            height = width = int(self.image_size)
+        else:
+            height, width = int(self.image_size[0]), int(self.image_size[1])
+        image = torch.zeros((3, height, width), dtype=torch.float32)
         if not self.positive or index % 2 == 1:
-            return image, _empty_target(f"synthetic_{index}", self.image_size, self.image_size)
-        box = [[self.image_size * 0.3, self.image_size * 0.25, self.image_size * 0.7, self.image_size * 0.75]]
+            return image, _empty_target(f"synthetic_{index}", height, width)
+        box = [[width * 0.3, height * 0.25, width * 0.7, height * 0.75]]
         keypoints = [
             [
-                [self.image_size * 0.42, self.image_size * 0.43],
-                [self.image_size * 0.58, self.image_size * 0.43],
-                [self.image_size * 0.50, self.image_size * 0.53],
-                [self.image_size * 0.44, self.image_size * 0.63],
-                [self.image_size * 0.56, self.image_size * 0.63],
+                [width * 0.42, height * 0.43],
+                [width * 0.58, height * 0.43],
+                [width * 0.50, height * 0.53],
+                [width * 0.44, height * 0.63],
+                [width * 0.56, height * 0.63],
             ]
         ]
         return image, _tensor_target(
@@ -615,8 +729,8 @@ class SyntheticFaceKeypointDataset(Dataset):
             keypoints=keypoints,
             keypoint_mask=[[True, True, True, True, True]],
             image_id=f"synthetic_{index}",
-            height=self.image_size,
-            width=self.image_size,
+            height=height,
+            width=width,
             metadata={"synthetic": True},
         )
 

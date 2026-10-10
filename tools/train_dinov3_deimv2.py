@@ -21,6 +21,7 @@ import train_dino as train_impl  # noqa: E402
 try:  # Support both `python tools/...py` and package-style imports in tests.
     from .dinov3_deimv2_common import (
         load_config,
+        resolved_config_sha256,
         resolve_data_paths,
         run_configured_leakage_audit,
         save_run_context,
@@ -28,6 +29,7 @@ try:  # Support both `python tools/...py` and package-style imports in tests.
 except ImportError:
     from dinov3_deimv2_common import (  # type: ignore[no-redef]
         load_config,
+        resolved_config_sha256,
         resolve_data_paths,
         run_configured_leakage_audit,
         save_run_context,
@@ -71,8 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-train-batches", type=int, default=None)
+    parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--val-every", type=int, default=None, help="Run validation every N epochs; 0 disables it.")
@@ -81,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-score-min", type=float, default=None)
     parser.add_argument("--val-max-images", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--batch-plan",
+        type=Path,
+        help="Resolved preflight plan recorded in the training config and W&B.",
+    )
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--tiny-model", action="store_true")
     parser.add_argument("--allow-dummy-backbone", action="store_true")
@@ -91,6 +100,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
+    config_sha256 = resolved_config_sha256(config)
     config, force_synthetic_from_paths = resolve_data_paths(config, args.data_root, split="train")
     if args.seed is not None:
         config.setdefault("train", {})["seed"] = int(args.seed)
@@ -98,6 +108,47 @@ def main() -> int:
         config.setdefault("train", {})["epochs"] = int(args.epochs)
     if args.batch_size is not None:
         config.setdefault("train", {})["batch_size"] = int(args.batch_size)
+    gradient_accumulation_steps = getattr(
+        args, "gradient_accumulation_steps", None
+    )
+    if gradient_accumulation_steps is not None:
+        if gradient_accumulation_steps <= 0:
+            raise ValueError("--gradient-accumulation-steps must be positive")
+        config.setdefault("train", {})["gradient_accumulation_steps"] = int(
+            gradient_accumulation_steps
+        )
+    batch_plan = getattr(args, "batch_plan", None)
+    if batch_plan is not None:
+        batch_plan_path = batch_plan.resolve()
+        batch_plan_payload = json.loads(
+            batch_plan_path.read_text(encoding="utf-8")
+        )
+        if batch_plan_payload.get("status") != "passed":
+            raise RuntimeError("Batch plan has not passed")
+        compatible_hashes = {
+            batch_plan_payload.get("resolved_config_sha256"),
+            batch_plan_payload.get("probe_resolved_config_sha256"),
+        }
+        if config_sha256 not in compatible_hashes:
+            raise RuntimeError(
+                "Batch plan was produced for a different resolved config"
+            )
+        config.setdefault("train", {})["resolved_batch_plan_path"] = str(
+            batch_plan_path
+        )
+        config["train"]["resolved_batch_plan"] = batch_plan_payload
+        selected = dict(batch_plan_payload["selected"])
+        if args.batch_size is None:
+            config["train"]["batch_size"] = int(selected["microbatch"])
+        if gradient_accumulation_steps is None:
+            config["train"]["gradient_accumulation_steps"] = int(
+                selected["accumulation_steps"]
+            )
+        runtime_attempts = args.output_dir / "runtime_batch_attempts.json"
+        if str(config.get("model", {}).get("type", "")).startswith("dinov3_codino_official") and runtime_attempts.is_file():
+            # Keep prior failures and the current effective batch in resolved
+            # config/W&B as well as the launcher's local recovery record.
+            config["train"]["runtime_batch_attempts"] = json.loads(runtime_attempts.read_text())
     if args.num_workers is not None:
         config.setdefault("train", {})["num_workers"] = int(args.num_workers)
     if args.val_every is not None:
@@ -153,6 +204,13 @@ def main() -> int:
             if args.dry_run:
                 return train_impl.dry_run(config, device=str(device), force_synthetic=force_synthetic)
             wandb_run = train_impl.init_training_wandb(config, args, output_dir=args.output_dir)
+            if wandb_run is not None and "runtime_batch_attempts" in config.get("train", {}):
+                wandb_run.config.update({
+                    "runtime_batch_attempts": config["train"]["runtime_batch_attempts"],
+                    "resolved_batch_plan": config["train"]["resolved_batch_plan"],
+                    "batch_size": config["train"]["batch_size"],
+                    "gradient_accumulation_steps": config["train"]["gradient_accumulation_steps"],
+                }, allow_val_change=True)
             try:
                 result = train_impl.train(
                     config,
@@ -163,6 +221,7 @@ def main() -> int:
                     save_every=int(args.save_every if args.save_every is not None else config.get("train", {}).get("checkpoint_every", 10)),
                     use_amp=train_impl.resolve_amp(config, args.amp) and torch.cuda.is_available(),
                     max_train_batches=args.max_train_batches,
+                    max_train_samples=args.max_train_samples,
                     allow_dummy_backbone=allow_dummy_backbone,
                     wandb_run=wandb_run,
                 )

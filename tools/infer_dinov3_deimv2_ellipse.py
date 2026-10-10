@@ -21,7 +21,8 @@ from dinov3_deimv2_common import (  # noqa: E402
     class_names,
     ensure_output_dir,
     image_paths,
-    image_to_tensor,
+    parse_image_size,
+    prepare_image_tensor,
     load_checkpoint,
     load_config,
     save_run_context,
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--image-size", default=None, help="INT or HEIGHTxWIDTH")
     parser.add_argument("--score-thr", type=float, default=0.30)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--draw-boxes", action="store_true")
@@ -112,7 +113,13 @@ def main() -> int:
     config = load_config(args.config)
     save_run_context(output_dir, config)
     device = args.device if torch.cuda.is_available() or not str(args.device).startswith("cuda") else "cpu"
-    image_size = int(args.image_size or config.get("data", {}).get("image_size", 960))
+    data_cfg = dict(config.get("data", {}) or {})
+    image_size = parse_image_size(args.image_size or data_cfg.get("image_size", 960))
+    if image_size is None:
+        raise ValueError("image_size must be configured")
+    resize_mode = str(data_cfg.get("resize_mode", "stretch"))
+    pad_color = data_cfg.get("pad_color")
+    size_divisor = int(data_cfg.get("size_divisor", 32))
     names = class_names(config)
     coco_ids = category_ids(config)
 
@@ -130,10 +137,28 @@ def main() -> int:
     visual_dir = output_dir / "visualizations"
     for image_path in image_paths(args.input):
         image = Image.open(image_path).convert("RGB")
-        tensor, input_hw, original_hw = image_to_tensor(image, image_size)
+        tensor, input_hw, original_hw, geometry, padding_mask = prepare_image_tensor(
+            image,
+            image_size,
+            resize_mode=resize_mode,
+            pad_color=pad_color,
+            size_divisor=size_divisor,
+        )
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
-            detections = model(tensor.to(device))[0]
-        detections = scale_detections_to_original(detections, input_hw=input_hw, original_hw=original_hw)
+            detections = model(
+                tensor.to(device),
+                padding_mask=(
+                    padding_mask.unsqueeze(0).to(device)
+                    if padding_mask is not None
+                    else None
+                ),
+            )[0]
+        detections = scale_detections_to_original(
+            detections,
+            input_hw=input_hw,
+            original_hw=original_hw,
+            geometry=geometry,
+        )
         rows = detection_records(image_path.name, detections, names, coco_ids)
         predictions.extend(rows)
         save_overlay(visual_dir / image_path.name, image.copy(), rows, draw_boxes=bool(args.draw_boxes))

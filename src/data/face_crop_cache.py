@@ -120,9 +120,9 @@ def load_detector_prediction_cache(
     predictions = value.get("predictions")
     if not isinstance(metadata, dict) or not isinstance(predictions, dict):
         raise RuntimeError(f"Invalid detector crop cache schema: {cache_path}")
-    if metadata.get("crop_geometry") != "ellipse_aligned":
+    if metadata.get("crop_geometry") not in {"ellipse", "ellipse_aligned"}:
         raise RuntimeError(
-            f"Crop cache must be ellipse_aligned, got "
+            f"Crop cache must provide ellipse geometry, got "
             f"{metadata.get('crop_geometry')!r}: {cache_path}"
         )
     return metadata, {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -202,7 +203,18 @@ class DINOv3STABackbone(nn.Module):
         )
         return outputs, high_resolution
 
-    def _semantic_features(self, images: torch.Tensor) -> list[torch.Tensor]:
+    def _semantic_features_with_final_stride16(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Return the STA semantic pyramid and the final DINO stride-16 map.
+
+        The three STA levels are built from blocks 3, 7, and 11 and are then
+        rescaled to strides 8, 16, and 32.  The Co-DINO HEAD must instead see
+        the unscaled block-11 map, matching the standalone HEAD backbone's
+        ``x_norm_patchtokens`` contract.  Both outputs come from this one DINO
+        invocation.
+        """
         grid_h = int(images.shape[-2]) // self.patch_size[0]
         grid_w = int(images.shape[-1]) // self.patch_size[1]
         raw_dino = self.dino.backbone
@@ -230,6 +242,7 @@ class DINOv3STABackbone(nn.Module):
 
         if len(base_features) != 3:
             raise ValueError(f"DEIMv2 STA expects exactly 3 DINO feature levels, got {len(base_features)}")
+        final_stride16 = base_features[-1]
         num_scales = len(base_features) - 2
         sem_feats: list[torch.Tensor] = []
         for index, feature in enumerate(base_features):
@@ -237,7 +250,38 @@ class DINOv3STABackbone(nn.Module):
             target_h = max(1, int(grid_h * scale))
             target_w = max(1, int(grid_w * scale))
             sem_feats.append(F.interpolate(feature, size=(target_h, target_w), mode="bilinear", align_corners=False))
-        return sem_feats
+        return sem_feats, final_stride16
+
+    def _semantic_features(self, images: torch.Tensor) -> list[torch.Tensor]:
+        semantic_features, _final_stride16 = (
+            self._semantic_features_with_final_stride16(images)
+        )
+        return semantic_features
+
+    def _forward_feature_bundle(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(f"Expected images with shape [B, 3, H, W], got {tuple(images.shape)}")
+        images = self._normalize(images)
+        sem_feats, final_stride16 = (
+            self._semantic_features_with_final_stride16(images)
+        )
+        if self.use_sta:
+            detail_feats = self.sta(images)
+            fused_feats = [torch.cat([sem_feat, detail_feat], dim=1) for sem_feat, detail_feat in zip(sem_feats, detail_feats)]
+        else:
+            fused_feats = sem_feats
+        outputs = tuple(
+            norm(conv(feat))
+            for conv, norm, feat in zip(self.convs, self.norms, fused_feats)
+        )
+        return outputs, tuple(sem_feats), final_stride16
 
     def forward_with_semantic(
         self,
@@ -252,20 +296,22 @@ class DINOv3STABackbone(nn.Module):
         same single DINO forward pass.  ``forward`` deliberately preserves the
         historical one-value contract for every existing configuration.
         """
-        if images.ndim != 4 or images.shape[1] != 3:
-            raise ValueError(f"Expected images with shape [B, 3, H, W], got {tuple(images.shape)}")
-        images = self._normalize(images)
-        sem_feats = self._semantic_features(images)
-        if self.use_sta:
-            detail_feats = self.sta(images)
-            fused_feats = [torch.cat([sem_feat, detail_feat], dim=1) for sem_feat, detail_feat in zip(sem_feats, detail_feats)]
-        else:
-            fused_feats = sem_feats
-        outputs = tuple(
-            norm(conv(feat))
-            for conv, norm, feat in zip(self.convs, self.norms, fused_feats)
+        outputs, semantic_features, _final_stride16 = (
+            self._forward_feature_bundle(images)
         )
-        return outputs, tuple(sem_feats)
+        return outputs, semantic_features
+
+    def forward_with_semantic_and_final_stride16(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Return DEIM, STA semantic, and block-11 HEAD features in one pass."""
+
+        return self._forward_feature_bundle(images)
 
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         outputs, _semantic = self.forward_with_semantic(images)
@@ -486,7 +532,53 @@ class DINOv3DEIMv2Detector(nn.Module):
             formatted["loss_bbox_l1"] = losses["loss_bbox"]
         return formatted
 
-    def forward_raw(self, images: torch.Tensor, targets: list[dict[str, Any]] | None = None) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _resolve_padding_mask(
+        images: torch.Tensor,
+        targets: list[dict[str, Any]] | None,
+        padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if padding_mask is None and targets:
+            values = [target.get("padding_mask") for target in targets]
+            if all(isinstance(value, torch.Tensor) for value in values):
+                padding_mask = torch.stack(
+                    [value.to(dtype=torch.bool) for value in values], dim=0
+                )
+        if padding_mask is None:
+            return None
+        padding_mask = torch.as_tensor(
+            padding_mask, dtype=torch.bool, device=images.device
+        )
+        expected = (images.shape[0], images.shape[-2], images.shape[-1])
+        if tuple(padding_mask.shape) != tuple(expected):
+            raise ValueError(
+                f"padding_mask must have shape {tuple(expected)}, got {tuple(padding_mask.shape)}"
+            )
+        return padding_mask
+
+    @staticmethod
+    def _feature_padding_masks(
+        padding_mask: torch.Tensor | None,
+        features: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    ) -> list[torch.Tensor] | None:
+        if padding_mask is None:
+            return None
+        return [
+            F.adaptive_avg_pool2d(
+                padding_mask[:, None].to(dtype=torch.float32),
+                output_size=feature.shape[-2:],
+            )[:, 0]
+            >= (1.0 - 1.0e-6)
+            for feature in features
+        ]
+
+    def forward_raw(
+        self,
+        images: torch.Tensor,
+        targets: list[dict[str, Any]] | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         official_targets = None
         if targets is not None:
             official_targets = self._targets_to_official(
@@ -495,12 +587,97 @@ class DINOv3DEIMv2Detector(nn.Module):
                 device=images.device,
                 dtype=images.dtype,
             )
+        padding_mask = self._resolve_padding_mask(images, targets, padding_mask)
         features = self.backbone(images)
-        encoded = self.encoder(list(features))
-        return self.decoder(encoded, official_targets)
+        feature_padding_masks = self._feature_padding_masks(padding_mask, features)
+        encoded = self.encoder(
+            list(features), feature_padding_masks=feature_padding_masks
+        )
+        return self.decoder(
+            encoded,
+            official_targets,
+            feature_padding_masks=feature_padding_masks,
+        )
 
-    def forward(self, images: torch.Tensor, targets: list[dict[str, Any]] | None = None) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
-        outputs = self.forward_raw(images, targets if self.training else None)
+    def forward_raw_with_features(
+        self,
+        images: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Run inference once and expose the final raw DINO feature map.
+
+        This opt-in path is intentionally separate from ``forward_raw`` and
+        ``forward`` so training, checkpoints, and the historical inference
+        contract remain unchanged.  The returned appearance map is the
+        unscaled final DINO block map (stride 16 for the deployed ViT-S/16).
+        """
+
+        feature_forward = getattr(
+            self.backbone,
+            "forward_with_semantic_and_final_stride16",
+            None,
+        )
+        if not callable(feature_forward):
+            raise RuntimeError(
+                "This DEIM backbone does not expose the final DINO feature "
+                "map required by tracking"
+            )
+        padding_mask = self._resolve_padding_mask(images, None, padding_mask)
+        features, _semantic_features, appearance_features = feature_forward(
+            images
+        )
+        feature_padding_masks = self._feature_padding_masks(
+            padding_mask,
+            features,
+        )
+        encoded = self.encoder(
+            list(features),
+            feature_padding_masks=feature_padding_masks,
+        )
+        outputs = self.decoder(
+            encoded,
+            None,
+            feature_padding_masks=feature_padding_masks,
+        )
+        return outputs, appearance_features
+
+    def forward_with_features(
+        self,
+        images: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+        """Return normal postprocessed detections plus DINO appearance map."""
+
+        outputs, appearance_features = self.forward_raw_with_features(
+            images,
+            padding_mask=padding_mask,
+        )
+        image_size = (int(images.shape[-2]), int(images.shape[-1]))
+        orig_sizes = torch.tensor(
+            [[images.shape[-1], images.shape[-2]] for _ in range(images.shape[0])],
+            dtype=images.dtype,
+            device=images.device,
+        )
+        results = self.postprocessor(outputs, orig_sizes)
+        return (
+            [self._clip_and_filter(result, image_size) for result in results],
+            appearance_features,
+        )
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        targets: list[dict[str, Any]] | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
+        outputs = self.forward_raw(
+            images,
+            targets if self.training else None,
+            padding_mask=padding_mask,
+        )
         image_size = (int(images.shape[-2]), int(images.shape[-1]))
         if targets is not None:
             official_targets = self._targets_to_official(targets, image_size, device=images.device, dtype=images.dtype)
@@ -595,6 +772,78 @@ def _target_checkpoint_keys(source_key: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+_LAYER_EXPANSION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "encoder": (
+        re.compile(r"^(encoder\.encoder\.\d+\.layers\.)(\d+)(\..+)$"),
+    ),
+    "decoder": (
+        re.compile(r"^(decoder\.decoder\.layers\.)(\d+)(\..+)$"),
+        re.compile(r"^(decoder\.decoder\.lqe_layers\.)(\d+)(\..+)$"),
+        re.compile(r"^(decoder\.dec_bbox_head\.)(\d+)(\..+)$"),
+    ),
+}
+
+
+def _expand_pretrained_layers(
+    loadable: dict[str, torch.Tensor],
+    model_state: Mapping[str, torch.Tensor],
+    expansion_cfg: Mapping[str, Any],
+) -> dict[str, str]:
+    """Initialize added encoder/decoder layers from the last pretrained layer.
+
+    The public DEIMv2-L checkpoint has one Hybrid Encoder transformer layer and
+    four decoder layers.  Depth ablations must not silently leave added layers
+    at unrelated random initialization, so an explicitly configured
+    ``repeat_last`` policy copies the deepest compatible pretrained layer into
+    every added target layer.  Classification heads are intentionally excluded
+    because custom datasets reinitialize them for their own class inventory.
+    """
+
+    source_keys = tuple(loadable)
+    expanded: dict[str, str] = {}
+    for family, patterns in _LAYER_EXPANSION_PATTERNS.items():
+        policy = str(expansion_cfg.get(family, "none")).strip().lower()
+        if policy in {"", "none", "false"}:
+            continue
+        if policy != "repeat_last":
+            raise ValueError(
+                f"Unsupported init_checkpoint.layer_expansion.{family}: {policy!r}"
+            )
+        for target_key, target_value in model_state.items():
+            if target_key in loadable:
+                continue
+            for pattern in patterns:
+                target_match = pattern.match(target_key)
+                if target_match is None:
+                    continue
+                prefix, target_index_text, suffix = target_match.groups()
+                target_index = int(target_index_text)
+                candidates: list[tuple[int, str]] = []
+                for source_key in source_keys:
+                    source_match = pattern.match(source_key)
+                    if source_match is None:
+                        continue
+                    source_prefix, source_index_text, source_suffix = source_match.groups()
+                    if source_prefix == prefix and source_suffix == suffix:
+                        source_index = int(source_index_text)
+                        if source_index < target_index:
+                            candidates.append((source_index, source_key))
+                if not candidates:
+                    break
+                _source_index, source_key = max(candidates)
+                source_value = loadable[source_key]
+                if tuple(source_value.shape) != tuple(target_value.shape):
+                    raise RuntimeError(
+                        "Layer expansion shape mismatch: "
+                        f"source={source_key}{tuple(source_value.shape)}, "
+                        f"target={target_key}{tuple(target_value.shape)}"
+                    )
+                loadable[target_key] = source_value.clone()
+                expanded[target_key] = source_key
+                break
+    return expanded
+
+
 def _load_pretrained_checkpoint(model: DINOv3DEIMv2Detector, init_cfg: Mapping[str, Any]) -> dict[str, Any]:
     path = init_cfg.get("path") or init_cfg.get("checkpoint") or init_cfg.get("weights")
     if not path:
@@ -636,7 +885,28 @@ def _load_pretrained_checkpoint(model: DINOv3DEIMv2Detector, init_cfg: Mapping[s
         loadable[key] = value
         loaded_numel += int(value.numel())
         remapped_keys += int(key != source_key)
+    layer_expansion_cfg = init_cfg.get("layer_expansion", {}) or {}
+    if not isinstance(layer_expansion_cfg, Mapping):
+        raise TypeError("init_checkpoint.layer_expansion must be a mapping")
+    expanded_layers = _expand_pretrained_layers(
+        loadable,
+        model_state,
+        layer_expansion_cfg,
+    )
+    loaded_numel += sum(int(loadable[key].numel()) for key in expanded_layers)
     missing, model_unexpected = model.load_state_dict(loadable, strict=False)
+    added_layer_initialization = {
+        "applied": False,
+        "added_layer_indices": [],
+        "zeroed_bbox_output_layers": [],
+        "copied_score_head_layers": [],
+    }
+    decoder = getattr(model, "decoder", None)
+    initialize_added_layers = getattr(
+        decoder, "apply_added_layer_initialization", None
+    )
+    if expanded_layers and callable(initialize_added_layers):
+        added_layer_initialization = initialize_added_layers()
     digest = hashlib.sha256()
     with Path(path).open("rb") as checkpoint_file:
         for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
@@ -658,6 +928,15 @@ def _load_pretrained_checkpoint(model: DINOv3DEIMv2Detector, init_cfg: Mapping[s
         "skipped_prefix": len(skipped_prefix),
         "skipped_prefix_keys": skipped_prefix,
         "remapped_keys": remapped_keys,
+        "layer_expansion": {
+            str(key): str(value) for key, value in layer_expansion_cfg.items()
+        },
+        "expanded_layer_keys": sorted(expanded_layers),
+        "expanded_layer_sources": {
+            key: expanded_layers[key] for key in sorted(expanded_layers)
+        },
+        "expanded_layers": len(expanded_layers),
+        "added_layer_initialization": added_layer_initialization,
         "loaded_numel": loaded_numel,
         "model_state_numel": sum(int(value.numel()) for value in model_state.values()),
         "loaded_state_numel_fraction": loaded_numel / max(1, sum(int(value.numel()) for value in model_state.values())),
@@ -721,6 +1000,7 @@ def build_dinov3_deimv2_detector(
     )
 
     decoder_hidden_dim = int(decoder_cfg.get("hidden_dim", encoder_hidden_dim))
+    added_layer_cfg = dict(decoder_cfg.get("added_layer_initialization", {}) or {})
     decoder = DEIMTransformer(
         num_classes=num_classes,
         hidden_dim=decoder_hidden_dim,
@@ -750,6 +1030,23 @@ def build_dinov3_deimv2_detector(
         use_gateway=bool(decoder_cfg.get("use_gateway", True)),
         share_bbox_head=bool(decoder_cfg.get("share_bbox_head", False)),
         share_score_head=bool(decoder_cfg.get("share_score_head", False)),
+        added_layer_start=added_layer_cfg.get("start_layer"),
+        added_layer_residual_gate=float(
+            added_layer_cfg.get("residual_gate", 0.1)
+        ),
+        zero_added_bbox_output=bool(
+            added_layer_cfg.get("zero_bbox_output", False)
+        ),
+        copy_added_score_head=bool(
+            added_layer_cfg.get("copy_score_head", False)
+        ),
+        self_attention_fp32=bool(decoder_cfg.get("self_attention_fp32", False)),
+        global_context_attention=bool(
+            decoder_cfg.get("global_context_attention", False)
+        ),
+        global_context_initial_gate=float(
+            decoder_cfg.get("global_context_initial_gate", 0.0)
+        ),
     )
 
     weight_dict = dict(loss_cfg.get("weight_dict", {"loss_mal": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_fgl": 0.15, "loss_ddf": 1.5}))
@@ -775,6 +1072,8 @@ def build_dinov3_deimv2_detector(
         share_matched_indices=bool(loss_cfg.get("share_matched_indices", False)),
         mal_alpha=loss_cfg.get("mal_alpha"),
         use_uni_set=bool(loss_cfg.get("use_uni_set", True)),
+        aux_layer_weights=loss_cfg.get("aux_layer_weights"),
+        dn_layer_weights=loss_cfg.get("dn_layer_weights"),
     )
     postprocessor = PostProcessor(
         num_classes=num_classes,

@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,8 +30,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.config_utils import load_yaml_config
 from src.checkpoint_retention import prune_periodic_checkpoints
+from src.amp_calibration import calibration_policy, calibrate_gradients, gradients_finite, preserve_rng_and_buffers
+from src.codino_runtime import OFFICIAL_TYPES, RuntimeProgress, configure_memory_budget
+from src.wandb_utils import write_json_atomic
 from src.data import AugmentedFaceKeypointDataset, FaceKeypointDataset, SyntheticFaceKeypointDataset, collate_face_keypoint_batch
 from src.models import build_detector_from_config
+from tools.dinov3_deimv2_common import (
+    parse_image_size,
+    prepare_image_tensor,
+    scale_detections_to_original,
+)
 
 
 LOSS_LOG_KEYS = (
@@ -43,6 +51,7 @@ LOSS_LOG_KEYS = (
     "loss_ellipse_axes",
     "loss_ellipse_angle",
     "loss_ellipse_chamfer",
+    "loss_depth_consistency",
     "loss_center_offset",
     "loss_bbox",
     "loss_bbox_l1",
@@ -64,6 +73,7 @@ VAL_LOG_KEYS = (
     "split",
     "num_images",
     "num_gt",
+    "loss",
     "mAP",
     "AP50",
     "AP75",
@@ -127,7 +137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Run one lightweight batch through loss computation only.")
     parser.add_argument("--device", default=None)
     parser.add_argument("--synthetic", action="store_true", help="Force synthetic smoke data for dry-run.")
-    parser.add_argument("--image-size", type=int, default=None, help="Override data.image_size for smoke runs.")
+    parser.add_argument(
+        "--image-size",
+        default=None,
+        help="Override data.image_size for smoke runs (INT or HEIGHTxWIDTH).",
+    )
     parser.add_argument("--overfit-smoke", action="store_true", help="Train on a tiny subset to confirm the model can overfit.")
     parser.add_argument("--max-samples", type=int, default=16, help="Subset size for --overfit-smoke.")
     parser.add_argument("--steps", type=int, default=40, help="Optimization steps for --overfit-smoke.")
@@ -477,7 +491,13 @@ def _resolve_eval_data_paths(config: dict[str, Any], split: str) -> tuple[Path, 
         raise FileNotFoundError(f"COCO annotation file not found for validation split={split!r}.")
     if root is None:
         root = annotation_path.parent
-    image_root = _choose_eval_image_root(root, annotation_path, split, data_cfg.get("image_root"))
+    split_roots = data_cfg.get("image_roots", {})
+    configured_root = (
+        split_roots.get(split)
+        if isinstance(split_roots, dict)
+        else None
+    ) or data_cfg.get("image_root")
+    image_root = _choose_eval_image_root(root, annotation_path, split, configured_root)
     if image_root is None or not image_root.exists():
         raise FileNotFoundError(f"image_root not found for validation split={split!r}: {image_root}")
     return annotation_path, image_root
@@ -507,14 +527,21 @@ def _load_coco_eval(annotation_path: Path, selected_category_ids: list[int]) -> 
     return images, gt_by_image
 
 
-def _image_to_eval_tensor(image: Image.Image, image_size: int) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
-    image = image.convert("RGB")
-    original_w, original_h = image.size
-    image = image.resize((int(image_size), int(image_size)), Image.BILINEAR)
-    input_w, input_h = image.size
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).contiguous()
-    return tensor, (input_h, input_w), (original_h, original_w)
+def _image_to_eval_tensor(
+    image: Image.Image,
+    image_size: int | tuple[int, int],
+    *,
+    resize_mode: str,
+    pad_color: Any,
+    size_divisor: int,
+):
+    return prepare_image_tensor(
+        image,
+        image_size,
+        resize_mode=resize_mode,
+        pad_color=pad_color,
+        size_divisor=size_divisor,
+    )
 
 
 def _scale_eval_detections(
@@ -522,7 +549,15 @@ def _scale_eval_detections(
     *,
     input_hw: tuple[int, int],
     original_hw: tuple[int, int],
+    geometry: Any | None = None,
 ) -> dict[str, torch.Tensor]:
+    if geometry is not None:
+        return scale_detections_to_original(
+            detections,
+            input_hw=input_hw,
+            original_hw=original_hw,
+            geometry=geometry,
+        )
     input_h, input_w = int(input_hw[0]), int(input_hw[1])
     original_h, original_w = int(original_hw[0]), int(original_hw[1])
     scale_x = original_w / float(max(1, input_w))
@@ -568,6 +603,7 @@ def _detections_to_eval_records(
             continue
         row = {
                 "image_id": image_id,
+                "file_name": str(image_info.get("file_name", "")),
                 "category_id": int(category_id),
                 "score": float(scores[index]),
                 "bbox_xyxy": [x1, y1, x2, y2],
@@ -693,7 +729,10 @@ def _validation_loss(
     category_ids: list[int],
     device: str,
     split: str,
-    image_size: int,
+    image_size: int | tuple[int, int],
+    resize_mode: str,
+    pad_color: Any,
+    size_divisor: int,
     batch_size: int,
     max_images: int | None,
 ) -> float:
@@ -703,6 +742,9 @@ def _validation_loss(
         image_root=image_root,
         split=split,
         image_size=image_size,
+        resize_mode=resize_mode,
+        pad_color=pad_color,
+        size_divisor=size_divisor,
         include_negative=True,
         category_ids=category_ids,
     )
@@ -746,17 +788,55 @@ def _validation_loss_mode(model: torch.nn.Module):
     """
 
     previous_model_training = bool(model.training)
+    query_head = getattr(model, "query_head", None)
+    previous_query_head_training = (
+        bool(query_head.training)
+        if isinstance(query_head, torch.nn.Module)
+        else None
+    )
     decoder = getattr(model, "decoder", None)
     previous_decoder_training = bool(decoder.training) if isinstance(decoder, torch.nn.Module) else None
+    depth_decoder = (
+        getattr(decoder, "decoder", None)
+        if isinstance(decoder, torch.nn.Module)
+        and bool(getattr(decoder, "depth_supervision_layers", ()))
+        else None
+    )
+    previous_depth_decoder_training = (
+        bool(depth_decoder.training)
+        if isinstance(depth_decoder, torch.nn.Module)
+        else None
+    )
     model.training = True
+    if isinstance(query_head, torch.nn.Module):
+        # Co-DINO creates CDN queries and dn_meta in the query-head forward
+        # only while this wrapper is in training mode. Toggle the wrapper
+        # itself, not its dropout/normalization children, so validation-loss
+        # decoding remains deterministic.
+        query_head.training = True
     if isinstance(decoder, torch.nn.Module):
         decoder.training = True
+    if isinstance(depth_decoder, torch.nn.Module):
+        # Depth-specific auxiliary/consistency losses require all decoder
+        # outputs. Toggle only the nested wrapper flag; its attention/dropout
+        # children remain in deterministic eval mode.
+        depth_decoder.training = True
     try:
         yield
     finally:
         model.training = previous_model_training
+        if (
+            isinstance(query_head, torch.nn.Module)
+            and previous_query_head_training is not None
+        ):
+            query_head.training = previous_query_head_training
         if isinstance(decoder, torch.nn.Module) and previous_decoder_training is not None:
             decoder.training = previous_decoder_training
+        if (
+            isinstance(depth_decoder, torch.nn.Module)
+            and previous_depth_decoder_training is not None
+        ):
+            depth_decoder.training = previous_depth_decoder_training
 
 
 def validate_detection_split(
@@ -765,14 +845,20 @@ def validate_detection_split(
     *,
     device: str,
     split: str,
-    image_size: int,
+    image_size: int | tuple[int, int],
     fixed_threshold: float,
     score_min: float,
     max_images: int | None,
     batch_size: int = 1,
+    predictions_output: Path | None = None,
+    compute_validation_loss: bool = True,
 ) -> dict[str, Any]:
     annotation_path, image_root = _resolve_eval_data_paths(config, split)
     category_ids = _config_category_ids(config)
+    data_cfg = dict(config.get("data", {}) or {})
+    resize_mode = str(data_cfg.get("resize_mode", "stretch"))
+    pad_color = data_cfg.get("pad_color")
+    size_divisor = int(data_cfg.get("size_divisor", 32))
     images, gt_by_image = _load_coco_eval(annotation_path, category_ids)
     if max_images is not None:
         images = images[: int(max_images)]
@@ -791,24 +877,55 @@ def validate_detection_split(
     predictions: list[dict[str, Any]] = []
     started = time.perf_counter()
     try:
-        val_loss = _validation_loss(
-            model,
-            annotation_path=annotation_path,
-            image_root=image_root,
-            category_ids=category_ids,
-            device=device,
-            split=split,
-            image_size=image_size,
-            batch_size=batch_size,
-            max_images=max_images,
+        val_loss = (
+            _validation_loss(
+                model,
+                annotation_path=annotation_path,
+                image_root=image_root,
+                category_ids=category_ids,
+                device=device,
+                split=split,
+                image_size=image_size,
+                resize_mode=resize_mode,
+                pad_color=pad_color,
+                size_divisor=size_divisor,
+                batch_size=batch_size,
+                max_images=max_images,
+            )
+            if compute_validation_loss
+            else None
         )
         for image_info in images:
             image_path = image_root / str(image_info.get("file_name", ""))
             image = Image.open(image_path).convert("RGB")
-            tensor, input_hw, original_hw = _image_to_eval_tensor(image, image_size)
+            (
+                tensor,
+                input_hw,
+                original_hw,
+                geometry,
+                padding_mask,
+            ) = _image_to_eval_tensor(
+                image,
+                image_size,
+                resize_mode=resize_mode,
+                pad_color=pad_color,
+                size_divisor=size_divisor,
+            )
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=str(device).startswith("cuda")):
-                detections = model(tensor.to(device, non_blocking=True))[0]
-            detections = _scale_eval_detections(detections, input_hw=input_hw, original_hw=original_hw)
+                detections = model(
+                    tensor.to(device, non_blocking=True),
+                    padding_mask=(
+                        padding_mask.unsqueeze(0).to(device, non_blocking=True)
+                        if padding_mask is not None
+                        else None
+                    ),
+                )[0]
+            detections = _scale_eval_detections(
+                detections,
+                input_hw=input_hw,
+                original_hw=original_hw,
+                geometry=geometry,
+            )
             predictions.extend(_detections_to_eval_records(image_info, detections, category_ids))
     finally:
         if old_model_score is not None and hasattr(model, "score_threshold"):
@@ -817,6 +934,12 @@ def validate_detection_split(
             model.postprocessor.score_threshold = old_post_score
         model.train(was_training)
     elapsed = time.perf_counter() - started
+    if predictions_output is not None:
+        predictions_output.parent.mkdir(parents=True, exist_ok=True)
+        predictions_output.write_text(
+            json.dumps(predictions, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     iou_thresholds = [round(float(value), 2) for value in np.arange(0.50, 0.96, 0.05)]
     ap_by_threshold = [
@@ -857,7 +980,14 @@ def validate_detection_split(
         "elapsed_seconds": elapsed,
     }
     model_type = str(config.get("model", {}).get("type", "")).lower()
-    if model_type in {"dinov3_deimv2_ellipse", "dino_deimv2_ellipse"}:
+    if model_type in {
+        "dinov3_deimv2_ellipse",
+        "dino_deimv2_ellipse",
+        "dinov3_codino_official_ellipse",
+        "dinov3_codino_ellipse",
+        "dino_codino_ellipse",
+        "co_dino_ellipse",
+    }:
         from src.evaluation import ellipse_detection_metrics
 
         metrics.update(
@@ -880,7 +1010,14 @@ def build_dataset(config: dict[str, Any], *, force_synthetic: bool = False):
     synthetic_if_missing = bool(data_cfg.get("synthetic_if_missing", True))
     missing_real_data = not data_root and not annotation_path
     if force_synthetic or (missing_real_data and synthetic_if_missing):
-        dataset = SyntheticFaceKeypointDataset(length=4, image_size=int(image_size if isinstance(image_size, int) else image_size[0]))
+        dataset = SyntheticFaceKeypointDataset(
+            length=4,
+            image_size=(
+                int(image_size)
+                if isinstance(image_size, int)
+                else (int(image_size[0]), int(image_size[1]))
+            ),
+        )
     else:
         dataset = FaceKeypointDataset(
             data_root=data_root,
@@ -890,6 +1027,9 @@ def build_dataset(config: dict[str, Any], *, force_synthetic: bool = False):
             image_root=data_cfg.get("image_root"),
             metadata_path=data_cfg.get("metadata_path"),
             image_size=image_size,
+            resize_mode=str(data_cfg.get("resize_mode", "stretch")),
+            pad_color=data_cfg.get("pad_color"),
+            size_divisor=int(data_cfg.get("size_divisor", 32)),
             include_negative=bool(data_cfg.get("include_negative", True)),
             category_ids=data_cfg.get("category_ids"),
         )
@@ -899,11 +1039,31 @@ def build_dataset(config: dict[str, Any], *, force_synthetic: bool = False):
     return dataset
 
 
+def subset_training_dataset(dataset, indices):
+    """Bound all augmentation sources, retaining the outer epoch-aware wrapper."""
+    if isinstance(dataset, AugmentedFaceKeypointDataset):
+        bounded = AugmentedFaceKeypointDataset(
+            Subset(dataset.base_dataset, indices), dataset.augmentation, seed=dataset.seed)
+        bounded.set_epoch(dataset.epoch, dataset.total_epochs)
+        return bounded
+    return Subset(dataset, indices)
+
+
 def move_targets_to_device(targets: list[dict[str, Any]], device: str, *, non_blocking: bool = False) -> list[dict[str, Any]]:
     moved = []
     for target in targets:
         updated = dict(target)
-        for key in ("boxes", "ellipses", "labels", "keypoints", "keypoint_mask"):
+        for key in (
+            "boxes",
+            "ellipses",
+            "labels",
+            "keypoints",
+            "keypoint_mask",
+            "keypoint_visibility",
+            "face_visibility",
+            "padding_mask",
+            "valid_image_region_xyxy",
+        ):
             value = updated.get(key)
             if isinstance(value, torch.Tensor):
                 updated[key] = value.to(device, non_blocking=non_blocking)
@@ -913,7 +1073,9 @@ def move_targets_to_device(targets: list[dict[str, Any]], device: str, *, non_bl
 
 def apply_tiny_model_overrides(config: dict[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(config)
-    backbone = config.setdefault("model", {}).setdefault("backbone", {})
+    model = config.setdefault("model", {})
+    model_type = str(model.get("type", "")).lower()
+    backbone = model.setdefault("backbone", {})
     backbone["embed_dim"] = 64
     backbone["dummy"] = True
     backbone["pretrained"] = False
@@ -924,16 +1086,63 @@ def apply_tiny_model_overrides(config: dict[str, Any]) -> dict[str, Any]:
     backbone["strict_weights"] = False
     backbone["token_key"] = None
     backbone["call_method"] = "auto"
-    config["model"].setdefault("adapter", {})["out_channels"] = 64
-    config["model"].setdefault("adapter", {})["hidden_dim"] = 64
-    config["model"].setdefault("neck", {})["out_channels"] = 64
-    config["model"].setdefault("encoder", {})["hidden_dim"] = 64
-    config["model"].setdefault("encoder", {})["num_heads"] = 4
-    config["model"].setdefault("decoder", {})["hidden_dim"] = 64
-    config["model"].setdefault("decoder", {})["num_heads"] = 4
-    config["model"].setdefault("decoder", {})["num_layers"] = min(1, int(config["model"].setdefault("decoder", {}).get("num_layers", 1)))
-    config["model"].setdefault("decoder", {})["num_queries"] = min(16, int(config["model"].setdefault("decoder", {}).get("num_queries", 16)))
-    head = config["model"].setdefault("head", {})
+    if model_type.startswith("dinov3_codino_official"):
+        model["init_checkpoint"] = None
+        model.setdefault("neck", {})["in_channels"] = [64]
+        model.setdefault("query_head", {}).update(embed_dims=64, num_queries=12,
+            num_encoder_layers=1, num_decoder_layers=2, feedforward_channels=128,
+            num_denoising_queries=10)
+        return config
+    if model_type in {
+        "dinov3_codino_official",
+        "dinov3_codino_official_ellipse",
+        "dinov3_codino",
+        "dino_codino",
+        "co_dino",
+        "dinov3_codino_ellipse",
+        "dino_codino_ellipse",
+        "co_dino_ellipse",
+    }:
+        # MMDetection 3.3's DinoTransformerDecoder creates its reference-point
+        # sine embedding with the canonical 256-wide contract. Keep that
+        # width in smoke runs and shrink depth/query counts instead.
+        model.setdefault("adapter", {})["out_channels"] = 256
+        model.setdefault("adapter", {})["hidden_dim"] = 256
+        neck = model.setdefault("neck", {})
+        neck["in_channels"] = [256, 256, 256]
+        neck["out_channels"] = 256
+        query = model.setdefault("query_head", {})
+        query["embed_dims"] = 256
+        query["num_queries"] = min(16, int(query.get("num_queries", 16)))
+        query["num_encoder_layers"] = 1
+        query["num_decoder_layers"] = 1
+        query["feedforward_channels"] = 256
+        query["num_denoising_queries"] = min(
+            10, int(query.get("num_denoising_queries", 10))
+        )
+        o2m = model.setdefault("o2m_head", {})
+        o2m["feat_channels"] = 256
+        o2m["stacked_convs"] = 1
+        o2m["max_positive_queries"] = min(
+            16, int(o2m.get("max_positive_queries", 16))
+        )
+        return config
+    model.setdefault("adapter", {})["out_channels"] = 64
+    model.setdefault("adapter", {})["hidden_dim"] = 64
+    model.setdefault("neck", {})["out_channels"] = 64
+    encoder = model.setdefault("encoder", {})
+    encoder["in_channels"] = [64, 64, 64]
+    encoder["hidden_dim"] = 64
+    encoder["nhead"] = 4
+    encoder["dim_feedforward"] = 256
+    decoder = model.setdefault("decoder", {})
+    decoder["feat_channels"] = [64, 64, 64]
+    decoder["hidden_dim"] = 64
+    decoder["nhead"] = 4
+    decoder["dim_feedforward"] = 256
+    decoder["num_layers"] = min(1, int(decoder.get("num_layers", 1)))
+    decoder["num_queries"] = min(16, int(decoder.get("num_queries", 16)))
+    head = model.setdefault("head", {})
     head["head_channels"] = 64
     head["num_convs"] = 1
     return config
@@ -998,6 +1207,42 @@ def trainable_parameter_groups(model: torch.nn.Module, config: dict[str, Any]) -
     if backbone_params and lr_backbone > 0.0:
         groups.append({"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay, "name": "backbone"})
     return groups
+
+
+def _raw_dino_module(
+    model: torch.nn.Module,
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    """Return the DINO wrapper controlling freeze mode and its raw ViT."""
+
+    backbone = getattr(model, "backbone", None)
+    dino_wrapper = getattr(backbone, "dino", None)
+    raw_dino = getattr(dino_wrapper, "backbone", None)
+    if isinstance(dino_wrapper, torch.nn.Module) and isinstance(
+        raw_dino, torch.nn.Module
+    ):
+        return dino_wrapper, raw_dino
+    raw_dino = getattr(backbone, "dinov3", None)
+    if isinstance(backbone, torch.nn.Module) and isinstance(
+        raw_dino, torch.nn.Module
+    ):
+        return backbone, raw_dino
+    raise RuntimeError(
+        "staged_unfreeze requires a DINOv3 STA backbone exposing dino.backbone or dinov3"
+    )
+
+
+def _set_raw_dino_trainable(
+    model: torch.nn.Module,
+    *,
+    trainable: bool,
+) -> int:
+    wrapper, raw_dino = _raw_dino_module(model)
+    for parameter in raw_dino.parameters():
+        parameter.requires_grad_(trainable)
+    if hasattr(wrapper, "freeze"):
+        wrapper.freeze = not trainable
+    raw_dino.train(trainable and model.training)
+    return sum(parameter.numel() for parameter in raw_dino.parameters())
 
 
 def build_optimizer(
@@ -1151,6 +1396,7 @@ def validate_production_training_contract(
     *,
     force_synthetic: bool,
     max_train_batches: int | None,
+    max_train_samples: int | None = None,
 ) -> None:
     train_cfg = dict(config.get("train", {}))
     if not bool(train_cfg.get("production_mode", False)):
@@ -1163,8 +1409,10 @@ def validate_production_training_contract(
     backbone_policy = str(train_cfg.get("backbone_policy", "full_unfreeze")).lower()
     if force_synthetic or bool(data_cfg.get("synthetic_if_missing", False)):
         raise RuntimeError("Production training forbids synthetic data and synthetic_if_missing")
-    if max_train_batches is not None:
-        raise RuntimeError("Production training forbids --max-train-batches and dataset truncation")
+    if max_train_batches is not None or max_train_samples is not None:
+        raise RuntimeError(
+            "Production training forbids bounded batches and dataset truncation"
+        )
     if not bool(data_cfg.get("leakage_audit", {}).get("enabled", False)):
         raise RuntimeError("Production training requires data.leakage_audit.enabled=true")
     if int(train_cfg.get("epochs", 0)) < int(train_cfg.get("minimum_epochs", 68)):
@@ -1176,6 +1424,20 @@ def validate_production_training_contract(
         raise RuntimeError(
             f"Production training requires image_size >= {minimum_image_size}, got {actual_image_size}"
         )
+    normalized_image_size = normalize_image_size(image_size)
+    if normalized_image_size is None:
+        raise RuntimeError("Production training requires an explicit image_size")
+    required_divisor = int(data_cfg.get("size_divisor", 1))
+    if any(value % required_divisor != 0 for value in normalized_image_size):
+        raise RuntimeError(
+            f"Production image_size {normalized_image_size} must be divisible by {required_divisor}"
+        )
+    minimum_image_pixels = int(train_cfg.get("minimum_image_pixels", 0) or 0)
+    if math.prod(normalized_image_size) < minimum_image_pixels:
+        raise RuntimeError(
+            f"Production image_size {normalized_image_size} has fewer than "
+            f"{minimum_image_pixels} pixels"
+        )
     if backbone_policy == "full_unfreeze":
         if bool(backbone_cfg.get("freeze", True)):
             raise RuntimeError("backbone_policy=full_unfreeze requires model.backbone.freeze=false")
@@ -1184,9 +1446,24 @@ def validate_production_training_contract(
             raise RuntimeError("backbone_policy=freeze requires model.backbone.freeze=true")
         if int(backbone_cfg.get("trainable_last_blocks", 0)) != 0:
             raise RuntimeError("backbone_policy=freeze requires trainable_last_blocks=0")
+    elif backbone_policy == "staged_unfreeze":
+        freeze_epochs = int(train_cfg.get("freeze_backbone_epochs", 0))
+        if not bool(backbone_cfg.get("freeze", False)):
+            raise RuntimeError(
+                "backbone_policy=staged_unfreeze requires model.backbone.freeze=true"
+            )
+        if freeze_epochs <= 0 or freeze_epochs >= int(train_cfg.get("epochs", 0)):
+            raise RuntimeError(
+                "staged_unfreeze requires 0 < train.freeze_backbone_epochs < train.epochs"
+            )
+        if float(train_cfg.get("lr_backbone", 0.0)) <= 0.0:
+            raise RuntimeError(
+                "staged_unfreeze requires a positive train.lr_backbone"
+            )
     else:
         raise RuntimeError(
-            "Production train.backbone_policy must be 'full_unfreeze' or 'freeze', "
+            "Production train.backbone_policy must be 'full_unfreeze', 'freeze', "
+            "or 'staged_unfreeze', "
             f"got {backbone_policy!r}"
         )
     if not bool(validation_cfg.get("enabled", False)) or int(validation_cfg.get("every", 0)) <= 0:
@@ -1236,6 +1513,7 @@ def save_checkpoint(
     config: dict[str, Any],
     metrics: dict[str, float],
     ema: ModelEMA | None = None,
+    amp_runtime: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
@@ -1249,6 +1527,8 @@ def save_checkpoint(
     if ema is not None:
         payload["ema"] = checkpoint_state_dict(ema.module)
         payload["ema_updates"] = int(ema.updates)
+    if amp_runtime is not None:
+        payload["amp_runtime"] = amp_runtime
     torch.save(payload, path)
 
 
@@ -1336,8 +1616,19 @@ def safe_cache_name(value: Any) -> str:
 
 def feature_cache_supported(dataset, config: dict[str, Any]) -> tuple[bool, str]:
     model_type = str(config.get("model", {}).get("type", "")).lower()
-    if model_type in {"dinov3_deimv2", "dino_deimv2"}:
-        return False, "official DEIMv2 STA requires raw images"
+    if model_type in {
+        "dinov3_deimv2",
+        "dino_deimv2",
+        "dinov3_codino_official",
+        "dinov3_codino_official_ellipse",
+        "dinov3_codino",
+        "dino_codino",
+        "co_dino",
+        "dinov3_codino_ellipse",
+        "dino_codino_ellipse",
+        "co_dino_ellipse",
+    }:
+        return False, "the configured STA detector requires raw images"
     if isinstance(dataset, AugmentedFaceKeypointDataset):
         return False, "train-time augmentation is enabled"
     if bool(config.get("train", {}).get("progressive_resizing", {}).get("enabled", False)):
@@ -1464,10 +1755,13 @@ def maybe_build_feature_cache(
     }
 
 
-def make_grad_scaler(*, enabled: bool):
+def make_grad_scaler(*, enabled: bool, initial_scale: float | None = None):
+    if initial_scale is not None and (not math.isfinite(float(initial_scale)) or float(initial_scale) <= 0):
+        raise ValueError("AMP initial scale must be finite and positive")
+    kwargs = {} if initial_scale is None else {"init_scale": initial_scale}
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    return torch.cuda.amp.GradScaler(enabled=enabled)
+        return torch.amp.GradScaler("cuda", enabled=enabled, **kwargs)
+    return torch.cuda.amp.GradScaler(enabled=enabled, **kwargs)
 
 
 def dry_run(config: dict[str, Any], *, device: str, force_synthetic: bool) -> int:
@@ -1498,6 +1792,27 @@ def dry_run(config: dict[str, Any], *, device: str, force_synthetic: bool) -> in
     return 0 if finite else 1
 
 
+def trim_uncommitted_epoch_metrics(output_dir: Path, completed_epoch: int) -> None:
+    """Rollback failed official-SFP epochs to the last completed checkpoint."""
+    for name in ("metrics.csv", "val_metrics.csv"):
+        path = output_dir / name
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            fields = reader.fieldnames
+            rows = list(reader)
+        kept = [row for row in rows if int(row["epoch"]) <= completed_epoch]
+        if len(kept) == len(rows):
+            continue
+        pending = path.with_suffix(".recovery_tmp")
+        with pending.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(kept)
+        pending.replace(path)
+
+
 def train(
     config: dict[str, Any],
     *,
@@ -1508,6 +1823,7 @@ def train(
     save_every: int,
     use_amp: bool,
     max_train_batches: int | None,
+    max_train_samples: int | None,
     allow_dummy_backbone: bool,
     wandb_run: Any | None = None,
 ) -> int:
@@ -1516,10 +1832,59 @@ def train(
         config,
         force_synthetic=force_synthetic,
         max_train_batches=max_train_batches,
+        max_train_samples=max_train_samples,
     )
     seed = int(config.get("train", {}).get("seed", 42))
     set_reproducible_seed(seed)
     dataset = build_dataset(config, force_synthetic=force_synthetic)
+    if max_train_samples is not None:
+        if int(max_train_samples) < 1:
+            raise ValueError("max_train_samples must be positive")
+        source_dataset_size = len(dataset)
+        selected_count = min(int(max_train_samples), source_dataset_size)
+        subset_strategy = str(
+            config.get("train", {}).get("bounded_subset_strategy", "head")
+        ).lower()
+        if subset_strategy == "head":
+            selected_indices = list(range(selected_count))
+        elif subset_strategy == "seeded_random":
+            subset_generator = torch.Generator()
+            subset_generator.manual_seed(seed)
+            selected_indices = torch.randperm(
+                source_dataset_size,
+                generator=subset_generator,
+            )[:selected_count].sort().values.tolist()
+        elif subset_strategy == "crowded":
+            # Isolated preflight only: include the densest real train images.
+            base = getattr(dataset, "base_dataset", dataset)
+            records = getattr(base, "samples", None)
+            if records is None or not all("annotations" in item for item in records):
+                raise ValueError("crowded subset requires COCO train records")
+            selected_indices = sorted(range(source_dataset_size),
+                key=lambda index: (-len(records[index]["annotations"]), index))[:selected_count]
+        else:
+            raise ValueError(
+                "train.bounded_subset_strategy must be head, seeded_random or crowded; "
+                f"got {subset_strategy!r}"
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "bounded_train_subset.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "strategy": subset_strategy,
+                    "seed": seed,
+                    "source_dataset_size": source_dataset_size,
+                    "selected_count": selected_count,
+                    "indices": selected_indices,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        dataset = subset_training_dataset(dataset, selected_indices)
     if len(dataset) == 0:
         raise RuntimeError("Dataset is empty; set data.synthetic_if_missing=true or provide local data.")
     train_cfg = config.get("train", {})
@@ -1542,9 +1907,30 @@ def train(
     generator = torch.Generator()
     generator.manual_seed(seed)
 
-    model = build_detector_from_config(config).to(device)
+    amp_policy = calibration_policy(config)
+    memory_budget = configure_memory_budget(config, device)
+    if memory_budget is not None:
+        write_json_atomic(output_dir / "cuda_memory_budget.json", memory_budget)
+        if wandb_run is not None:
+            wandb_run.config.update({"cuda_memory_budget": memory_budget}, allow_val_change=True)
+    model = build_detector_from_config(config)
+    if train_cfg.get("continuation_source"):
+        from src.codino_continuation import load_continuation_source
+        initial = load_continuation_source(config)
+        model.load_state_dict(initial["model"], strict=True)
+        del initial
+    model = model.to(device)
     model.train()
     compile_meta = compile_trainable_modules(model, config)
+    transfer_report = getattr(model, "checkpoint_transfer_report", None)
+    if transfer_report is not None:
+        (output_dir / "checkpoint_transfer.json").write_text(
+            json.dumps(transfer_report, indent=2) + "\n", encoding="utf-8")
+        if wandb_run is not None:
+            wandb_run.config.update({"checkpoint_transfer": transfer_report}, allow_val_change=True)
+    backbone_policy = str(train_cfg.get("backbone_policy", "full_unfreeze")).lower()
+    staged_unfreeze = backbone_policy == "staged_unfreeze"
+    freeze_backbone_epochs = int(train_cfg.get("freeze_backbone_epochs", 0))
     ema_cfg = dict(train_cfg.get("ema", {}) or {})
     ema = (
         ModelEMA(
@@ -1556,12 +1942,23 @@ def train(
         if bool(ema_cfg.get("enabled", False))
         else None
     )
+    # Staged parameters must be present in the optimizer from the beginning so
+    # resume/scheduler state stays stable. They receive no gradients while the
+    # DINO wrapper remains frozen and are activated at the declared epoch.
+    if staged_unfreeze:
+        _set_raw_dino_trainable(model, trainable=True)
     parameter_groups = trainable_parameter_groups(model, config)
+    if staged_unfreeze:
+        _set_raw_dino_trainable(model, trainable=False)
     if not parameter_groups:
         raise RuntimeError("No trainable parameters were found.")
     optimizer, optimizer_meta = build_optimizer(parameter_groups, config, device=device)
     scheduler = build_epoch_scheduler(optimizer, config, epochs=epochs)
-    scaler = make_grad_scaler(enabled=use_amp and str(device).startswith("cuda"))
+    scaler = make_grad_scaler(enabled=use_amp and str(device).startswith("cuda"),
+                             initial_scale=(amp_policy["initial_scale"] if amp_policy
+                                            else train_cfg.get("amp_initial_scale")))
+    amp_runtime = (dict(policy=amp_policy, calibrated_states={}, scaler=scaler.state_dict())
+                   if amp_policy else None)
 
     start_epoch = 1
     total_step = 0
@@ -1569,8 +1966,20 @@ def train(
     best_val_map = float("-inf")
     previous_elapsed = 0.0
     metrics_path = output_dir / "metrics.csv"
+    official_recovery = bool(train_cfg.get("runtime_batch_attempts")) and str(
+        config.get("model", {}).get("type", "")).startswith("dinov3_codino_official")
+    if official_recovery and resume_from is None:
+        trim_uncommitted_epoch_metrics(output_dir, 0)
     if resume_from is not None:
-        checkpoint = torch.load(resume_from, map_location=device)
+        # Continuation restores tensors into existing model/EMA/optimizer slots;
+        # avoid materializing a second complete checkpoint on the GPU.
+        checkpoint = torch.load(resume_from, map_location="cpu" if train_cfg.get("continuation_source") else device)
+        if amp_runtime is not None:
+            saved_amp = checkpoint.get("amp_runtime")
+            if not saved_amp or saved_amp.get("policy") != amp_policy:
+                raise RuntimeError("Cannot change AMP calibration policy or resume an unrecorded trial")
+            amp_runtime = saved_amp
+            scaler.load_state_dict(saved_amp["scaler"])
         model.load_state_dict(checkpoint.get("model", checkpoint), strict=True)
         if ema is not None:
             ema_state = checkpoint.get("ema")
@@ -1584,7 +1993,11 @@ def train(
             optimizer.load_state_dict(checkpoint["optimizer"])
         completed_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = completed_epoch + 1
+        if official_recovery:
+            trim_uncommitted_epoch_metrics(output_dir, completed_epoch)
         total_step = int(checkpoint.get("step", 0))
+        if train_cfg.get("continuation_source"):
+            del checkpoint
         if metrics_path.exists():
             with metrics_path.open(encoding="utf-8") as file:
                 rows = list(csv.DictReader(file))
@@ -1607,6 +2020,13 @@ def train(
         if start_epoch > epochs:
             print(f"training_already_complete: {output_dir}")
             return 0
+
+    if staged_unfreeze and start_epoch > freeze_backbone_epochs:
+        unfreezed_parameters = _set_raw_dino_trainable(model, trainable=True)
+        print(
+            "staged_unfreeze_resume: "
+            f"start_epoch={start_epoch} parameters={unfreezed_parameters}"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     first_image_size = progressive_image_size_for_epoch(config, start_epoch, epochs)
@@ -1637,6 +2057,7 @@ def train(
         "epochs": epochs,
         "device": device,
         "amp": bool(scaler.is_enabled()),
+        "amp_calibration": amp_policy,
         "tf32": bool(torch.backends.cuda.matmul.allow_tf32) if str(device).startswith("cuda") else False,
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark) if str(device).startswith("cuda") else False,
         "matmul_precision": str(train_cfg.get("matmul_precision", "")) if str(device).startswith("cuda") else "",
@@ -1658,6 +2079,11 @@ def train(
         "seed": seed,
         "scheduler": str(train_cfg.get("scheduler", "none")),
         "warmup_epochs": int(train_cfg.get("warmup_epochs", 0)),
+        "backbone_policy": backbone_policy,
+        "freeze_backbone_epochs": freeze_backbone_epochs,
+        "backbone_unfreeze_epoch": (
+            freeze_backbone_epochs + 1 if staged_unfreeze else None
+        ),
         "frozen_backbone": backbone_wrapper_fully_frozen,
         "backbone_wrapper_fully_frozen": backbone_wrapper_fully_frozen,
         "dino_backbone_frozen": dino_backbone_frozen,
@@ -1669,6 +2095,16 @@ def train(
     }
     (output_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    isolated_probe = bool(train_cfg.get("official_sfp_preflight_probe", False))
+    runtime_progress = (RuntimeProgress(output_dir / "runtime_progress.json", device)
+                        if config.get("model", {}).get("type") in OFFICIAL_TYPES and not isolated_probe
+                        else None)
+    if isolated_probe:
+        if train_cfg.get("production_mode", False) or not str(device).startswith("cuda"):
+            raise ValueError("Official-SFP timing probe must be isolated CUDA non-production")
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    probe_started, probe_images, probe_train_seconds = None, 0, None
     started = time.monotonic()
     fieldnames = ["epoch", *LOSS_LOG_KEYS, "lr", "elapsed_seconds"]
     validation_cfg = dict(train_cfg.get("validation", {}) or {})
@@ -1676,10 +2112,10 @@ def train(
     validation_every = int(validation_cfg.get("every", validation_cfg.get("val_every", 0)) or 0)
     validation_split = str(validation_cfg.get("split", "val"))
     validation_image_size_raw = validation_cfg.get("image_size", train_cfg.get("imgsz", config.get("data", {}).get("image_size", 896)))
-    if isinstance(validation_image_size_raw, (list, tuple)):
-        validation_image_size = int(validation_image_size_raw[0])
-    else:
-        validation_image_size = int(validation_image_size_raw)
+    parsed_validation_size = parse_image_size(validation_image_size_raw)
+    if parsed_validation_size is None:
+        raise ValueError("validation.image_size must be configured")
+    validation_image_size = parsed_validation_size
     validation_fixed_threshold = float(validation_cfg.get("fixed_threshold", validation_cfg.get("threshold", 0.30)))
     validation_score_min = float(validation_cfg.get("score_min", config.get("inference", {}).get("score_thr", 0.001)))
     validation_max_images = validation_cfg.get("max_images")
@@ -1716,10 +2152,19 @@ def train(
         if write_header:
             writer.writeheader()
         for epoch in range(start_epoch, epochs + 1):
+            if staged_unfreeze and epoch == freeze_backbone_epochs + 1:
+                unfreezed_parameters = _set_raw_dino_trainable(
+                    model, trainable=True
+                )
+                print(
+                    "staged_unfreeze: "
+                    f"epoch={epoch} parameters={unfreezed_parameters} "
+                    f"lr_backbone={float(train_cfg.get('lr_backbone', 0.0))}"
+                )
             if hasattr(model, "set_epoch"):
                 model.set_epoch(epoch)
             if hasattr(dataset, "set_epoch"):
-                dataset.set_epoch(epoch, epochs)
+                dataset.set_epoch(epoch, int(train_cfg.get("augmentation_schedule_epochs", epochs)))
             epoch_image_size = progressive_image_size_for_epoch(config, epoch, epochs)
             if loader is None or epoch_image_size != loader_image_size:
                 set_dataset_image_size(dataset, epoch_image_size)
@@ -1733,6 +2178,50 @@ def train(
                     generator=generator,
                     train_cfg=train_cfg,
                 ))
+            if amp_runtime is not None and scaler.is_enabled():
+                state = "unfrozen" if any(p.requires_grad for p in model.backbone.parameters()) else "frozen"
+                if state not in amp_runtime["calibrated_states"]:
+                    if feature_cache is not None:
+                        raise ValueError("Experimental calibration does not support cached features")
+                    report_path = output_dir / f"amp_calibration_{state}.json"
+                    with preserve_rng_and_buffers(model):
+                        calibration_generator = torch.Generator()
+                        calibration_generator.set_state(generator.get_state())
+                        calibration_loader = iter(DataLoader(**dataloader_kwargs(
+                            dataset=dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=0, device=device, generator=calibration_generator,
+                            train_cfg=train_cfg)))
+                        windows = []
+                        for _ in range(amp_policy["required_finite_windows"]):
+                            window = []
+                            for _ in range(gradient_accumulation_steps):
+                                try:
+                                    window.append(next(calibration_loader))
+                                except StopIteration:
+                                    break
+                            if not window:
+                                window = windows[0]
+                            windows.append(window)
+
+                        def backward_calibration_window(index):
+                            window = windows[index % len(windows)]
+                            for cpu_images, cpu_targets in window:
+                                calibration_images = cpu_images.to(device)
+                                calibration_targets = move_targets_to_device(cpu_targets, device)
+                                with torch.amp.autocast("cuda", enabled=True):
+                                    calibration_loss = model(calibration_images, calibration_targets)["loss_total"]
+                                if not torch.isfinite(calibration_loss).all():
+                                    raise RuntimeError("Non-finite forward loss during AMP calibration")
+                                scaler.scale(calibration_loss / len(window)).backward()
+
+                        calibrated = calibrate_gradients(model=model, optimizer=optimizer,
+                            scaler=scaler, policy=amp_policy, backward_window=backward_calibration_window,
+                            report=lambda item: write_json_atomic(report_path, item))
+                    amp_runtime["calibrated_states"][state] = calibrated
+                    del windows, calibration_loader
+                    print(f"amp_calibration_complete: state={state} scale={scaler.get_scale()} windows={len(calibrated['windows'])} optimizer_updates=0", flush=True)
+                    if wandb_run is not None:
+                        wandb_run.config.update({f"amp_calibration_{state}": calibrated}, allow_val_change=True)
             sums = {key: 0.0 for key in LOSS_LOG_KEYS}
             observed_loss_keys: set[str] = set()
             batches = 0
@@ -1741,6 +2230,9 @@ def train(
             if max_train_batches is not None:
                 total_batches = min(total_batches, int(max_train_batches))
             optimizer.zero_grad(set_to_none=True)
+            if runtime_progress is not None:
+                runtime_progress.update(phase="training", epoch=epoch, completed_batches=0,
+                    total_batches=total_batches, optimizer_step=total_step, force=True)
             for batch_index, (images, targets) in enumerate(loader, start=1):
                 if max_train_batches is not None and batch_index > max_train_batches:
                     break
@@ -1770,9 +2262,12 @@ def train(
                 should_step = batch_index % gradient_accumulation_steps == 0 or batch_index == total_batches
                 if should_step:
                     scaler.unscale_(optimizer)
+                    if (isolated_probe or amp_policy) and not gradients_finite(trainable_params):
+                        raise RuntimeError("Non-finite gradient in official-SFP verification (after calibration if enabled)")
                     torch.nn.utils.clip_grad_norm_(
                         trainable_params,
                         max_norm=float(train_cfg.get("max_grad_norm", 10.0)),
+                        **({"error_if_nonfinite": True} if amp_policy else {}),
                     )
                     scale_before_step = scaler.get_scale() if scaler.is_enabled() else 1.0
                     scaler.step(optimizer)
@@ -1785,18 +2280,32 @@ def train(
                         optimizer_steps_this_epoch += 1
                         if ema is not None:
                             ema.update(model)
+                if isolated_probe:
+                    if probe_started is not None:
+                        probe_images += len(targets)
+                    elif total_step >= 2:
+                        torch.cuda.synchronize(device)
+                        probe_started = time.monotonic()
                 batches += 1
                 observed_loss_keys.update(str(key) for key in loss_dict)
                 for key in sums:
                     value = loss_dict.get(key)
                     if value is not None:
                         sums[key] += float(value.detach().cpu())
+                if runtime_progress is not None:
+                    runtime_progress.update(phase="training", epoch=epoch,
+                        completed_batches=batches, total_batches=total_batches,
+                        optimizer_step=total_step, loss=sums["loss_total"] / batches,
+                        force=batches == total_batches)
 
             if batches == 0:
                 raise RuntimeError("No batches were processed.")
             row = {key: sums[key] / batches for key in sums}
             row["epoch"] = epoch
             row["lr"] = float(optimizer.param_groups[0]["lr"])
+            if isolated_probe:
+                torch.cuda.synchronize(device)
+                probe_train_seconds = time.monotonic() - probe_started if probe_started else None
             row["elapsed_seconds"] = round(previous_elapsed + time.monotonic() - started, 3)
             writer.writerow({key: row.get(key, "") for key in fieldnames})
             metrics_file.flush()
@@ -1826,16 +2335,21 @@ def train(
                 wandb_metrics["train/bbox_loss"] = float(row["loss_bbox_l1"])
             if "loss_kpt" in observed_loss_keys:
                 wandb_metrics["train/keypoint_loss"] = float(row["loss_kpt"])
-            save_checkpoint(
-                output_dir / "checkpoints" / "last.pt",
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                step=total_step,
-                config=config,
-                metrics=metrics,
-                ema=ema,
-            )
+            if amp_runtime is not None:
+                amp_runtime["scaler"] = scaler.state_dict()
+                wandb_metrics["train/amp_scale"] = scaler.get_scale()
+            if not official_recovery:
+                save_checkpoint(
+                    output_dir / "checkpoints" / "last.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    step=total_step,
+                    config=config,
+                    metrics=metrics,
+                    ema=ema,
+                    amp_runtime=amp_runtime,
+                )
             if row["loss_total"] < best_loss:
                 best_loss = row["loss_total"]
                 save_checkpoint(
@@ -1847,6 +2361,7 @@ def train(
                     config=config,
                     metrics=metrics,
                     ema=ema,
+                    amp_runtime=amp_runtime,
                 )
             if save_every > 0 and epoch % save_every == 0:
                 save_checkpoint(
@@ -1858,9 +2373,14 @@ def train(
                     config=config,
                     metrics=metrics,
                     ema=ema,
+                    amp_runtime=amp_runtime,
                 )
                 prune_periodic_checkpoints(output_dir / "checkpoints", keep=1)
             if validation_enabled and validation_every > 0 and (epoch % validation_every == 0 or epoch == epochs):
+                if runtime_progress is not None:
+                    runtime_progress.update(phase="validation", epoch=epoch,
+                        completed_batches=batches, total_batches=total_batches,
+                        optimizer_step=total_step, force=True)
                 val_metrics = validate_detection_split(
                     ema.module if ema is not None else model,
                     config,
@@ -1891,6 +2411,7 @@ def train(
                         config=config,
                         metrics={**metrics, **{f"val_{key}": float(value) for key, value in val_metrics.items() if isinstance(value, (int, float))}},
                         ema=ema,
+                        amp_runtime=amp_runtime,
                     )
                 if current_validation_score > early_stopping_best + early_stopping_min_delta:
                     early_stopping_best = current_validation_score
@@ -1973,14 +2494,33 @@ def train(
                             f"best_mAP={early_stopping_best:.6f} "
                             f"bad_validations={early_stopping_bad_validations}/{early_stopping_patience}"
                         )
+            if official_recovery:
+                # A validation OOM, including on the final epoch, must retry
+                # that epoch rather than resume past the missed validation.
+                save_checkpoint(output_dir / "checkpoints" / "last.pt",
+                    model=model, optimizer=optimizer, epoch=epoch, step=total_step,
+                    config=config, metrics=metrics, ema=ema, amp_runtime=amp_runtime)
             if scheduler is not None and optimizer_steps_this_epoch > 0:
                 scheduler.step()
             if wandb_run is not None:
                 wandb_run.log(wandb_metrics, step=epoch)
+            if runtime_progress is not None:
+                runtime_progress.update(phase="epoch_completed", epoch=epoch,
+                    completed_batches=batches, total_batches=total_batches,
+                    optimizer_step=total_step, force=True)
             if early_stopping_triggered:
                 break
     prune_periodic_checkpoints(output_dir / "checkpoints", keep=0)
+    retention_cfg = dict(train_cfg.get("checkpoint_retention", {}) or {})
+    if bool(retention_cfg.get("only_last_and_validation_best", False)):
+        (output_dir / "checkpoints" / "best_loss.pt").unlink(missing_ok=True)
     print(f"training_complete: {output_dir} early_stopped={early_stopping_triggered}")
+    if isolated_probe:
+        torch.cuda.synchronize(device)
+        (output_dir / "isolated_probe.json").write_text(json.dumps(dict(
+            train_seconds_after_warmup=probe_train_seconds, measured_train_images=probe_images,
+            warmup_optimizer_updates=2, peak_reserved_bytes=torch.cuda.max_memory_reserved(device),
+            peak_allocated_bytes=torch.cuda.max_memory_allocated(device)),indent=2)+"\n",encoding="utf-8")
     return 0
 
 
@@ -1995,7 +2535,14 @@ def overfit_smoke(
 ) -> int:
     smoke_config = copy.deepcopy(config)
     model_type = str(smoke_config.get("model", {}).get("type", "")).lower()
-    ellipse_smoke = model_type in {"dinov3_deimv2_ellipse", "dino_deimv2_ellipse"}
+    ellipse_smoke = model_type in {
+        "dinov3_codino_official_ellipse",
+        "dinov3_deimv2_ellipse",
+        "dino_deimv2_ellipse",
+        "dinov3_codino_ellipse",
+        "dino_codino_ellipse",
+        "co_dino_ellipse",
+    }
     if ellipse_smoke:
         smoke_config.setdefault("augmentation", {})["enabled"] = False
         smoke_config.setdefault("model", {}).setdefault("decoder", {})["num_denoising"] = 0
@@ -2019,7 +2566,10 @@ def overfit_smoke(
         model.set_epoch(1)
     if ellipse_smoke:
         for name, parameter in model.named_parameters():
-            parameter.requires_grad_(name.startswith("decoder.ellipse_head."))
+            parameter.requires_grad_(
+                name.startswith("decoder.ellipse_head.")
+                or name.startswith("decoder.ellipse_refinement.")
+            )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=0.0)
 
@@ -2097,8 +2647,11 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     if args.image_size is not None:
-        config.setdefault("data", {})["image_size"] = args.image_size
-        config.setdefault("train", {})["imgsz"] = args.image_size
+        image_size_override = parse_image_size(args.image_size)
+        if image_size_override is None:
+            raise ValueError("--image-size must be INT or HEIGHTxWIDTH")
+        config.setdefault("data", {})["image_size"] = image_size_override
+        config.setdefault("train", {})["imgsz"] = image_size_override
     if args.batch_size is not None:
         config.setdefault("train", {})["batch_size"] = args.batch_size
     if args.epochs is not None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -90,6 +91,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--gradient-accumulation-steps", type=int)
+    parser.add_argument("--val-every", type=int)
+    parser.add_argument("--validation-batch-size", type=int)
+    parser.add_argument(
+        "--disable-early-stopping",
+        action="store_true",
+        help=(
+            "Gate-only override that collects the complete bounded learning "
+            "curve; production keeps the config's validation early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-augmentation-epoch",
+        type=int,
+        help=(
+            "Gate-only deterministic overfit override. Reuses one complete "
+            "augmentation realization across bounded epochs."
+        ),
+    )
+    parser.add_argument(
+        "--batch-plan",
+        type=Path,
+        help="Resolved preflight plan recorded in the training config and W&B.",
+    )
     return parser.parse_args()
 
 
@@ -132,6 +158,42 @@ def main() -> int:
             raise ValueError("--epochs must be positive")
         config.raw["train"]["epochs"] = int(args.epochs)
     for key, value in (
+        ("batch_size", args.batch_size),
+        ("gradient_accumulation_steps", args.gradient_accumulation_steps),
+    ):
+        if value is not None:
+            if value <= 0:
+                raise ValueError(f"--{key.replace('_', '-')} must be positive")
+            config.raw["train"][key] = int(value)
+    if args.val_every is not None:
+        if args.val_every <= 0:
+            raise ValueError("--val-every must be positive")
+        config.raw["train"].setdefault("validation", {})["enabled"] = True
+        config.raw["train"]["validation"]["every"] = int(args.val_every)
+    if args.validation_batch_size is not None:
+        if args.validation_batch_size <= 0:
+            raise ValueError("--validation-batch-size must be positive")
+        config.raw["train"].setdefault("validation", {})["batch_size"] = int(
+            args.validation_batch_size
+        )
+    if args.disable_early_stopping:
+        config.raw["train"].setdefault("early_stopping", {})["enabled"] = False
+    if args.fixed_augmentation_epoch is not None:
+        if args.fixed_augmentation_epoch < 0:
+            raise ValueError("--fixed-augmentation-epoch must be non-negative")
+        config.raw["train"]["fixed_augmentation_epoch"] = int(
+            args.fixed_augmentation_epoch
+        )
+        # Worker RNG state persists across epochs. Run this bounded gate in
+        # process so resetting the augmentation RNG truly replays samples.
+        config.raw["train"]["num_workers"] = 0
+    if args.batch_plan is not None:
+        batch_plan_path = args.batch_plan.resolve()
+        config.raw["train"]["resolved_batch_plan_path"] = str(batch_plan_path)
+        config.raw["train"]["resolved_batch_plan"] = json.loads(
+            batch_plan_path.read_text(encoding="utf-8")
+        )
+    for key, value in (
         ("max_train_samples", args.max_train_samples),
         ("max_val_samples", args.max_val_samples),
     ):
@@ -156,6 +218,7 @@ def main() -> int:
             device=device,
             check_detector=not args.skip_detector_preflight,
             require_wandb=args.stage == "all" and wandb_enabled,
+            variants=variants,
         )
     if args.stage in {"train", "all"}:
         # A training-only call still verifies W&B before starting the first epoch.
@@ -165,6 +228,7 @@ def main() -> int:
                 device=device,
                 check_detector=False,
                 require_wandb=wandb_enabled,
+                variants=variants,
             )
         train_variants(
             config,

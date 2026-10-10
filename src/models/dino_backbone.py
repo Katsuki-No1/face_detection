@@ -398,6 +398,86 @@ class DinoBackbone(nn.Module):
             allow_non_divisible=self.allow_non_divisible,
         )
 
+    def forward_intermediate_feature_maps(
+        self,
+        images: torch.Tensor,
+        *,
+        layer_indexes: Sequence[int],
+    ) -> tuple[torch.Tensor, ...]:
+        """Return patch-token maps from explicit transformer block indexes.
+
+        This is intentionally opt-in so the historical single final-layer
+        ``forward`` contract and its checkpoints remain unchanged.
+        """
+
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(
+                f"Expected images with shape (B, 3, H, W), got {tuple(images.shape)}"
+            )
+        indexes = tuple(int(index) for index in layer_indexes)
+        if not indexes:
+            raise ValueError("layer_indexes must contain at least one DINO block index")
+        if len(set(indexes)) != len(indexes):
+            raise ValueError(f"layer_indexes must be unique, got {indexes}")
+        getter = getattr(self.backbone, "get_intermediate_layers", None)
+        if getter is None:
+            raise RuntimeError(
+                "The configured DINO backbone does not expose "
+                "get_intermediate_layers; multi-scale extraction cannot be enabled"
+            )
+
+        def extract() -> Any:
+            return getter(
+                images,
+                n=indexes,
+                return_class_token=True,
+            )
+
+        if self.freeze and not any(
+            parameter.requires_grad for parameter in self.backbone.parameters()
+        ):
+            with torch.no_grad():
+                outputs = extract()
+        else:
+            outputs = extract()
+        if not isinstance(outputs, Sequence) or isinstance(outputs, (str, bytes)):
+            raise TypeError(
+                "DINO get_intermediate_layers must return a sequence, got "
+                f"{type(outputs)!r}"
+            )
+        if len(outputs) != len(indexes):
+            raise RuntimeError(
+                "DINO intermediate output count mismatch: "
+                f"requested={len(indexes)}, returned={len(outputs)}"
+            )
+
+        feature_maps: list[torch.Tensor] = []
+        for layer_output in outputs:
+            if (
+                isinstance(layer_output, Sequence)
+                and not isinstance(layer_output, (str, bytes))
+                and layer_output
+                and isinstance(layer_output[0], torch.Tensor)
+            ):
+                tokens = layer_output[0]
+                patch_tokens_only = True
+            else:
+                tokens, patch_tokens_only = _extract_token_tensor(
+                    layer_output,
+                    self.token_key,
+                )
+            feature_maps.append(
+                tokens_to_feature_map(
+                    tokens,
+                    image_size=images.shape[-2:],
+                    patch_size=self.patch_size,
+                    num_prefix_tokens=self.num_prefix_tokens,
+                    patch_tokens_only=patch_tokens_only,
+                    allow_non_divisible=self.allow_non_divisible,
+                )
+            )
+        return tuple(feature_maps)
+
 
 def build_dino_backbone(config: Mapping[str, Any] | None = None, *, backbone: nn.Module | None = None) -> DinoBackbone:
     cfg = dict(config or {})

@@ -30,6 +30,22 @@ from .ellipse_error_model import (
     ellipse_residual,
     validate_ellipse_error_model,
 )
+from .letterbox import (
+    DEFAULT_PAD_COLOR,
+    LetterboxGeometry,
+    letterbox_image,
+    normalize_canvas_size,
+    restore_detections,
+    transform_target,
+)
+from .landmark_occlusion import (
+    LandmarkOcclusionConfig,
+    apply_landmark_occlusion_numpy,
+    apply_landmark_occlusion_tensor,
+    ellipse_region_mask,
+    generate_landmark_occlusion_mask,
+    transform_ellipse_affine,
+)
 
 __all__ = [
     "AugmentedFaceKeypointDataset",
@@ -37,11 +53,16 @@ __all__ = [
     "ELLIPSE_ERROR_FEATURE_NAMES",
     "EllipseErrorSample",
     "EllipseErrorSampler",
+    "DEFAULT_PAD_COLOR",
     "FACE_KEYPOINT_NAMES",
     "FaceKeypointDataset",
+    "LetterboxGeometry",
+    "LandmarkOcclusionConfig",
     "SyntheticFaceKeypointDataset",
     "apply_ellipse_residual",
     "apply_ellipse_border_crop",
+    "apply_landmark_occlusion_numpy",
+    "apply_landmark_occlusion_tensor",
     "apply_geometry",
     "apply_horizontal_flip",
     "apply_mixup",
@@ -52,8 +73,15 @@ __all__ = [
     "ellipse_params_to_xyxy",
     "ellipse_to_params",
     "ellipse_to_xyxy",
+    "ellipse_region_mask",
+    "generate_landmark_occlusion_mask",
     "has_active_augmentation",
+    "letterbox_image",
+    "normalize_canvas_size",
+    "restore_detections",
     "select_ellipse_border_crop",
     "transform_target_homography",
+    "transform_target",
+    "transform_ellipse_affine",
     "validate_ellipse_error_model",
 ]

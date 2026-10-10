@@ -1,0 +1,111 @@
+schema_version: local-baseline-v1
+role: current_local_baseline
+promoted_on: '2026-10-09'
+authorization: 'User: ではα=2をbaselineとして更新しましょう'
+# Authoritative terminology: baseline means FACE detection AND keypoint detection.
+# Legacy top-level model/evaluation fields below describe only the FACE component
+# so existing FACE comparison consumers retain their authenticated contract.
+baseline_pipeline:
+  role: current_complete_local_baseline
+  definition: 顔検出とkeypoint検出をセットにしたパイプライン全体
+  clarified_on: '2026-10-09'
+  authorization: 'User: 顔検出とkeypoint検出はセットでbaselineになるので、そのように記載してください'
+  display_name: MAL alpha2 FACE/ellipse + A1/A2 DINOv3 Query Refinement
+  topology: ordered_cascade
+  stages:
+  - full-image FACE/ellipse (MAL alpha2)
+  - Face-crop DINOv3 Query Refinement (retained landmark-occlusion A1/A2)
+  head_stage: false
+  components:
+    face:
+      architecture_id: mal_alpha2_ellipse_from_existing_wider
+      asset_reference: top-level config/checkpoint/operating_points/evaluations
+      evidence_scope: FACE/ellipse component only
+    keypoints:
+      variant: query_refinement
+      inherited_from: deimv2_l_query_refinement_landmark_occlusion_a1_a2
+      config:
+        path: keypoint_comparison1/configs/dinov3_vits16_face_pose_drive_v2_landmark_occlusion.yaml
+        sha256: e7738fa0da455ea8fe1ecd14a564571e3bcd9034a5afc643e15cd80448e0c31f
+      checkpoint:
+        path: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion/query_refinement/checkpoints/best_nme.pt
+        sha256: baf7a6d0b1df6d1089357b2f28ffc1b2da3aadbb6239bae2cb5085d36ef016e0
+      replacement: none; retain existing keypoint component
+  combined_inference_status: not_run
+  combined_evaluation_status: not_run
+  evidence_note: Detector-only metrics and the 2026-10-09 montage do not certify the combined baseline.
+  runtime_note: Existing active-learning/TensorRT registries still execute the previous complete baseline.
+top_level_asset_scope: current_baseline_face_component_only
+architecture_id: mal_alpha2_ellipse_from_existing_wider
+display_name: 'Local baseline FACE component: DEIMv2-L existing WIDER -> target MAL alpha2 + A1/A2'
+deployment:
+  scope: face_component_only; complete baseline is defined in baseline_pipeline
+  topology: non-cascade
+  stages:
+  - full-image FACE/ellipse
+  capabilities:
+  - face
+  - ellipse
+  unsupported:
+    head: No HEAD stage
+    keypoints: Provided by baseline_pipeline keypoint component, absent from this FACE-only component
+    state: No state branch in this FACE-only component
+config:
+  path: configs/dinov3_deimv2/mal_alpha2_ellipse_from_existing_wider.yaml
+  sha256: b8c98e1943fcc3150f2fca3865701c88e1d521cbc2ec7669880cb79d32a6485c
+checkpoint:
+  path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/checkpoints/best_val_map.pt
+  sha256: 3bd6e40517bc6f6e276c47e1dfdf639173e8b9c04d32486adbb6f4b407f006a0
+  epoch: 45
+  step: 11920
+  weight_branch: ema
+  selection: validation bbox mAP50_95
+operating_points:
+  common_face_score: 0.33
+  precision_gt_0_90: 0.2666015625
+  selected_on_split: val
+  selection_metric: bbox IoU >= 0.50 precision > 0.90, maximize recall
+  prediction_cap: 100
+evaluations:
+  val:
+    metrics.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/val/baseline_aligned/metrics.json
+      sha256: 0ca2e6d9b24a395eca960cf1175d99d8600d9c491918b0ac0f0b3503f956ec42
+    success.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/val/baseline_aligned/success.json
+      sha256: 19100e81f69c9bac6c0dfb1bd92a8d34485962221149b523e8a9c072f2c869ba
+    candidate/thresholds.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/val/baseline_aligned/candidate/thresholds.json
+      sha256: 1d4f7f2add2d8977c59d633b7de4ffd0d8028bdd429e1db4151c82f7277257b5
+    candidate/predictions.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/val/baseline_aligned/candidate/predictions.json
+      sha256: 31f5832ebea148016f8b8f5456b2fda89724b9d1dd026f95fa5b1431530ca7fd
+    candidate/provenance.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/val/baseline_aligned/candidate/provenance.json
+      sha256: b0dd05274ee962e0c99b92e420b5349b6f52dc77b2ac1524c727bc50d6fea4a1
+  test:
+    metrics.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/test/baseline_aligned/metrics.json
+      sha256: 202d7c76f9efd668bfbd0554623f8891ae3be1e3235858e2f61f74c12c7424f5
+    success.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/test/baseline_aligned/success.json
+      sha256: 533595cbef95abbf59ad1830e123e685df16e353a354eaade810f769f568c958
+    candidate/predictions.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/test/baseline_aligned/candidate/predictions.json
+      sha256: 8540dd6e37bbd440de79b2c839971bdeaff6ce187d26619c85bdc2614ed04ac8
+    candidate/provenance.json:
+      path: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/evaluation/test/baseline_aligned/candidate/provenance.json
+      sha256: 8933ce832de6fdd512307150f1772427000beff4dd48917198c8d80dd64260a2
+previous_local_baseline:
+  architecture_id: deimv2_l_query_refinement_landmark_occlusion_a1_a2
+  role: previous_complete_local_baseline; existing active-learning/TensorRT execution retained
+global_reference:
+  path: reference_model/face_dino_v2_distribution
+  changed: false
+limitations:
+- No new threshold/checkpoint search on test. Promotion is the explicit user decision.
+- No automatic Query Refinement composition or TensorRT export; existing active-learning
+  registries remain pinned to prior complete pipeline.
+- The current baseline definition includes the retained Query Refinement component.
+  Its new composition has not been inferred or evaluated by this wording update.
+- Historic reports and their baseline identities are immutable.

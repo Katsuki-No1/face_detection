@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -45,6 +46,14 @@ def load_config(path: Path) -> dict[str, Any]:
                     continue
                 candidate = Path(str(value)).expanduser()
                 annotation_paths[key] = str(candidate if candidate.is_absolute() else (REPO_ROOT / candidate).resolve())
+        image_roots = data_cfg.get("image_roots")
+        if isinstance(image_roots, dict):
+            for key in tuple(image_roots):
+                value = image_roots.get(key)
+                if value in {None, ""}:
+                    continue
+                candidate = Path(str(value)).expanduser()
+                image_roots[key] = str(candidate if candidate.is_absolute() else (REPO_ROOT / candidate).resolve())
     model_cfg = config.get("model", {})
     if isinstance(model_cfg, dict):
         backbone_cfg = model_cfg.get("backbone", {})
@@ -61,6 +70,16 @@ def load_config(path: Path) -> dict[str, Any]:
             if isinstance(asset, dict):
                 resolve_in(asset, "path")
     return config
+
+
+def resolved_config_sha256(config: dict[str, Any]) -> str:
+    payload = json.dumps(
+        config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def class_names(config: dict[str, Any]) -> list[str]:
@@ -92,9 +111,11 @@ def run_configured_leakage_audit(config: dict[str, Any]) -> dict[str, Any] | Non
         )
     splits = tuple(str(split) for split in audit_cfg.get("splits", ("train", "val", "test")))
     configured_paths = data_cfg.get("annotation_paths")
+    configured_roots = data_cfg.get("image_roots")
     return audit_coco_splits(
         Path(data_root),
         annotation_paths=configured_paths if isinstance(configured_paths, dict) else None,
+        image_roots=configured_roots if isinstance(configured_roots, dict) else None,
         splits=splits,
         expected_category_id=configured_category_ids[0],
     )
@@ -183,15 +204,92 @@ def image_paths(input_path: Path) -> list[Path]:
     return sorted(path for path in input_path.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and path.is_file())
 
 
-def image_to_tensor(image: Image.Image, image_size: int | None) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
+def parse_image_size(
+    value: int | str | list[int] | tuple[int, int] | None,
+) -> int | tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(f"image size must be an int or [height, width], got {value}")
+        return int(value[0]), int(value[1])
+    text = str(value).strip().lower().replace(",", "x")
+    if "x" not in text:
+        return int(text)
+    parts = [part.strip() for part in text.split("x") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"image size must be INT or HEIGHTxWIDTH, got {value!r}")
+    return int(parts[0]), int(parts[1])
+
+
+def prepare_image_tensor(
+    image: Image.Image,
+    image_size: int | str | list[int] | tuple[int, int] | None,
+    *,
+    resize_mode: str = "stretch",
+    pad_color: int | list[int] | tuple[int, int, int] | None = None,
+    size_divisor: int = 32,
+) -> tuple[
+    torch.Tensor,
+    tuple[int, int],
+    tuple[int, int],
+    Any | None,
+    torch.Tensor | None,
+]:
     image = image.convert("RGB")
     original_w, original_h = image.size
-    if image_size is not None:
-        image = image.resize((int(image_size), int(image_size)), Image.BILINEAR)
+    parsed_size = parse_image_size(image_size)
+    geometry = None
+    padding_mask = None
+    if parsed_size is not None and str(resize_mode).lower() == "letterbox":
+        from src.data.letterbox import letterbox_image
+
+        image, geometry, padding_mask = letterbox_image(
+            image,
+            parsed_size,
+            pad_color=pad_color,
+            divisor=size_divisor,
+        )
+    elif parsed_size is not None:
+        if str(resize_mode).lower() != "stretch":
+            raise ValueError(
+                f"resize_mode must be 'stretch' or 'letterbox', got {resize_mode!r}"
+            )
+        if isinstance(parsed_size, int):
+            output_h = output_w = parsed_size
+        else:
+            output_h, output_w = parsed_size
+        image = image.resize((int(output_w), int(output_h)), Image.BILINEAR)
     input_w, input_h = image.size
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).contiguous()
-    return tensor, (input_h, input_w), (original_h, original_w)
+    return (
+        tensor,
+        (input_h, input_w),
+        (original_h, original_w),
+        geometry,
+        padding_mask,
+    )
+
+
+def image_to_tensor(
+    image: Image.Image,
+    image_size: int | str | list[int] | tuple[int, int] | None,
+    *,
+    resize_mode: str = "stretch",
+    pad_color: int | list[int] | tuple[int, int, int] | None = None,
+    size_divisor: int = 32,
+) -> tuple[torch.Tensor, tuple[int, int], tuple[int, int]]:
+    tensor, input_hw, original_hw, _geometry, _padding_mask = prepare_image_tensor(
+        image,
+        image_size,
+        resize_mode=resize_mode,
+        pad_color=pad_color,
+        size_divisor=size_divisor,
+    )
+    return tensor, input_hw, original_hw
 
 
 def scale_detections_to_original(
@@ -199,7 +297,12 @@ def scale_detections_to_original(
     *,
     input_hw: tuple[int, int],
     original_hw: tuple[int, int],
+    geometry: Any | None = None,
 ) -> dict[str, torch.Tensor]:
+    if geometry is not None:
+        from src.data.letterbox import restore_detections
+
+        return restore_detections(detections, geometry)
     input_h, input_w = int(input_hw[0]), int(input_hw[1])
     original_h, original_w = int(original_hw[0]), int(original_hw[1])
     scale_x = original_w / float(max(1, input_w))

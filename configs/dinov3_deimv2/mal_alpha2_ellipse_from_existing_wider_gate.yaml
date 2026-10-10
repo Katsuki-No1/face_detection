@@ -1,0 +1,12 @@
+extends: mal_alpha2_ellipse_from_existing_wider.yaml
+train:
+  production_mode: false
+  minimum_epochs: 1
+  warmup_epochs: 3
+  flat_epochs: 3
+  augmentation_schedule_epochs: 70
+  early_stopping:
+    enabled: false
+wandb:
+  enabled: false
+  mode: disabled

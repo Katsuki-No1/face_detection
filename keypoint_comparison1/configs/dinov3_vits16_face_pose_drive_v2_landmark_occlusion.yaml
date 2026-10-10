@@ -1,0 +1,48 @@
+extends: dinov3_vits16_face_pose_drive_v2.yaml
+
+experiment_name: dinov3_vits16_face_landmarks_face_pose_drive_v2_balanced_811_landmark_occlusion_factorized_state
+
+data:
+  augmentation:
+    # Disable the legacy crop-global random rectangle. The replacement uses
+    # the target face ellipse as denominator and preserves COCO v=0/1/2.
+    occlusion_probability: 0.0
+    landmark_guided_occlusion:
+      probability: 0.30
+      regular_probability: 0.50
+      landmark_anchor_probability: 0.70
+      face_overlap: [0.10, 0.40]
+      center_offset_fraction: 0.12
+      maximum_attempts: 128
+
+model:
+  backbone:
+    initialize_from_deim_checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco/checkpoints/best_val_ellipse_map.pt
+
+detector:
+  name: deimv2_l_dinov3_vits16_balanced_811_ellipse_landmark_occlusion
+  config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco.yaml
+  checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco/checkpoints/best_val_ellipse_map.pt
+
+outputs:
+  root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion
+
+evaluation:
+  # This historical waterfall benchmark composes the two-stage model with an
+  # external Shared Co-DINO HEAD detector. It is intentionally three-stage;
+  # the model's ordinary primary validation remains HEAD-free.
+  pipeline_contract:
+    type: cascade
+    stages: [full_image_head, head_crop_face_ellipse, face_crop_keypoint]
+  defer_until_all_checkpoints: false
+  architecture_id: deimv2_l_query_refinement_landmark_occlusion_a1_a2
+  baseline_aligned_output_root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion/query_refinement/evaluation
+  predicted_head:
+    config: configs/head_codino/shared_three_stage_960.yaml
+    checkpoint: runs/shared_head_codino_vits16plus_960_balanced_811/last.pth
+    predictions:
+      val: outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/val/predictions.json
+      test: outputs/shared_head_codino_vits16plus_960_balanced_811/evaluation/test/predictions.json
+
+wandb:
+  group: face_pose_drive_v2_balanced_811_landmark_occlusion_factorized_state

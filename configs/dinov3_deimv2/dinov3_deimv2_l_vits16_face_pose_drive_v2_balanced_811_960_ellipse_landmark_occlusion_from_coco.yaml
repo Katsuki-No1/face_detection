@@ -1,0 +1,27 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_from_coco.yaml
+
+# Local-baseline FACE/ellipse retraining with explicit hard-case augmentation.
+# The network, source checkpoint, dataset, canvas, loss, and optimizer stay
+# identical to the current baseline; only the training augmentation changes.
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco
+
+augmentation:
+  # The current baseline already uses 0.20. Raise only this sampling rate so
+  # screen-edge faces are deliberately represented without changing geometry.
+  ellipse_border_crop: 0.30
+  landmark_guided_occlusion:
+    # One selected face at most per final training canvas. A1/A2 are sampled
+    # equally, so each is used on approximately 15% of training canvases.
+    probability: 0.30
+    regular_probability: 0.50
+    landmark_anchor_probability: 0.70
+    face_overlap: [0.10, 0.40]
+    center_offset_fraction: 0.12
+    maximum_attempts: 128
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco
+
+verification:
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco_preflight
+

@@ -25,6 +25,7 @@ from .checkpoint import (
     load_face_checkpoint_strict,
 )
 from .cascade import ExternalHeadCascadeRouter
+from .dense_local import EllipseAlignedDensePoseRefiner, PoseEvidenceFaceFusion
 from .model import (
     BidirectionalCooperativeDecoder,
     CooperativeCriterion,
@@ -205,6 +206,11 @@ def build_face_keypoint_cooperative_detr(
                     face_detector,
                     checkpoint,
                     prefer_ema=bool(face_cfg.get("prefer_ema", True)),
+                    component=(
+                        str(face_cfg["checkpoint_component"])
+                        if face_cfg.get("checkpoint_component")
+                        else None
+                    ),
                 )
                 load_info["face"] = {
                     **report,
@@ -313,6 +319,27 @@ def build_face_keypoint_cooperative_detr(
         hidden_dimension=int(association_cfg.get("hidden_dimension", 256)),
         inside_temperature=float(association_cfg.get("inside_temperature", 12.0)),
     )
+    dense_cfg = _section(model_cfg, "dense_local_refinement")
+    dense_local_refiner = (
+        EllipseAlignedDensePoseRefiner(
+            pose_dimension,
+            face_dimension,
+            stages=list(dense_cfg.get("stages", [])),
+            samples_per_axis=int(dense_cfg.get("samples_per_axis", 3)),
+            feature_levels=int(dense_cfg.get("feature_levels", 3)),
+            association_topk=int(dense_cfg.get("association_topk", 4)),
+            association_temperature=float(
+                dense_cfg.get("association_temperature", 1.0)
+            ),
+            roi_scale=float(dense_cfg.get("roi_scale", 1.35)),
+            minimum_association_gate=float(
+                dense_cfg.get("minimum_association_gate", 0.25)
+            ),
+            state_head_mode=pose_decoder.state_head_mode,
+        )
+        if bool(dense_cfg.get("enabled", False))
+        else None
+    )
     cooperative_cfg = _section(model_cfg, "cooperative_decoder")
     cooperative = BidirectionalCooperativeDecoder(
         face_dimension,
@@ -335,6 +362,22 @@ def build_face_keypoint_cooperative_detr(
             cooperative_cfg.get("drop_pose_to_face", 0.10)
         ),
         auxiliary_loss=bool(cooperative_cfg.get("auxiliary_loss", True)),
+    )
+    evidence_cfg = _section(model_cfg, "face_evidence_fusion")
+    face_evidence_fusion = (
+        PoseEvidenceFaceFusion(
+            pose_dimension,
+            association.geometry_dimension,
+            topk_associations=int(
+                evidence_cfg.get("topk_associations", 4)
+            ),
+            initial_gate=float(evidence_cfg.get("initial_gate", 0.10)),
+            maximum_box_delta=float(
+                evidence_cfg.get("maximum_box_delta", 0.10)
+            ),
+        )
+        if bool(evidence_cfg.get("enabled", False))
+        else None
     )
     matcher_cfg = _section(model_cfg, "pose_matcher")
     matcher = PoseHungarianMatcher(
@@ -403,6 +446,8 @@ def build_face_keypoint_cooperative_detr(
         external_head_cascade=external_head_cascade,
         shared_head_branch=shared_head_branch,
         strict_sequential_cascade=strict_sequential_cascade,
+        dense_local_refiner=dense_local_refiner,
+        face_evidence_fusion=face_evidence_fusion,
         maximum_face_queries=int(model_cfg.get("maximum_face_queries", 100)),
         face_score_threshold=float(
             inference_cfg.get("face_score_threshold", 0.05)
@@ -442,6 +487,18 @@ def build_face_keypoint_cooperative_detr(
             "training_roi_source": "ground_truth_augmented",
             "evaluation_roi_source": "predicted",
         }
+    if dense_local_refiner is not None:
+        load_info["dense_local_refiner"] = {
+            "initialization": "zero_residual_random_context",
+            "checkpoint": None,
+            "rgb_crop": False,
+            "shared_backbone_reused": True,
+        }
+    if face_evidence_fusion is not None:
+        load_info["face_evidence_fusion"] = {
+            "initialization": "zero_residual_low_gate",
+            "checkpoint": None,
+        }
     if initialize_pretrained:
         load_info["association"] = {
             "initialization": "random",
@@ -458,12 +515,14 @@ def build_face_keypoint_cooperative_detr(
 __all__ = [
     "BidirectionalCooperativeDecoder",
     "CooperativeCriterion",
+    "EllipseAlignedDensePoseRefiner",
     "ExternalHeadCascadeRouter",
     "FaceKeypointCooperativeDETR",
     "FacePoseAssociation",
     "IndependentPoseQueryDecoder",
     "KEYPOINT_NAMES",
     "PoseHungarianMatcher",
+    "PoseEvidenceFaceFusion",
     "SharedDINOHeadBranch",
     "StrictSequentialCascade",
     "build_face_keypoint_cooperative_detr",

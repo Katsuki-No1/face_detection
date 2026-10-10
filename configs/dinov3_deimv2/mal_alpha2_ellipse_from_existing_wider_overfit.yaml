@@ -1,0 +1,5 @@
+extends: mal_alpha2_ellipse_from_existing_wider_gate.yaml
+augmentation:
+  enabled: false
+train:
+  epochs: 200

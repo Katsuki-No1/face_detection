@@ -1,0 +1,13 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_ablation_base.yaml
+
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_2
+
+loss:
+  mal_alpha: 2.0
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_2
+
+verification:
+  output: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_2_preflight
+

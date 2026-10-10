@@ -7,8 +7,11 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import Dataset
+
+from .landmark_occlusion import apply_landmark_occlusion_tensor
 
 
 DEFAULT_KEYPOINT_FLIP_INDEX = (1, 0, 2, 4, 3)
@@ -40,7 +43,13 @@ def has_active_augmentation(config: Mapping[str, Any] | None) -> bool:
         "blur",
         "noise",
     )
-    return any(float(config.get(key, 0.0) or 0.0) > 0.0 for key in numeric_keys)
+    if any(float(config.get(key, 0.0) or 0.0) > 0.0 for key in numeric_keys):
+        return True
+    landmark_occlusion = config.get("landmark_guided_occlusion")
+    return bool(
+        isinstance(landmark_occlusion, Mapping)
+        and float(landmark_occlusion.get("probability", 0.0) or 0.0) > 0.0
+    )
 
 
 def _tensor_to_image(image: torch.Tensor) -> Image.Image:
@@ -75,14 +84,80 @@ def _clone_target(target: Mapping[str, Any]) -> dict[str, Any]:
     return cloned
 
 
+def _padding_mask(
+    target: Mapping[str, Any], *, height: int, width: int
+) -> torch.Tensor:
+    value = target.get("padding_mask")
+    if isinstance(value, torch.Tensor):
+        mask = value.to(dtype=torch.bool)
+        if tuple(mask.shape) != (height, width):
+            raise ValueError(
+                f"padding_mask shape must match image {(height, width)}, got {tuple(mask.shape)}"
+            )
+        return mask
+    return torch.zeros((height, width), dtype=torch.bool)
+
+
+def _resize_padding_mask(
+    mask: torch.Tensor, *, height: int, width: int
+) -> torch.Tensor:
+    return (
+        F.interpolate(
+            mask.to(dtype=torch.float32).reshape(1, 1, *mask.shape),
+            size=(height, width),
+            mode="nearest",
+        )
+        .reshape(height, width)
+        .to(dtype=torch.bool)
+    )
+
+
+def _set_padding_mask(target: dict[str, Any], mask: torch.Tensor) -> None:
+    mask = mask.to(dtype=torch.bool)
+    target["padding_mask"] = mask
+    valid = torch.nonzero(~mask, as_tuple=False)
+    if valid.numel() == 0:
+        region = [0.0, 0.0, 0.0, 0.0]
+    else:
+        y1, x1 = valid.min(dim=0).values.tolist()
+        y2, x2 = (valid.max(dim=0).values + 1).tolist()
+        region = [float(x1), float(y1), float(x2), float(y2)]
+    target["valid_image_region_xyxy"] = torch.tensor(region, dtype=torch.float32)
+
+
+def _restore_padding_pixels(
+    image: torch.Tensor,
+    target: Mapping[str, Any],
+    *,
+    pad_color: Any,
+) -> torch.Tensor:
+    height, width = int(image.shape[-2]), int(image.shape[-1])
+    mask = _padding_mask(target, height=height, width=width)
+    if not bool(mask.any()):
+        return image
+    if isinstance(pad_color, int):
+        channels = (pad_color, pad_color, pad_color)
+    elif isinstance(pad_color, (list, tuple)) and len(pad_color) == 3:
+        channels = tuple(int(value) for value in pad_color)
+    else:
+        channels = (124, 116, 104)
+    restored = image.clone()
+    fill = restored.new_tensor(channels).div_(255.0).reshape(3, 1)
+    restored[:, mask] = fill
+    return restored
+
+
 def _empty_like_target(target: Mapping[str, Any], *, image_id: str, height: int, width: int) -> dict[str, Any]:
     num_keypoints = int(target.get("keypoints", torch.zeros((0, 5, 2))).shape[1]) if isinstance(target.get("keypoints"), torch.Tensor) else 5
     return {
         "boxes": torch.zeros((0, 4), dtype=torch.float32),
+        "head_boxes": torch.zeros((0, 4), dtype=torch.float32),
         "ellipses": torch.zeros((0, 5), dtype=torch.float32),
         "labels": torch.zeros((0,), dtype=torch.long),
         "keypoints": torch.zeros((0, num_keypoints, 2), dtype=torch.float32),
         "keypoint_mask": torch.zeros((0, num_keypoints), dtype=torch.bool),
+        "keypoint_visibility": torch.zeros((0, num_keypoints), dtype=torch.long),
+        "face_visibility": torch.zeros((0,), dtype=torch.long),
         "image_id": image_id,
         "orig_size": (height, width),
         "size": (height, width),
@@ -112,6 +187,12 @@ def _scale_offset_target(
         boxes[:, 0::2] = boxes[:, 0::2] * scale_x + offset_x
         boxes[:, 1::2] = boxes[:, 1::2] * scale_y + offset_y
         updated["boxes"] = boxes
+    head_boxes = updated.get("head_boxes")
+    if isinstance(head_boxes, torch.Tensor) and head_boxes.numel() > 0:
+        head_boxes = head_boxes.clone()
+        head_boxes[:, 0::2] = head_boxes[:, 0::2] * scale_x + offset_x
+        head_boxes[:, 1::2] = head_boxes[:, 1::2] * scale_y + offset_y
+        updated["head_boxes"] = head_boxes
     ellipses = updated.get("ellipses")
     if isinstance(ellipses, torch.Tensor) and ellipses.numel() > 0:
         ellipses = ellipses.clone()
@@ -139,13 +220,44 @@ def _scale_offset_target(
 def _concat_targets(targets: list[Mapping[str, Any]], *, image_id: str, height: int, width: int) -> dict[str, Any]:
     if not targets:
         return _empty_like_target({}, image_id=image_id, height=height, width=width)
-    keys = ("boxes", "ellipses", "labels", "keypoints", "keypoint_mask")
+    keys = (
+        "boxes",
+        "head_boxes",
+        "ellipses",
+        "labels",
+        "keypoints",
+        "keypoint_mask",
+    )
     output: dict[str, Any] = {}
     for key in keys:
         tensors = [target[key] for target in targets if isinstance(target.get(key), torch.Tensor)]
         output[key] = torch.cat(tensors, dim=0) if tensors else torch.empty((0,))
     if output["labels"].numel() == 0:
         output["labels"] = torch.ones((output["boxes"].shape[0],), dtype=torch.long)
+    keypoint_visibility = []
+    face_visibility = []
+    for target in targets:
+        count = _target_instance_count(target)
+        masks = target.get("keypoint_mask")
+        states = target.get("keypoint_visibility")
+        if isinstance(states, torch.Tensor):
+            keypoint_visibility.append(states.to(dtype=torch.long))
+        elif isinstance(masks, torch.Tensor):
+            keypoint_visibility.append(masks.to(dtype=torch.long) * 2)
+        if isinstance(target.get("face_visibility"), torch.Tensor):
+            face_visibility.append(target["face_visibility"].to(dtype=torch.long))
+        else:
+            face_visibility.append(torch.full((count,), 2, dtype=torch.long))
+    output["keypoint_visibility"] = (
+        torch.cat(keypoint_visibility, dim=0)
+        if keypoint_visibility
+        else torch.zeros((0, 5), dtype=torch.long)
+    )
+    output["face_visibility"] = (
+        torch.cat(face_visibility, dim=0)
+        if face_visibility
+        else torch.zeros((0,), dtype=torch.long)
+    )
     output["image_id"] = image_id
     output["orig_size"] = (height, width)
     output["size"] = (height, width)
@@ -171,11 +283,19 @@ def apply_mosaic(
     half_w = width // 2
     half_h = height // 2
     canvas = Image.new("RGB", (width, height), (114, 114, 114))
+    canvas_padding_mask = torch.ones((height, width), dtype=torch.bool)
     transformed_targets: list[Mapping[str, Any]] = []
     placements = ((0, 0), (half_w, 0), (0, half_h), (half_w, half_h))
     for (image_tensor, target), (offset_x, offset_y) in zip(samples, placements):
         image = _tensor_to_image(image_tensor).resize((half_w, half_h), Image.BILINEAR)
         canvas.paste(image, (offset_x, offset_y))
+        source_mask = _padding_mask(target, height=height, width=width)
+        resized_mask = _resize_padding_mask(
+            source_mask, height=half_h, width=half_w
+        )
+        canvas_padding_mask[
+            offset_y : offset_y + half_h, offset_x : offset_x + half_w
+        ] = resized_mask
         transformed_targets.append(
             _scale_offset_target(
                 target,
@@ -188,7 +308,11 @@ def apply_mosaic(
             )
         )
     image_id = "mosaic__" + "__".join(str(target.get("image_id", index)) for index, (_image, target) in enumerate(samples))
-    return _image_to_tensor(canvas), _concat_targets(transformed_targets, image_id=image_id, height=height, width=width)
+    output_target = _concat_targets(
+        transformed_targets, image_id=image_id, height=height, width=width
+    )
+    _set_padding_mask(output_target, canvas_padding_mask)
+    return _image_to_tensor(canvas), output_target
 
 
 def apply_mixup(
@@ -214,6 +338,11 @@ def apply_mixup(
         image_id=f"mixup__{target_a.get('image_id', 'a')}__{target_b.get('image_id', 'b')}",
         height=height,
         width=width,
+    )
+    _set_padding_mask(
+        target,
+        _padding_mask(target_a, height=height, width=width)
+        & _padding_mask(target_b, height=height, width=width),
     )
     metadata = dict(target.get("metadata", {}) if isinstance(target.get("metadata"), Mapping) else {})
     metadata["mixup_lambda"] = float(lam)
@@ -486,6 +615,13 @@ def apply_ellipse_border_crop(
         min_ellipse_radius=float(cfg.get("min_ellipse_radius", 2.0) or 2.0),
         allow_outside_center=True,
     )
+    source_padding_mask = _padding_mask(target, height=height, width=width)
+    _set_padding_mask(
+        transformed_target,
+        _resize_padding_mask(
+            source_padding_mask[y0:y1, x0:x1], height=height, width=width
+        ),
+    )
 
     source_ellipse = [float(value) for value in ellipses_value[selected["instance_index"]].detach().cpu().tolist()]
     transformed_points = _apply_homography(_ellipse_points(*source_ellipse), matrix)
@@ -589,12 +725,40 @@ def transform_target_homography(
     ellipses = torch.as_tensor(target["ellipses"], dtype=torch.float32)
     keypoints = torch.as_tensor(target["keypoints"], dtype=torch.float32)
     keypoint_mask = torch.as_tensor(target["keypoint_mask"], dtype=torch.bool)
+    keypoint_visibility = torch.as_tensor(
+        target.get("keypoint_visibility", keypoint_mask.to(dtype=torch.long) * 2),
+        dtype=torch.long,
+    )
+    face_visibility = torch.as_tensor(
+        target.get("face_visibility", torch.full((count,), 2, dtype=torch.long)),
+        dtype=torch.long,
+    )
     labels = torch.as_tensor(target.get("labels", torch.ones((count,), dtype=torch.long)), dtype=torch.long)
+    raw_head_boxes = torch.as_tensor(
+        target.get("head_boxes", torch.empty((0, 4))),
+        dtype=torch.float32,
+    )
+    # FACE-only datasets legitimately carry no HEAD boxes. Mosaic preserves
+    # that optional field as an empty (0, 4) tensor even when FACE ellipses are
+    # present, so treat it exactly like an omitted field rather than reshaping
+    # zero elements to the FACE instance count.
+    if raw_head_boxes.numel() == 0:
+        head_boxes = torch.full((count, 4), float("nan"), dtype=torch.float32)
+    elif raw_head_boxes.numel() == count * 4:
+        head_boxes = raw_head_boxes.reshape(count, 4)
+    else:
+        raise ValueError(
+            "head_boxes must be empty or contain one xyxy box per FACE "
+            f"instance: faces={count}, shape={tuple(raw_head_boxes.shape)}"
+        )
 
     kept_boxes: list[list[float]] = []
+    kept_head_boxes: list[list[float]] = []
     kept_ellipses: list[list[float]] = []
     kept_keypoints: list[torch.Tensor] = []
     kept_masks: list[torch.Tensor] = []
+    kept_keypoint_visibility: list[torch.Tensor] = []
+    kept_face_visibility: list[int] = []
     kept_labels: list[int] = []
     ignored = 0
     clipped_instances = 0
@@ -621,8 +785,28 @@ def transform_target_homography(
             continue
         clipped_instances += int(clipped)
 
+        source_head_box = head_boxes[index].detach().cpu().numpy()
+        if np.isfinite(source_head_box).all():
+            hx1, hy1, hx2, hy2 = [float(value) for value in source_head_box]
+            head_corners = np.asarray(
+                ((hx1, hy1), (hx2, hy1), (hx2, hy2), (hx1, hy2)),
+                dtype=np.float64,
+            )
+            transformed_head = _apply_homography(head_corners, matrix)
+            transformed_head_box, _ = _clip_box_from_points(
+                transformed_head, width, height
+            )
+            kept_head_boxes.append(
+                transformed_head_box
+                if transformed_head_box is not None
+                else [float("nan")] * 4
+            )
+        else:
+            kept_head_boxes.append([float("nan")] * 4)
+
         points = keypoints[index].clone()
         mask = keypoint_mask[index].clone()
+        visibility = keypoint_visibility[index].clone()
         if points.numel() > 0:
             visible_indices = torch.nonzero(mask, as_tuple=False).flatten()
             if visible_indices.numel() > 0:
@@ -631,6 +815,7 @@ def transform_target_homography(
                     x, y = float(transformed_kpts[local_index, 0]), float(transformed_kpts[local_index, 1])
                     if x < 0.0 or x >= float(width) or y < 0.0 or y >= float(height):
                         mask[point_index] = False
+                        visibility[point_index] = 0
                         points[point_index] = torch.tensor([0.0, 0.0])
                         keypoints_outside += 1
                     else:
@@ -640,6 +825,8 @@ def transform_target_homography(
         kept_ellipses.append([tcx, tcy, trx, try_, ttheta])
         kept_keypoints.append(points)
         kept_masks.append(mask)
+        kept_keypoint_visibility.append(visibility)
+        kept_face_visibility.append(int(face_visibility[index].item()))
         kept_labels.append(int(labels[index].item()))
 
     num_keypoints = keypoints.shape[1] if keypoints.ndim == 3 else 5
@@ -654,10 +841,13 @@ def transform_target_homography(
     if not kept_boxes:
         return {
             "boxes": torch.zeros((0, 4), dtype=torch.float32),
+            "head_boxes": torch.zeros((0, 4), dtype=torch.float32),
             "ellipses": torch.zeros((0, 5), dtype=torch.float32),
             "labels": torch.zeros((0,), dtype=torch.long),
             "keypoints": torch.zeros((0, num_keypoints, 2), dtype=torch.float32),
             "keypoint_mask": torch.zeros((0, num_keypoints), dtype=torch.bool),
+            "keypoint_visibility": torch.zeros((0, num_keypoints), dtype=torch.long),
+            "face_visibility": torch.zeros((0,), dtype=torch.long),
             "image_id": str(target.get("image_id", "")),
             "orig_size": target.get("orig_size", (height, width)),
             "size": (height, width),
@@ -665,10 +855,13 @@ def transform_target_homography(
         }
     return {
         "boxes": torch.as_tensor(kept_boxes, dtype=torch.float32),
+        "head_boxes": torch.as_tensor(kept_head_boxes, dtype=torch.float32),
         "ellipses": torch.as_tensor(kept_ellipses, dtype=torch.float32),
         "labels": torch.as_tensor(kept_labels, dtype=torch.long),
         "keypoints": torch.stack(kept_keypoints).to(torch.float32),
         "keypoint_mask": torch.stack(kept_masks).to(torch.bool),
+        "keypoint_visibility": torch.stack(kept_keypoint_visibility).to(torch.long),
+        "face_visibility": torch.as_tensor(kept_face_visibility, dtype=torch.long),
         "image_id": str(target.get("image_id", "")),
         "orig_size": target.get("orig_size", (height, width)),
         "size": (height, width),
@@ -682,6 +875,22 @@ def _transform_image(image: Image.Image, matrix: np.ndarray) -> Image.Image:
     inverse = inverse / inverse[2, 2]
     coeffs = tuple(float(value) for value in inverse.reshape(-1)[:8])
     return image.transform((width, height), Image.PERSPECTIVE, coeffs, resample=Image.BILINEAR, fillcolor=(114, 114, 114))
+
+
+def _transform_padding_mask(mask: torch.Tensor, matrix: np.ndarray) -> torch.Tensor:
+    height, width = int(mask.shape[0]), int(mask.shape[1])
+    inverse = np.linalg.inv(matrix)
+    inverse = inverse / inverse[2, 2]
+    coeffs = tuple(float(value) for value in inverse.reshape(-1)[:8])
+    image = Image.fromarray(mask.detach().cpu().numpy().astype(np.uint8) * 255, mode="L")
+    transformed = image.transform(
+        (width, height),
+        Image.PERSPECTIVE,
+        coeffs,
+        resample=Image.Resampling.NEAREST,
+        fillcolor=255,
+    )
+    return torch.from_numpy(np.asarray(transformed, dtype=np.uint8) > 0)
 
 
 def apply_geometry(
@@ -706,6 +915,12 @@ def apply_geometry(
             or float(cfg.get("ellipse_border_crop", 0.0) or 0.0) > 0.0
         ),
     )
+    _set_padding_mask(
+        transformed_target,
+        _transform_padding_mask(
+            _padding_mask(target, height=height, width=width), matrix
+        ),
+    )
     return _image_to_tensor(transformed_image), transformed_target
 
 
@@ -718,6 +933,17 @@ def apply_horizontal_flip(
     image = torch.flip(image_tensor, dims=(2,))
     width = int(image_tensor.shape[-1])
     updated = _clone_target(target)
+    _set_padding_mask(
+        updated,
+        torch.flip(
+            _padding_mask(
+                target,
+                height=int(image_tensor.shape[-2]),
+                width=int(image_tensor.shape[-1]),
+            ),
+            dims=(1,),
+        ),
+    )
     boxes = updated.get("boxes")
     if isinstance(boxes, torch.Tensor) and boxes.numel() > 0:
         boxes = boxes.clone()
@@ -726,6 +952,14 @@ def apply_horizontal_flip(
         boxes[:, 0] = float(width) - old_x2
         boxes[:, 2] = float(width) - old_x1
         updated["boxes"] = boxes
+    head_boxes = updated.get("head_boxes")
+    if isinstance(head_boxes, torch.Tensor) and head_boxes.numel() > 0:
+        head_boxes = head_boxes.clone()
+        old_x1 = head_boxes[:, 0].clone()
+        old_x2 = head_boxes[:, 2].clone()
+        head_boxes[:, 0] = float(width) - old_x2
+        head_boxes[:, 2] = float(width) - old_x1
+        updated["head_boxes"] = head_boxes
     ellipses = updated.get("ellipses")
     if isinstance(ellipses, torch.Tensor) and ellipses.numel() > 0:
         ellipses = ellipses.clone()
@@ -747,6 +981,9 @@ def apply_horizontal_flip(
             keypoints = keypoints[:, order]
             if isinstance(masks, torch.Tensor):
                 updated["keypoint_mask"] = masks.clone()[:, order]
+            visibility = updated.get("keypoint_visibility")
+            if isinstance(visibility, torch.Tensor):
+                updated["keypoint_visibility"] = visibility.clone()[:, order]
         updated["keypoints"] = keypoints
     metadata = dict(updated.get("metadata", {}) if isinstance(updated.get("metadata"), Mapping) else {})
     metadata["augmentation_debug"] = {
@@ -856,39 +1093,85 @@ class AugmentedFaceKeypointDataset(Dataset):
             return False
         return True
 
+    def _effective_augmentation(self) -> dict[str, Any]:
+        """Return the scheduled augmentation without mutating the run config."""
+
+        cfg = dict(self.augmentation)
+        weak_last_epochs = int(cfg.get("weak_last_epochs", 0) or 0)
+        weak = (
+            self.total_epochs is not None
+            and weak_last_epochs > 0
+            and self.epoch > self.total_epochs - weak_last_epochs
+        )
+        if not weak:
+            return cfg
+        factor = float(cfg.get("weak_augmentation_scale", 0.5) or 0.5)
+        cfg["mosaic"] = 0.0
+        for key in (
+            "degrees",
+            "translate",
+            "scale",
+            "shear",
+            "perspective",
+            "hsv_h",
+            "hsv_s",
+            "hsv_v",
+            "brightness",
+            "contrast",
+            "gamma",
+            "blur",
+            "noise",
+        ):
+            if key in cfg:
+                cfg[key] = float(cfg.get(key, 0.0) or 0.0) * factor
+        return cfg
+
     def __getitem__(self, index: int) -> tuple[torch.Tensor, dict[str, Any]]:
         image, target = self.base_dataset[index]
         if not _enabled(self.augmentation):
             return image, target
         rng = self._rng(index)
+        cfg = self._effective_augmentation()
 
-        if self._mosaic_active() and rng.random() < float(self.augmentation.get("mosaic", 0.0) or 0.0) and len(self.base_dataset) >= 4:
+        if self._mosaic_active() and rng.random() < float(cfg.get("mosaic", 0.0) or 0.0) and len(self.base_dataset) >= 4:
             extra_indices = [rng.randrange(len(self.base_dataset)) for _ in range(3)]
             samples = [(image, target)] + [self.base_dataset[item] for item in extra_indices]
             image, target = apply_mosaic(samples, rng=rng)
 
-        if self.mixup_enabled and rng.random() < float(self.augmentation.get("mixup", 0.0) or 0.0) and len(self.base_dataset) >= 2:
+        if self.mixup_enabled and rng.random() < float(cfg.get("mixup", 0.0) or 0.0) and len(self.base_dataset) >= 2:
             other = self.base_dataset[rng.randrange(len(self.base_dataset))]
             image, target = apply_mixup(
                 (image, target),
                 other,
-                alpha=float(self.augmentation.get("mixup_alpha", 0.2) or 0.2),
+                alpha=float(cfg.get("mixup_alpha", 0.2) or 0.2),
                 rng=rng,
             )
 
         geometry_keys = ("degrees", "translate", "scale", "shear", "perspective")
-        if any(float(self.augmentation.get(key, 0.0) or 0.0) > 0.0 for key in geometry_keys):
-            image, target = apply_geometry(image, target, self.augmentation, rng=rng)
+        if any(float(cfg.get(key, 0.0) or 0.0) > 0.0 for key in geometry_keys):
+            image, target = apply_geometry(image, target, cfg, rng=rng)
 
-        ellipse_border_crop = float(self.augmentation.get("ellipse_border_crop", 0.0) or 0.0)
+        ellipse_border_crop = float(cfg.get("ellipse_border_crop", 0.0) or 0.0)
         if ellipse_border_crop > 0.0 and rng.random() < ellipse_border_crop:
-            image, target = apply_ellipse_border_crop(image, target, self.augmentation, rng=rng)
+            image, target = apply_ellipse_border_crop(image, target, cfg, rng=rng)
 
-        fliplr = float(self.augmentation.get("fliplr", 0.0) or 0.0)
+        fliplr = float(cfg.get("fliplr", 0.0) or 0.0)
         if fliplr > 0.0 and rng.random() < fliplr:
             image, target = apply_horizontal_flip(image, target)
 
         photometric_keys = ("hsv_h", "hsv_s", "hsv_v", "brightness", "contrast", "gamma", "blur", "noise")
-        if any(float(self.augmentation.get(key, 0.0) or 0.0) > 0.0 for key in photometric_keys):
-            image = apply_photometric(image, self.augmentation, rng=rng)
+        if any(float(cfg.get(key, 0.0) or 0.0) > 0.0 for key in photometric_keys):
+            image = apply_photometric(image, cfg, rng=rng)
+        landmark_occlusion = cfg.get("landmark_guided_occlusion")
+        if isinstance(landmark_occlusion, Mapping):
+            image, target = apply_landmark_occlusion_tensor(
+                image,
+                target,
+                landmark_occlusion,
+                rng=rng,
+            )
+        pad_color = cfg.get(
+            "pad_color", getattr(self.base_dataset, "pad_color", None)
+        )
+        image = _restore_padding_pixels(image, target, pad_color=pad_color)
         return image, target

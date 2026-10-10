@@ -47,6 +47,7 @@ def audit_coco_splits(
     data_root: str | Path,
     *,
     annotation_paths: Mapping[str, str | Path] | None = None,
+    image_roots: Mapping[str, str | Path] | None = None,
     splits: Sequence[str] = DEFAULT_SPLITS,
     expected_category_id: int | None = 2,
     expected_category_ids: Sequence[int] | None = None,
@@ -105,7 +106,12 @@ def audit_coco_splits(
             relative_path = Path(str(image["file_name"]))
             if relative_path.is_absolute():
                 raise CocoSplitLeakageError(f"{path}: absolute image paths are not allowed: {relative_path}")
-            image_path = root / relative_path
+            split_root = (
+                Path(image_roots[split])
+                if image_roots is not None and split in image_roots
+                else root
+            )
+            image_path = split_root / relative_path
             if not image_path.is_file():
                 raise CocoSplitLeakageError(f"{path}: image file does not exist: {image_path}")
             digest = sha256_file(image_path)
@@ -161,6 +167,10 @@ def audit_coco_splits(
     return {
         "status": "ok",
         "data_root": str(root),
+        "image_roots": {
+            split: str(Path(image_roots[split])) if image_roots and split in image_roots else str(root)
+            for split in splits
+        },
         "expected_category_ids": sorted(expected_ids),
         "expected_category_id": next(iter(expected_ids)) if len(expected_ids) == 1 else None,
         "splits": split_summary,

@@ -6,6 +6,7 @@ import logging
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -18,9 +19,14 @@ from torch.utils.data import DataLoader
 
 from src.data.coco_split_audit import audit_coco_splits
 
-from .config import LandmarkExperimentConfig
+from .config import (
+    THREE_STAGE_HEAD_FACE_KEYPOINT_PIPELINE,
+    LandmarkExperimentConfig,
+    configured_evaluation_pipeline_stages,
+)
 from .dataset import CropAugmentation, TopDownFaceLandmarkDataset, collate_landmark_batch
 from .detector import DeimFaceDetector
+from .face_overlap import face_context_kwargs
 from .diagnostics import gradient_interference_matrix
 from .evaluation import evaluate_deim_boxes, evaluate_gt_boxes, load_or_create_detector_predictions, sha256_file
 from .losses import LandmarkLoss
@@ -88,6 +94,11 @@ def _annotation_inventory(
     verify_images: bool = False,
 ) -> dict[str, Any]:
     coco = json.loads(path.read_text(encoding="utf-8"))
+    positive_instances_by_image: Counter[int] = Counter()
+    for annotation in coco.get("annotations", []):
+        keypoints = list(annotation.get("keypoints", []))
+        if any(float(keypoints[index]) > 0 for index in range(2, len(keypoints), 3)):
+            positive_instances_by_image[int(annotation["image_id"])] += 1
     source_videos = {
         str(image.get("metadata", {}).get("source_video_id", ""))
         for image in coco.get("images", [])
@@ -138,6 +149,9 @@ def _annotation_inventory(
         "images": len(coco.get("images", [])),
         "annotations": len(coco.get("annotations", [])),
         "usable_instances": _usable_annotations(coco),
+        "maximum_positive_instances_per_image": max(
+            positive_instances_by_image.values(), default=0
+        ),
         "valid_ellipses": valid_ellipses,
         "visibility_counts": visibility_counts,
         "verified_images": verified_images,
@@ -151,6 +165,14 @@ def _verify_expected(actual: Mapping[str, Any], expected: Mapping[str, Any], *, 
         if key in expected and actual[key] != expected[key]:
             raise RuntimeError(
                 f"Dataset verification failed for {name}.{key}: expected={expected[key]!r}, actual={actual[key]!r}"
+            )
+    if "max_positive_instances_per_image" in expected:
+        limit = int(expected["max_positive_instances_per_image"])
+        observed = int(actual["maximum_positive_instances_per_image"])
+        if observed > limit:
+            raise RuntimeError(
+                f"Dataset verification failed for {name}.maximum_positive_instances_per_image: "
+                f"limit={limit}, actual={observed}"
             )
 
 
@@ -194,6 +216,7 @@ def preflight(
     device: torch.device,
     check_detector: bool = True,
     require_wandb: bool = False,
+    variants: Sequence[str] = VARIANTS,
 ) -> dict[str, Any]:
     """Validate data, real weights, all heads, gradients, and optional detector inference."""
 
@@ -224,6 +247,7 @@ def preflight(
     split_audit = audit_coco_splits(
         raw["data"]["root"],
         annotation_paths=raw["data"]["annotations"],
+        image_roots=raw["data"].get("image_roots"),
         splits=tuple(raw["data"]["leakage_audit"].get("splits", ("train", "val", "test"))),
         expected_category_ids=raw["data"].get("category_ids", (1,)),
     )
@@ -269,7 +293,7 @@ def preflight(
     LOGGER.info("[preflight] checking DINOv3 initialization and A-G model graph")
     val_dataset = TopDownFaceLandmarkDataset(
         annotation_path=raw["data"]["annotations"]["val"],
-        image_root=raw["data"]["root"],
+        image_root=raw["data"].get("image_roots", {}).get("val", raw["data"]["root"]),
         input_size=int(raw["data"]["input_size"]),
         training=False,
         augmentation=CropAugmentation(scale_factor=float(raw["data"]["augmentation"]["scale_factor"])),
@@ -280,18 +304,25 @@ def preflight(
             raw["data"].get("include_missing_keypoint_instances", False)
         ),
     )
+    if raw.get("model", {}).get("face_overlap_robustness", {}).get("enabled", False):
+        from .training import make_dataset
+        val_dataset = make_dataset(raw, split="val", training=False)
     image, target = val_dataset[0]
     sample = image.unsqueeze(0).to(device)
     criterion = LandmarkLoss(raw.get("loss", {})).to(device)
     model_reports: dict[str, Any] = {}
-    for variant in VARIANTS:
+    selected_variants = tuple(variant for variant in VARIANTS if variant in variants)
+    if not selected_variants:
+        raise ValueError("Preflight requires at least one landmark variant")
+    for variant in selected_variants:
         LOGGER.info("[preflight:%s] real forward/backward", variant)
         model, initialization = build_landmark_model(raw, variant=variant)
         parameters = _parameter_report(model)
         model.to(device).train()
         model.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            output = model(sample, return_attention=variant not in VITPOSE_VARIANTS)
+            output = model(sample, return_attention=variant not in VITPOSE_VARIANTS,
+                           **face_context_kwargs(model, [target], device))
             losses = criterion(output, [target])
         losses["loss_total"].backward()
         finite_gradients = all(
@@ -321,10 +352,14 @@ def preflight(
             config_path=detector_cfg["config"],
             checkpoint_path=detector_cfg["checkpoint"],
             device=str(device),
-            image_size=int(detector_cfg["image_size"]),
+            image_size=detector_cfg["image_size"],
+            resize_mode=detector_cfg.get("resize_mode"),
+            pad_color=detector_cfg.get("pad_color"),
+            size_divisor=detector_cfg.get("size_divisor"),
             score_threshold=float(detector_cfg["score_threshold"]),
             maximum_detections=int(detector_cfg["maximum_detections"]),
             crop_geometry=str(detector_cfg["crop_geometry"]),
+            return_face_query_features=bool(raw.get("model", {}).get("face_overlap_robustness", {}).get("enabled", False)),
         )
         sample_path = Path(val_dataset.samples[0]["image_path"])
         detections = detector.predict(Image.open(sample_path).convert("RGB"))
@@ -479,7 +514,8 @@ def _interference_diagnostic(
     model.eval()
     model.zero_grad(set_to_none=True)
     with torch.enable_grad():
-        output = model(images.to(device), return_attention=True)
+        output = model(images.to(device), return_attention=True,
+                       **face_context_kwargs(model, targets, device))
         return gradient_interference_matrix(
             model,
             criterion,
@@ -508,7 +544,8 @@ def evaluate_conditions(
     evaluation_cfg = raw.get("evaluation", {})
     configured_common_root = evaluation_cfg.get("baseline_aligned_output_root")
     validation_success = (
-        Path(str(configured_common_root)) / "val/baseline_aligned/success.json"
+        Path(str(configured_common_root))
+        / "val/baseline_aligned/face_threshold_selection.json"
         if configured_common_root
         else None
     )
@@ -536,8 +573,13 @@ def evaluate_conditions(
     )
     if not selected_variants:
         raise ValueError("At least one evaluation variant is required")
+    selection_filename = str(
+        raw.get("train", {})
+        .get("checkpoint_selection", {})
+        .get("filename", "best_nme.pt")
+    )
     checkpoint_paths = {
-        variant: config.output_root / variant / "checkpoints" / "best_nme.pt"
+        variant: config.output_root / variant / "checkpoints" / selection_filename
         for variant in selected_variants
     }
     missing = [str(path) for path in checkpoint_paths.values() if not path.is_file()]
@@ -575,10 +617,14 @@ def evaluate_conditions(
         config_path=detector_cfg["config"],
         checkpoint_path=detector_cfg["checkpoint"],
         device=str(device),
-        image_size=int(detector_cfg["image_size"]),
+        image_size=detector_cfg["image_size"],
+        resize_mode=detector_cfg.get("resize_mode"),
+        pad_color=detector_cfg.get("pad_color"),
+        size_divisor=detector_cfg.get("size_divisor"),
         score_threshold=float(detector_cfg["score_threshold"]),
         maximum_detections=int(detector_cfg["maximum_detections"]),
         crop_geometry=str(detector_cfg["crop_geometry"]),
+        return_face_query_features=bool(raw.get("model", {}).get("face_overlap_robustness", {}).get("enabled", False)),
     )
     criterion = LandmarkLoss(raw.get("loss", {})).to(device)
     all_results: dict[str, Any] = {}
@@ -601,15 +647,19 @@ def evaluate_conditions(
             model, initialization = build_landmark_model(raw, variant=variant)
             checkpoint_report = load_landmark_checkpoint(model, checkpoint_paths[variant], prefer_ema=True, strict=True)
             model.to(device).eval()
-            gt_result = evaluate_gt_boxes(
-                model,
-                dataset,
-                device=device,
-                batch_size=int(evaluation_cfg.get("batch_size", 64)),
-                num_workers=int(evaluation_cfg.get("num_workers", 8)),
-                input_size=int(raw["data"]["input_size"]),
-                attention_batches=int(evaluation_cfg.get("attention_batches", 4)),
-            )
+            if getattr(model, "face_overlap_enabled", False):
+                # GT crops have no corresponding detector query; never invent one.
+                gt_result = ({"unsupported_reason": "FOR requires predicted-face context; GT-crop oracle is unsupported"}, [])
+            else:
+                gt_result = evaluate_gt_boxes(
+                    model,
+                    dataset,
+                    device=device,
+                    batch_size=int(evaluation_cfg.get("batch_size", 64)),
+                    num_workers=int(evaluation_cfg.get("num_workers", 8)),
+                    input_size=int(raw["data"]["input_size"]),
+                    attention_batches=int(evaluation_cfg.get("attention_batches", 4)),
+                )
             deim_result = evaluate_deim_boxes(
                 model,
                 annotation_path=Path(definition["annotation"]),
@@ -635,7 +685,7 @@ def evaluate_conditions(
             diagnostics[variant] = {
                 "checkpoint": checkpoint_report,
                 "dino_initialization": initialization,
-                "gradient_interference": _interference_diagnostic(
+                "gradient_interference": {"unsupported_reason": "FOR GT-crop diagnostic is unsupported"} if getattr(model, "face_overlap_enabled", False) else _interference_diagnostic(
                     model,
                     dataset,
                     criterion,
@@ -654,6 +704,8 @@ def evaluate_conditions(
             condition
             for condition in EXPERIMENT_CONDITIONS
             if condition.variant in selected_variants
+            and (not raw.get("model", {}).get("face_overlap_robustness", {}).get("enabled", False)
+                 or condition.bbox_mode == "deim")
         )
         for condition in selected_conditions:
             metrics, rows = variant_results[condition.variant][condition.bbox_mode]
@@ -681,7 +733,7 @@ def evaluate_conditions(
                     condition_rows[oracle_condition],
                     condition_rows[predicted_condition],
                 )
-        if "E" in condition_rows:
+        if "E" in condition_rows and not raw.get("model", {}).get("face_overlap_robustness", {}).get("enabled", False):
             condition_results["E"][
                 "paired_oracle_reference"
             ] = _paired_oracle_metrics(
@@ -716,6 +768,16 @@ def evaluate_conditions(
                 if configured_common_root
                 else directory / "baseline_aligned"
             )
+            pipeline_stages = configured_evaluation_pipeline_stages(raw)
+            predicted_head_cfg = evaluation_cfg.get("predicted_head")
+            uses_predicted_head = (
+                pipeline_stages == THREE_STAGE_HEAD_FACE_KEYPOINT_PIPELINE
+            )
+
+            def project_path(value: Any) -> Path:
+                path = Path(str(value))
+                return path if path.is_absolute() else config.project_root / path
+
             command = [
                 sys.executable,
                 str(
@@ -743,6 +805,12 @@ def evaluate_conditions(
                 str(directory / "baseline_aligned_diagnostic"),
                 "--common-output-dir",
                 str(common_output_dir),
+                "--pipeline-contract",
+                (
+                    "three_stage_head_face_keypoint"
+                    if uses_predicted_head
+                    else "two_stage_face_keypoint"
+                ),
                 "--split",
                 split,
                 "--architecture-id",
@@ -761,6 +829,26 @@ def evaluate_conditions(
                 "--point-threshold",
                 "0.70",
             ]
+            if uses_predicted_head:
+                if not isinstance(predicted_head_cfg, Mapping):
+                    raise RuntimeError(
+                        "The declared three-stage pipeline requires "
+                        "evaluation.predicted_head"
+                    )
+                command.extend(
+                    [
+                        "--head-predictions",
+                        str(
+                            project_path(
+                                predicted_head_cfg["predictions"][split]
+                            )
+                        ),
+                        "--head-detector-config",
+                        str(project_path(predicted_head_cfg["config"])),
+                        "--head-detector-checkpoint",
+                        str(project_path(predicted_head_cfg["checkpoint"])),
+                    ]
+                )
             if split == "val":
                 command.extend(
                     [

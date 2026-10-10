@@ -15,6 +15,7 @@ from src.data.face_crop_cache import crop_geometry_from_detection
 
 from .dataset import TopDownFaceLandmarkDataset, _parse_keypoints, collate_landmark_batch, image_to_tensor, xywh_to_xyxy
 from .detector import DeimFaceDetector
+from .face_overlap import CONTEXT_SCHEMA, crop_face_context, face_context_kwargs
 from .diagnostics import attention_diagnostics
 from .geometry import build_crop_transform, normalized_crop_to_original, warp_crop
 from .metrics import LandmarkMetricAccumulator, iou_xyxy, match_detector_boxes
@@ -31,6 +32,18 @@ def sha256_file(path: Path) -> str:
 def _target_numpy(target: dict[str, Any], key: str) -> np.ndarray:
     value = target[key]
     return value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+
+
+def _dataset_attribute(dataset: Any, name: str, default: Any = None) -> Any:
+    """Read metadata from a dataset, including through nested Subset wrappers."""
+    current = dataset
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, name):
+            return getattr(current, name)
+        current = getattr(current, "dataset", None)
+    return default
 
 
 def predictions_to_original(
@@ -85,6 +98,7 @@ def evaluate_gt_boxes(
     num_workers: int,
     input_size: int,
     attention_batches: int = 4,
+    recovery_mode: str = "recovered",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     loader = DataLoader(
         dataset,
@@ -101,7 +115,12 @@ def evaluate_gt_boxes(
     for batch_index, (images, targets) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            output = model(images, return_attention=batch_index < attention_batches)
+            output = model(
+                images,
+                return_attention=batch_index < attention_batches,
+                recovery_mode=recovery_mode,
+                **face_context_kwargs(model, targets, device),
+            )
         decoded = output["decoded_coordinates"]
         inverse = torch.stack([target["inverse_affine"] for target in targets])
         original_predictions = predictions_to_original(decoded, inverse, input_size=input_size)
@@ -142,7 +161,19 @@ def evaluate_gt_boxes(
         if diagnostic is not None:
             attention_rows.append(diagnostic)
     metrics = accumulator.compute()
-    metrics.update({"bbox_mode": "gt", "attention": _merge_attention(attention_rows)})
+    detector_crop_report = _dataset_attribute(dataset, "detector_crop_report")
+    metrics.update(
+        {
+            "bbox_mode": (
+                "predicted_face_crop"
+                if detector_crop_report is not None
+                else "gt"
+            ),
+            "detector_crop_report": detector_crop_report,
+            "attention": _merge_attention(attention_rows),
+            "recovery_mode": recovery_mode,
+        }
+    )
     return metrics, accumulator.rows
 
 
@@ -166,6 +197,8 @@ def load_or_create_detector_predictions(
         "maximum_detections": detector.maximum_detections,
         "crop_geometry": getattr(detector, "crop_geometry", "bbox"),
     }
+    if getattr(detector, "return_face_query_features", False):
+        expected_metadata["face_context_schema"] = CONTEXT_SCHEMA
     if cache_path.is_file() and not force:
         value = json.loads(cache_path.read_text(encoding="utf-8"))
         metadata = value.get("metadata", {})
@@ -181,6 +214,7 @@ def load_or_create_detector_predictions(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "metadata": {
+            **expected_metadata,
             "annotation": str(annotation_path),
             "annotation_sha256": annotation_hash,
             "detector_config": str(detector.config_path),
@@ -212,7 +246,8 @@ def _flush_predicted_batch(
         return None
     batch = torch.stack(images).to(device, non_blocking=True)
     with torch.inference_mode(), torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-        output = model(batch, return_attention=return_attention)
+        output = model(batch, return_attention=return_attention,
+                       **face_context_kwargs(model, metadata, device))
     coordinates = output["decoded_coordinates"].detach().float().cpu().numpy()
     presence_scores, visibility_scores = _state_probabilities(output)
     state_probabilities = (
@@ -392,6 +427,8 @@ def evaluate_deim_boxes(
                     "detector_iou": overlap,
                     "detector_bbox_xyxy": [float(value) for value in detection_box],
                     "detector_score": float(detections[detection_index].get("score", 0.0)),
+                    **(crop_face_context(detections[detection_index], transform)
+                       if getattr(model, "face_overlap_enabled", False) else {}),
                 }
             )
             if len(crop_images) >= batch_size:

@@ -1,0 +1,3 @@
+extends: mal_alpha2_ellipse_from_existing_wider_gate.yaml
+train:
+  official_sfp_preflight_probe: true

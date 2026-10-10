@@ -1,0 +1,41 @@
+extends: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco.yaml
+
+# Matched DINO-unfreeze MAL-alpha ablation. Every arm starts from the same
+# public COCO checkpoint, fixed train split, seed, augmentation, and optimizer.
+# Alpha 1.0 is the explicit control and is equivalent to the prior implicit
+# MAL negative weight.
+experiment_name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_ablation_base
+
+model:
+  backbone:
+    freeze: false
+
+loss:
+  mal_alpha: 1.0
+
+train:
+  name: dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_mal_alpha_ablation_base
+  backbone_policy: full_unfreeze
+  seed: 0
+  validation:
+    fixed_threshold: 0.33
+  early_stopping:
+    enabled: true
+    monitor: val/mAP50_95
+    checkpoint_name: best_val_map.pt
+    minimum_epoch: 20
+    patience_validations: 6
+    min_delta: 0.0005
+
+mal_alpha_ablation:
+  control_alpha: 1.0
+  values: [1.0, 1.25, 1.5, 2.0]
+  topology: full-image FACE/ellipse
+  dino_policy: full_unfreeze
+  bbox_matching_iou: 0.50
+  common_threshold: 0.33
+  threshold_candidate_floor_exclusive: 0.33
+  threshold_selection: maximize_recall_subject_to_strict_precision_gt_0.90
+  selection_split: val
+  selection_rule: preserve_precision_and_recall_vs_alpha1_and_reduce_duplication
+

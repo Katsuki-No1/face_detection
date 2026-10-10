@@ -1,5 +1,24 @@
 # 顔検出と顔ランドマーク検出のためのスクリプト集
 
+## 現行ローカルbaseline（2026-10-09更新）
+
+**baselineは顔検出とkeypoint検出をセットにしたパイプライン全体**を指します。
+現行の構成は、HEADを使わない順序付き2段構成です。
+
+`全画像FACE／楕円検出（MAL α=2） → Face cropのDINOv3 Query Refinement（既存A1/A2版）`
+
+顔検出部は `mal_alpha2_ellipse_from_existing_wider`（既存WIDER事前学習済みDEIMv2-L、
+landmark-guided occlusion A1/A2、validation選択epoch45 EMA）。
+keypoint検出部は従来のA1/A2版Query Refinementを引き継ぎます。
+正規の参照先・SHA・固定閾値は [local_baseline.yaml](configs/model_registry/local_baseline.yaml)、
+更新履歴は [model_baseline_history.md](docs/model_baseline_history.md) を参照してください。
+
+新しい組み合わせ全体の推論・評価は未実施です。顔検出部単独の成功や指標を、
+baseline全体の評価済み結果として扱いません。既存active-learning／TensorRTの実行構成は
+評価済みの旧パイプラインのままです。global/reference baselineは変更していません。
+2026-10-09の5分比較動画は左が現baselineの顔検出部のみ、右が旧baseline一式であり、
+新旧baseline一式同士の比較ではありません。
+
 このリポジトリには、顔と頭部の検出、顔ランドマークの抽出、YOLO Pose 用のデータセットへの変換、学習、推論、可視化、評価を行う Python スクリプトが含まれています。
 
 このリポジトリでは、個人情報や実データを Git に含めない運用を前提にしています。モデルの重み、入力動画、抽出したフレーム、アノテーション、生成したデータセット、学習結果、推論結果はローカルに保存し、`.gitignore` によって Git の管理対象から除外します。

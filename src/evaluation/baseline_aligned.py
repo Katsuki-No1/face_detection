@@ -22,14 +22,16 @@ import numpy as np
 from src.evaluation.ellipse_detection import ellipse_iou
 
 
-SCHEMA_VERSION = "face-dino-baseline-aligned-v1"
+SCHEMA_VERSION = "face-dino-baseline-aligned-v2"
+FACE_PRECISION_CONSTRAINT = 0.90
+FACE_THRESHOLD_SELECTION_FILENAME = "face_threshold_selection.json"
 THRESHOLDS = {
     "head_score": 0.30,
     "head_max_detections": 100,
     "head_nms": False,
     "head_matching_iou": 0.50,
     "head_roi_scale": 1.20,
-    "face_score": 0.80,
+    "face_score": 0.33,
     "point_presence": 0.70,
     "point_nme": [0.05, 0.10],
     "angle_axis_ratio": 1.05,
@@ -60,6 +62,13 @@ EXPECTED = {
 # contract.  They reproduce the report inventory exactly.
 IGNORED_HEAD_IDS = {"val": {1219, 4717}, "test": {4096}}
 SEMANTIC_SLOTS = {"eye": (0, 1), "nose": (2,), "mouth": (3, 4)}
+OCCLUSION_SEVERITY_CASES = (
+    "occlusion_proxy_0_percent",
+    "occlusion_proxy_25_percent",
+    "occlusion_proxy_50_percent",
+    "occlusion_proxy_75_percent",
+    "occlusion_proxy_100_percent",
+)
 
 # The designated report values are intentionally kept separate from computed
 # candidate values.  Test never writes back into this mapping.
@@ -203,9 +212,32 @@ BASELINE_VAL = {
 }
 
 TABLE_METRICS = (
+    "cascade.total_face_positive_heads",
+    "cascade.head_detected_heads",
+    "cascade.head_recall",
+    "cascade.face_detected_after_head_heads",
+    "cascade.face_given_head_rate",
+    "cascade.face_end_to_end_recall",
+    "cascade.keypoint_positive_heads",
+    "cascade.keypoint_eligible_after_face_heads",
+    "cascade.keypoint_detected_after_face_heads",
+    "cascade.keypoint_given_face_rate",
+    "cascade.keypoint_detected_end_to_end_heads",
+    "cascade.keypoint_head_end_to_end_recall",
+    "cascade.gt_keypoint_points_total",
+    "cascade.gt_keypoint_points_after_head",
+    "cascade.gt_keypoint_points_after_face",
+    "cascade.predicted_keypoint_points_after_face",
+    "cascade.correct_keypoint_points_0.05",
+    "cascade.correct_keypoint_points_0.10",
+    "cascade.correct_keypoint_point_recall_0.05",
+    "cascade.correct_keypoint_point_recall_0.10",
+    "cascade.correct_keypoint_point_recall_given_face_0.05",
+    "cascade.correct_keypoint_point_recall_given_face_0.10",
     "gt_head.face.supervised_heads",
     "gt_head.face.positive_heads",
     "gt_head.face.negative_heads",
+    "gt_head.face.face_present_precision",
     "gt_head.keypoint.micro_recall_0.05",
     "gt_head.keypoint.micro_recall_0.10",
     "gt_head.keypoint.matched_points_0.10",
@@ -214,6 +246,7 @@ TABLE_METRICS = (
     "gt_head.state.evaluated_present_points",
     "matched_head.keypoint.micro_recall_0.05",
     "matched_head.keypoint.micro_recall_0.10",
+    "matched_head.face.face_present_precision",
     "runtime.total_seconds",
     "runtime.images_per_second",
     "runtime.model_inference_milliseconds_per_image",
@@ -238,12 +271,32 @@ TABLE_METRICS = (
         "image_edge",
         "occlusion_yes",
         "small_head_tercile",
+        *OCCLUSION_SEVERITY_CASES,
     )
     for section, metric in (
         ("ellipse", "mean_iou"),
         ("ellipse", "p10_iou"),
         ("keypoint", "macro_f1_0.05"),
         ("keypoint", "macro_f1_0.10"),
+    )
+) + tuple(
+    f"hard_cases.{case}.{scope}.{metric}"
+    for case in OCCLUSION_SEVERITY_CASES
+    for scope, metric in (
+        ("face_detection.gt_head", "detected_faces"),
+        ("face_detection.gt_head", "recall"),
+        ("face_detection.gt_head", "mean_iou"),
+        ("face_detection.gt_head", "median_iou"),
+        ("face_detection.gt_head", "p10_iou"),
+        ("face_detection.gt_head", "iou_recall_0.50"),
+        ("face_detection.gt_head", "iou_recall_0.75"),
+        ("face_detection.deployment", "matched_heads"),
+        ("face_detection.deployment", "head_recall"),
+        ("face_detection.deployment", "detected_faces"),
+        ("face_detection.deployment", "face_end_to_end_recall"),
+        ("face_detection.deployment", "mean_iou"),
+        ("face_detection.deployment", "iou_recall_0.50"),
+        ("face_detection.deployment", "iou_recall_0.75"),
     )
 ) + tuple(
     f"{scope}.state.{metric}"
@@ -269,6 +322,7 @@ TABLE_METRICS = (
         "image_edge",
         "occlusion_yes",
         "small_head_tercile",
+        *OCCLUSION_SEVERITY_CASES,
     )
 )
 
@@ -344,6 +398,38 @@ def _assign_to_heads(
     return result
 
 
+def _assign_linked_to_heads(
+    head_predictions: Sequence[Mapping[str, Any]],
+    head_matches: Mapping[int, int],
+    predictions: Sequence[Mapping[str, Any]],
+) -> dict[int, int]:
+    """Resolve explicit query parent links through matched predicted HEADs."""
+
+    query_to_gt = {
+        int(head_predictions[prediction_index]["query_index"]): int(gt_index)
+        for gt_index, prediction_index in head_matches.items()
+        if head_predictions[prediction_index].get("query_index") is not None
+    }
+    candidates: list[tuple[float, int, int]] = []
+    for prediction_index, prediction in enumerate(predictions):
+        parent = prediction.get("parent_head_query_index")
+        if parent is None or int(parent) < 0 or int(parent) not in query_to_gt:
+            continue
+        candidates.append(
+            (
+                float(prediction.get("score", 0.0)),
+                query_to_gt[int(parent)],
+                prediction_index,
+            )
+        )
+    assigned: dict[int, int] = {}
+    for _score, gt_index, prediction_index in sorted(
+        candidates, reverse=True
+    ):
+        assigned.setdefault(gt_index, prediction_index)
+    return assigned
+
+
 def _match_boxes(
     ground_truth: Sequence[Sequence[float]],
     predictions: Sequence[Mapping[str, Any]],
@@ -390,9 +476,119 @@ def _face_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "false_negative": fn,
         "true_negative": tn,
         "macro_f1": 0.5 * (positive["f1"] + negative["f1"]),
+        "face_present_precision": positive["precision"],
         "face_present_recall": positive["recall"],
         "no_face_recall": negative["recall"],
         "false_face_rate": fp / max(1, fp + tn),
+    }
+
+
+def select_face_threshold_precision_constrained(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    minimum_threshold: float = 0.33,
+    precision_constraint: float = FACE_PRECISION_CONSTRAINT,
+    precision_metric_path: str = "gt_head.face.face_present_precision",
+    population: str = "supervised_gt_heads",
+    allow_unavailable: bool = False,
+) -> dict[str, Any]:
+    """Select the validation FACE threshold with maximum constrained recall.
+
+    Precision must be strictly greater than ``precision_constraint`` and at
+    least one FACE prediction must be emitted.  Recall is maximized first;
+    ties prefer higher precision and then the lower threshold.
+    """
+
+    supervised = [row for row in rows if row["face_target"] != "ignored"]
+    candidate_thresholds = sorted(
+        {
+            float(minimum_threshold),
+            *(
+                float(row.get("face_score", 0.0))
+                for row in supervised
+                if float(row.get("face_score", 0.0)) >= minimum_threshold
+            ),
+        }
+    )
+    candidates: list[dict[str, Any]] = []
+    for threshold in candidate_thresholds:
+        threshold_rows = []
+        for source in supervised:
+            row = dict(source)
+            score = float(row.get("face_score", 0.0))
+            has_assignment = bool(
+                score > 0.0 or row.get("_assigned_ellipse") is not None
+            )
+            row["face_predicted"] = bool(
+                has_assignment and score >= threshold
+            )
+            threshold_rows.append(row)
+        face = _face_metrics(threshold_rows)
+        predicted = int(face["true_positive"]) + int(face["false_positive"])
+        precision = float(face["face_present_precision"])
+        recall = float(face["face_present_recall"])
+        if predicted > 0 and precision > precision_constraint:
+            candidates.append(
+                {
+                    "face_threshold": threshold,
+                    "precision": precision,
+                    "recall": recall,
+                    "predicted_heads": predicted,
+                    "true_positive": int(face["true_positive"]),
+                    "false_positive": int(face["false_positive"]),
+                    "false_negative": int(face["false_negative"]),
+                    "true_negative": int(face["true_negative"]),
+                }
+            )
+    if not candidates:
+        if allow_unavailable:
+            return {
+                "status": "unsupported",
+                "unsupported_reason": (
+                    "no_validation_face_threshold_satisfies_precision_gt_0.90"
+                ),
+                "selection_source": "validation_precision_gt_0.90_max_recall",
+                "objective": "maximize_recall",
+                "precision_constraint": {
+                    "metric": precision_metric_path,
+                    "operator": ">",
+                    "value": float(precision_constraint),
+                },
+                "selection_population": population,
+                "selection_population_heads": len(supervised),
+                "minimum_threshold": float(minimum_threshold),
+                "candidate_threshold_count": len(candidate_thresholds),
+                "eligible_threshold_count": 0,
+                "face_threshold": None,
+                "tie_break": ["higher_precision", "lower_threshold"],
+            }
+        raise RuntimeError(
+            "No validation FACE threshold emits a prediction while satisfying "
+            f"precision > {precision_constraint:.2f}"
+        )
+    selected = max(
+        candidates,
+        key=lambda item: (
+            float(item["recall"]),
+            float(item["precision"]),
+            -float(item["face_threshold"]),
+        ),
+    )
+    return {
+        **selected,
+        "selection_source": "validation_precision_gt_0.90_max_recall",
+        "objective": "maximize_recall",
+        "precision_constraint": {
+            "metric": precision_metric_path,
+            "operator": ">",
+            "value": float(precision_constraint),
+        },
+        "selection_population": population,
+        "selection_population_heads": len(supervised),
+        "minimum_threshold": float(minimum_threshold),
+        "candidate_threshold_count": len(candidate_thresholds),
+        "eligible_threshold_count": len(candidates),
+        "tie_break": ["higher_precision", "lower_threshold"],
     }
 
 
@@ -500,6 +696,147 @@ def _keypoint_metrics(
     }
 
 
+def _cascade_waterfall(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    head_supported: bool,
+    keypoint_supported: bool,
+    point_threshold: float = 0.70,
+) -> dict[str, Any]:
+    """Count the same GT Head instances through HEAD -> FACE -> keypoint.
+
+    The denominator is every attribute-valid (face-positive) GT Head. HEAD
+    success requires a predicted Head matched at the locked IoU. FACE and
+    keypoint success are then gated by all preceding stages, so downstream
+    counts cannot hide upstream misses.
+    """
+
+    if not head_supported:
+        return _unsupported("architecture_does_not_output_head_boxes")
+
+    positive = [row for row in rows if row["face_target"] == "positive"]
+    head_detected = [row for row in positive if bool(row.get("head_detected"))]
+    face_detected = [row for row in head_detected if bool(row["face_predicted"])]
+    keypoint_positive = [
+        row
+        for row in positive
+        if any(int(state) > 0 for state in row.get("gt_keypoint_states", ()))
+    ]
+    keypoint_eligible = [
+        row
+        for row in face_detected
+        if any(int(state) > 0 for state in row.get("gt_keypoint_states", ()))
+    ]
+    keypoint_eligible_ids = {
+        int(row["annotation_id"])
+        for row in keypoint_eligible
+        if row.get("annotation_id") is not None
+    }
+
+    result: dict[str, Any] = {
+        "supported": True,
+        "denominator": "attribute_valid_face_positive_gt_heads",
+        "head_match": "predicted_head_to_gt_head_iou_at_least_0.50",
+        "face_gate": "assigned_face_score_at_least_locked_face_threshold",
+        "keypoint_gate": (
+            "preceding_head_and_face_success_and_at_least_one_point_presence_"
+            "score_at_or_above_threshold"
+        ),
+        "point_threshold": float(point_threshold),
+        "total_face_positive_heads": len(positive),
+        "head_detected_heads": len(head_detected),
+        "head_recall": len(head_detected) / max(1, len(positive)),
+        "face_detected_after_head_heads": len(face_detected),
+        "face_given_head_rate": len(face_detected) / max(1, len(head_detected)),
+        "face_end_to_end_recall": len(face_detected) / max(1, len(positive)),
+        "keypoint_supported": bool(keypoint_supported),
+        "keypoint_positive_heads": len(keypoint_positive),
+    }
+    if not keypoint_supported:
+        result["keypoint_unsupported_reason"] = (
+            "architecture_does_not_output_fixed_five_keypoints"
+        )
+        return result
+
+    keypoint_detected: list[Mapping[str, Any]] = []
+    gt_points_total = 0
+    gt_points_after_head = 0
+    gt_points_after_face = 0
+    predicted_points_after_face = 0
+    correct = {0.05: 0, 0.10: 0}
+    correct_heads = {0.05: 0, 0.10: 0}
+
+    for row in positive:
+        states = [int(state) for state in row.get("gt_keypoint_states", ())]
+        gt_present = [index for index, state in enumerate(states) if state > 0]
+        gt_points_total += len(gt_present)
+        if bool(row.get("head_detected")):
+            gt_points_after_head += len(gt_present)
+        if int(row.get("annotation_id", -1)) not in keypoint_eligible_ids:
+            continue
+        gt_points_after_face += len(gt_present)
+        points = row.get("predicted_keypoints")
+        scores = row.get("point_scores")
+        predicted_slots = []
+        if points is not None and scores is not None:
+            predicted_slots = [
+                slot
+                for slot in range(min(len(points), len(scores), len(states)))
+                if float(scores[slot]) >= point_threshold
+            ]
+        predicted_points_after_face += len(predicted_slots)
+        if predicted_slots:
+            keypoint_detected.append(row)
+
+        correct_in_head = {0.05: False, 0.10: False}
+        if points is None or scores is None:
+            continue
+        for slot in gt_present:
+            if slot >= len(points) or slot >= len(scores):
+                continue
+            if float(scores[slot]) < point_threshold:
+                continue
+            error = math.hypot(
+                float(points[slot][0]) - float(row["gt_keypoints"][slot][0]),
+                float(points[slot][1]) - float(row["gt_keypoints"][slot][1]),
+            ) / max(float(row["head_roi_side"]), 1.0e-12)
+            for threshold in (0.05, 0.10):
+                if error <= threshold:
+                    correct[threshold] += 1
+                    correct_in_head[threshold] = True
+        for threshold in (0.05, 0.10):
+            correct_heads[threshold] += int(correct_in_head[threshold])
+
+    result.update(
+        {
+            "keypoint_eligible_after_face_heads": len(keypoint_eligible),
+            "keypoint_detected_after_face_heads": len(keypoint_detected),
+            "keypoint_given_face_rate": len(keypoint_detected)
+            / max(1, len(keypoint_eligible)),
+            "keypoint_detected_end_to_end_heads": len(keypoint_detected),
+            "keypoint_head_end_to_end_recall": len(keypoint_detected)
+            / max(1, len(keypoint_positive)),
+            "keypoint_correct_heads_0.05": correct_heads[0.05],
+            "keypoint_correct_heads_0.10": correct_heads[0.10],
+            "gt_keypoint_points_total": gt_points_total,
+            "gt_keypoint_points_after_head": gt_points_after_head,
+            "gt_keypoint_points_after_face": gt_points_after_face,
+            "predicted_keypoint_points_after_face": predicted_points_after_face,
+            "correct_keypoint_points_0.05": correct[0.05],
+            "correct_keypoint_points_0.10": correct[0.10],
+            "correct_keypoint_point_recall_0.05": correct[0.05]
+            / max(1, gt_points_total),
+            "correct_keypoint_point_recall_0.10": correct[0.10]
+            / max(1, gt_points_total),
+            "correct_keypoint_point_recall_given_face_0.05": correct[0.05]
+            / max(1, gt_points_after_face),
+            "correct_keypoint_point_recall_given_face_0.10": correct[0.10]
+            / max(1, gt_points_after_face),
+        }
+    )
+    return result
+
+
 def _state_metrics(
     rows: Sequence[Mapping[str, Any]],
     supported: bool,
@@ -602,6 +939,123 @@ def _head_coco_metrics(
     return {"supported": True, "detections_at_locked_threshold": len(detections), **dict(zip(keys, map(float, values), strict=True))}
 
 
+def _occlusion_severity_case(states: Sequence[int]) -> str | None:
+    """Map five semantic states to the documented coarse occlusion proxy.
+
+    The source data has point states, not an occluder mask or visible-face-area
+    annotation.  A non-visible slot (missing=0 or occluded=1) therefore acts as
+    one fifth of the proxy.  The 40% and 60% cases share the approximate 50%
+    bucket.  Zero is retained as a control population.
+    """
+
+    if len(states) != 5:
+        return None
+    non_visible = sum(int(state) != 2 for state in states)
+    return {
+        0: "occlusion_proxy_0_percent",
+        1: "occlusion_proxy_25_percent",
+        2: "occlusion_proxy_50_percent",
+        3: "occlusion_proxy_50_percent",
+        4: "occlusion_proxy_75_percent",
+        5: "occlusion_proxy_100_percent",
+    }[non_visible]
+
+
+def _face_detection_slice_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    ellipse_supported: bool,
+    head_supported: bool,
+) -> dict[str, Any]:
+    """Measure thresholded FACE localization on one positive-GT stratum."""
+
+    positive = [row for row in rows if row["face_target"] == "positive"]
+    instance_count = len(positive)
+
+    def localization(
+        selected: Sequence[Mapping[str, Any]],
+        *,
+        detected_key: str,
+    ) -> dict[str, Any]:
+        detected_count = sum(bool(row[detected_key]) for row in selected)
+        if not ellipse_supported:
+            return {
+                "detected_faces": detected_count,
+                "recall": detected_count / instance_count if instance_count else None,
+                **_unsupported("architecture_does_not_output_face_ellipse"),
+            }
+        overlaps = []
+        for row in selected:
+            predicted = row.get("predicted_ellipse")
+            overlap = (
+                float(ellipse_iou(predicted, row["gt_ellipse"]))
+                if bool(row[detected_key]) and predicted is not None
+                else 0.0
+            )
+            overlaps.append(overlap)
+        return {
+            "supported": True,
+            "detected_faces": detected_count,
+            "recall": detected_count / instance_count if instance_count else None,
+            "mean_iou": float(np.mean(overlaps)) if overlaps else None,
+            "median_iou": float(np.median(overlaps)) if overlaps else None,
+            "p10_iou": float(np.quantile(overlaps, 0.10)) if overlaps else None,
+            "iou_recall_0.50": (
+                sum(value >= 0.50 for value in overlaps) / instance_count
+                if instance_count
+                else None
+            ),
+            "iou_recall_0.75": (
+                sum(value >= 0.75 for value in overlaps) / instance_count
+                if instance_count
+                else None
+            ),
+            "miss_iou_policy": "zero",
+            "iou_implementation": "repository_96_point_polygon",
+        }
+
+    gt_rows = []
+    deployment_rows = []
+    for source in positive:
+        gt_row = dict(source)
+        gt_row["_slice_detected"] = bool(source.get("face_predicted"))
+        gt_rows.append(gt_row)
+        deployment_row = dict(source)
+        deployment_row["_slice_detected"] = bool(
+            source.get("head_detected") and source.get("face_predicted")
+        )
+        deployment_rows.append(deployment_row)
+
+    gt_head = localization(gt_rows, detected_key="_slice_detected")
+    if head_supported:
+        deployment = localization(
+            deployment_rows,
+            detected_key="_slice_detected",
+        )
+        deployment.update(
+            {
+                "matched_heads": sum(
+                    bool(row.get("head_detected")) for row in positive
+                ),
+                "head_recall": (
+                    sum(bool(row.get("head_detected")) for row in positive)
+                    / instance_count
+                    if instance_count
+                    else None
+                ),
+                "face_end_to_end_recall": deployment.pop("recall"),
+            }
+        )
+    else:
+        deployment = _unsupported("architecture_does_not_output_head_boxes")
+    return {
+        "instances": instance_count,
+        "denominator": "attribute_valid_face_positive_gt_heads_in_slice",
+        "gt_head": gt_head,
+        "deployment": deployment,
+    }
+
+
 def _slice_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
     positive_rows = [row for row in rows if row["face_target"] == "positive"]
     sides = [row["head_roi_side"] for row in positive_rows]
@@ -648,6 +1102,9 @@ def _slice_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str
             tags.append("image_edge")
         if any(state == 1 for state in states):
             tags.append("occlusion_yes")
+        severity_case = _occlusion_severity_case(states)
+        if severity_case is not None:
+            tags.append(severity_case)
         if row["head_roi_side"] <= small_cut:
             tags.append("small_head_tercile")
         for tag in tags:
@@ -686,11 +1143,18 @@ def evaluate_normalized_predictions(
     allow_partial_inventory: bool = False,
     validation_selected_face_threshold: float | None = None,
     validation_selected_point_threshold: float | None = None,
+    face_score_candidate_floor: float | None = None,
+    local_face_bbox_metrics: Mapping[str, Any] | None = None,
+    local_face_bbox_markdown: Sequence[str] | None = None,
+    inventory_contract: Mapping[str, Any] | None = None,
+    validation_face_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate and write the canonical JSON, Markdown table, and marker."""
 
     coco = json.loads(annotation_path.read_text(encoding="utf-8"))
-    expected = EXPECTED[split]
+    expected = EXPECTED[split] if inventory_contract is None else inventory_contract
+    if inventory_contract is not None and allow_partial_inventory:
+        raise ValueError("An explicit split contract requires full inventory verification")
     annotation_hash = sha256_file(annotation_path)
     if annotation_hash != expected["annotation_sha256"]:
         raise RuntimeError(f"{split} annotation SHA-256 mismatch: {annotation_hash}")
@@ -698,10 +1162,15 @@ def evaluate_normalized_predictions(
     annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for annotation in coco["annotations"]:
         annotations_by_image[int(annotation["image_id"])].append(annotation)
-    ignored = IGNORED_HEAD_IDS[split]
+    ignored = IGNORED_HEAD_IDS[split] if inventory_contract is None else set(inventory_contract["ignored_head_ids"])
+    if set(map(int, predictions_by_image)) != set(image_by_id) and not allow_partial_inventory:
+        raise RuntimeError("Prediction image IDs differ from the declared split")
     rows: list[dict[str, Any]] = []
+    linked_matched_rows: list[dict[str, Any]] = []
+    explicit_parent_links = False
     matched_head_annotation_ids: set[int] = set()
     has_head = any(value.get("heads") for value in predictions_by_image.values())
+    has_face = any(value.get("faces") for value in predictions_by_image.values())
     has_ellipse = any(any(row.get("ellipse") is not None for row in value.get("faces", [])) for value in predictions_by_image.values())
     has_keypoint = any(value.get("poses") for value in predictions_by_image.values())
     has_state = any(any(row.get("state_probabilities") is not None for row in value.get("poses", [])) for value in predictions_by_image.values())
@@ -716,6 +1185,7 @@ def evaluate_normalized_predictions(
             if float(row.get("score", 0.0)) >= THRESHOLDS["head_score"]
         ][:100]
         head_matches = _match_boxes([_xywh_to_xyxy(head["bbox"]) for head in heads], head_predictions) if has_head else {}
+        image_rows: list[dict[str, Any]] = []
         for index, head in enumerate(heads):
             annotation_id = int(head["id"])
             if index in head_matches:
@@ -726,7 +1196,7 @@ def evaluate_normalized_predictions(
             face_score = float(face.get("score", 0.0)) if face is not None else 0.0
             face_predicted = face is not None and face_score >= THRESHOLDS["face_score"]
             _roi, roi_side = _head_square(head)
-            rows.append({
+            image_rows.append({
                 "image_id": image_id,
                 "image_width": float(image["width"]),
                 "image_height": float(image["height"]),
@@ -734,6 +1204,7 @@ def evaluate_normalized_predictions(
                 "face_target": target,
                 "face_score": face_score,
                 "face_predicted": face_predicted,
+                "head_detected": index in head_matches,
                 "head_bbox_xyxy": _xywh_to_xyxy(head["bbox"]),
                 "head_roi_side": roi_side,
                 "gt_ellipse": list(map(float, head["ellipse"])) if target == "positive" else None,
@@ -749,6 +1220,56 @@ def evaluate_normalized_predictions(
                 "point_scores": pose.get("point_scores") if pose is not None else None,
                 "state_probabilities": pose.get("state_probabilities") if pose is not None else None,
             })
+        rows.extend(image_rows)
+        image_has_explicit_links = bool(
+            prediction.get("uses_explicit_parent_links", False)
+        ) or any(
+            item.get("parent_head_query_index") is not None
+            for item in (*faces, *poses)
+        )
+        if image_has_explicit_links:
+            explicit_parent_links = True
+            linked_faces = _assign_linked_to_heads(
+                head_predictions, head_matches, faces
+            )
+            linked_poses = _assign_linked_to_heads(
+                head_predictions, head_matches, poses
+            )
+            for gt_index in head_matches:
+                linked = dict(image_rows[gt_index])
+                face = (
+                    faces[linked_faces[gt_index]]
+                    if gt_index in linked_faces
+                    else None
+                )
+                pose = (
+                    poses[linked_poses[gt_index]]
+                    if gt_index in linked_poses
+                    else None
+                )
+                linked["face_score"] = (
+                    float(face.get("score", 0.0)) if face is not None else 0.0
+                )
+                linked["face_predicted"] = bool(
+                    face is not None
+                    and linked["face_score"] >= THRESHOLDS["face_score"]
+                )
+                linked["predicted_ellipse"] = (
+                    list(map(float, face["ellipse"]))
+                    if face is not None and face.get("ellipse") is not None
+                    else None
+                )
+                linked["_assigned_ellipse"] = linked["predicted_ellipse"]
+                linked["predicted_keypoints"] = (
+                    pose.get("keypoints") if pose is not None else None
+                )
+                linked["point_scores"] = (
+                    pose.get("point_scores") if pose is not None else None
+                )
+                linked["state_probabilities"] = (
+                    pose.get("state_probabilities") if pose is not None else None
+                )
+                linked_matched_rows.append(linked)
     inventory = {
         "groups": len({str(image.get("source_video_id", "")) for image in coco["images"]}),
         "images": len(coco["images"]),
@@ -761,14 +1282,28 @@ def evaluate_normalized_predictions(
     for key in ("groups", "images", "heads", "face_positive", "no_face", "ignored_ambiguous"):
         if not allow_partial_inventory and inventory[key] != expected[key]:
             raise RuntimeError(f"{split} inventory mismatch for {key}: expected={expected[key]} actual={inventory[key]}")
-    matched_rows = [row for row in rows if row["annotation_id"] in matched_head_annotation_ids]
+    matched_rows = (
+        linked_matched_rows
+        if explicit_parent_links
+        else [
+            row
+            for row in rows
+            if row["annotation_id"] in matched_head_annotation_ids
+        ]
+    )
 
     def operating_point(
         source_rows: Sequence[Mapping[str, Any]],
         *,
         face_threshold: float,
         point_threshold: float,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
         selected_rows = []
         for source in source_rows:
             row = dict(source)
@@ -782,7 +1317,11 @@ def evaluate_normalized_predictions(
             row["predicted_ellipse"] = row.get("_assigned_ellipse")
             selected_rows.append(row)
         gt = {
-            "face": _face_metrics(selected_rows),
+            "face": (
+                _face_metrics(selected_rows)
+                if has_face
+                else _unsupported("architecture_does_not_output_face_predictions")
+            ),
             "ellipse": _ellipse_metrics(selected_rows, has_ellipse),
             "keypoint": _keypoint_metrics(
                 selected_rows,
@@ -807,7 +1346,15 @@ def evaluate_normalized_predictions(
                 "matched_supervised_heads": sum(row["face_target"] != "ignored" for row in matched),
                 "matched_face_positive": sum(row["face_target"] == "positive" for row in matched),
             } if has_head else _unsupported("architecture_does_not_output_head_boxes"),
-            "face": _face_metrics(matched) if has_head else _unsupported("architecture_does_not_output_head_boxes"),
+            "face": (
+                _face_metrics(matched)
+                if has_head and has_face
+                else _unsupported(
+                    "architecture_does_not_output_face_predictions"
+                    if has_head
+                    else "architecture_does_not_output_head_boxes"
+                )
+            ),
             "ellipse": _ellipse_metrics(matched, has_ellipse) if has_head else _unsupported("architecture_does_not_output_head_boxes"),
             "keypoint": _keypoint_metrics(matched, has_keypoint, point_threshold=point_threshold) if has_head else _unsupported("architecture_does_not_output_head_boxes"),
             "state": _state_metrics(matched, has_state, point_threshold=point_threshold) if has_head else _unsupported("architecture_does_not_output_head_boxes"),
@@ -816,6 +1363,11 @@ def evaluate_normalized_predictions(
         for name, subset in _slice_rows(selected_rows).items():
             cases[name] = {
                 "instances": len(subset),
+                "face_detection": _face_detection_slice_metrics(
+                    subset,
+                    ellipse_supported=has_ellipse,
+                    head_supported=has_head,
+                ),
                 "ellipse": _ellipse_metrics(subset, has_ellipse),
                 "keypoint": _keypoint_metrics(
                     subset,
@@ -823,9 +1375,179 @@ def evaluate_normalized_predictions(
                     point_threshold=point_threshold,
                 ),
             }
-        return selected_rows, gt, matched_sections, cases
+        cascade = _cascade_waterfall(
+            selected_rows,
+            head_supported=has_head,
+            keypoint_supported=has_keypoint,
+            point_threshold=point_threshold,
+        )
+        return selected_rows, gt, matched_sections, cases, cascade
 
-    rows, gt_sections, matched_sections, hard_cases = operating_point(
+    selected_point_threshold = (
+        float(validation_selected_point_threshold)
+        if validation_selected_point_threshold is not None
+        else float(THRESHOLDS["point_presence"])
+    )
+    selection_candidate_floor = (
+        float(face_score_candidate_floor)
+        if face_score_candidate_floor is not None
+        else float(THRESHOLDS["face_score"])
+    )
+    if not 0.0 <= selection_candidate_floor <= 1.0:
+        raise ValueError(
+            "FACE score candidate floor must be in [0, 1], got "
+            f"{selection_candidate_floor}"
+        )
+    validation_selection_path = (
+        output_dir.parent.parent
+        / "val"
+        / output_dir.name
+        / FACE_THRESHOLD_SELECTION_FILENAME
+    )
+    if not has_face:
+        face_threshold_selection = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "unsupported",
+            "unsupported_reason": "architecture_does_not_output_face_predictions",
+            "selected_on_split": None,
+            "architecture_id": architecture_id,
+            "comparison_stage": comparison_stage,
+            "face_threshold": float(THRESHOLDS["face_score"]),
+            "minimum_threshold": selection_candidate_floor,
+            "point_threshold": selected_point_threshold,
+            "annotation_sha256": annotation_hash,
+        }
+        selection_application_source = "not_applicable_to_head_only_model"
+    elif validation_face_selection is not None:
+        face_threshold_selection = dict(validation_face_selection)
+        if face_threshold_selection.get("selected_on_split") != "val" and face_threshold_selection.get("selection_attempted_on_split") != "val":
+            raise ValueError("External FACE selection must be locked on validation")
+        if face_threshold_selection.get("architecture_id") != architecture_id:
+            raise ValueError("External FACE selection belongs to another architecture")
+        selection_application_source = "explicit_validation_bbox_iou50_lock"
+    elif split == "val":
+        face_threshold_selection = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "success",
+            "selected_on_split": "val",
+            "architecture_id": architecture_id,
+            "comparison_stage": comparison_stage,
+            **select_face_threshold_precision_constrained(
+                matched_rows if has_head else rows,
+                minimum_threshold=selection_candidate_floor,
+                precision_metric_path=(
+                    "matched_head.face.face_present_precision"
+                    if has_head
+                    else "gt_head.face.face_present_precision"
+                ),
+                population=(
+                    "supervised_gt_heads_with_matched_predicted_head"
+                    if has_head
+                    else "supervised_gt_heads"
+                ),
+                allow_unavailable=True,
+            ),
+            "point_threshold": selected_point_threshold,
+            "annotation_sha256": annotation_hash,
+        }
+        if face_threshold_selection.get("status") == "unsupported":
+            face_threshold_selection["selected_on_split"] = None
+            face_threshold_selection["selection_attempted_on_split"] = "val"
+            selection_application_source = (
+                "validation_had_no_precision_constrained_operating_point"
+            )
+        else:
+            selection_application_source = (
+                "selected_automatically_on_validation"
+            )
+    elif validation_selection_path.is_file():
+        face_threshold_selection = json.loads(
+            validation_selection_path.read_text(encoding="utf-8")
+        )
+        selection_status = face_threshold_selection.get("status")
+        if selection_status == "success":
+            if face_threshold_selection.get("selected_on_split") != "val":
+                raise RuntimeError(
+                    "Test FACE threshold must have been selected on validation: "
+                    f"{validation_selection_path}"
+                )
+        elif selection_status == "unsupported":
+            if (
+                face_threshold_selection.get("selection_attempted_on_split")
+                != "val"
+                or face_threshold_selection.get("unsupported_reason")
+                != "no_validation_face_threshold_satisfies_precision_gt_0.90"
+            ):
+                raise RuntimeError(
+                    "Validation FACE threshold unavailability is not a valid "
+                    f"precision-constrained Val result: {validation_selection_path}"
+                )
+        else:
+            raise RuntimeError(
+                "Validation FACE threshold selection has invalid status: "
+                f"{validation_selection_path}"
+            )
+        if face_threshold_selection.get("architecture_id") != architecture_id:
+            raise RuntimeError(
+                "Validation FACE threshold belongs to another architecture: "
+                f"{validation_selection_path}"
+            )
+        if face_threshold_selection.get("comparison_stage") != comparison_stage:
+            raise RuntimeError(
+                "Validation FACE threshold belongs to another comparison "
+                f"stage: {validation_selection_path}"
+            )
+        constraint = face_threshold_selection.get("precision_constraint", {})
+        if (
+            constraint.get("operator") != ">"
+            or float(constraint.get("value", -1.0))
+            != FACE_PRECISION_CONSTRAINT
+        ):
+            raise RuntimeError(
+                "Validation FACE threshold selection has the wrong precision "
+                f"constraint: {validation_selection_path}"
+            )
+        selected_point_threshold = float(
+            face_threshold_selection.get(
+                "point_threshold",
+                THRESHOLDS["point_presence"],
+            )
+        )
+        selection_application_source = (
+            "frozen_validation_artifact"
+            if selection_status == "success"
+            else "frozen_validation_artifact_no_feasible_operating_point"
+        )
+    elif validation_selected_face_threshold is not None:
+        # Compatibility path for callers whose Val and Test directories are
+        # not siblings.  The argument is explicitly validation-selected; Test
+        # still never computes a threshold from its own labels.
+        face_threshold_selection = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "success",
+            "selected_on_split": "val",
+            "architecture_id": architecture_id,
+            "comparison_stage": comparison_stage,
+            "selection_source": "explicit_validation_selected_threshold",
+            "objective": "maximize_recall",
+            "precision_constraint": {
+                "metric": "gt_head.face.face_present_precision",
+                "operator": ">",
+                "value": FACE_PRECISION_CONSTRAINT,
+            },
+            "face_threshold": float(validation_selected_face_threshold),
+            "minimum_threshold": selection_candidate_floor,
+            "point_threshold": selected_point_threshold,
+            "validation_metrics_unavailable": True,
+        }
+        selection_application_source = "explicit_validation_threshold"
+    else:
+        raise FileNotFoundError(
+            "Test evaluation requires the validation-selected FACE threshold "
+            f"artifact: {validation_selection_path}"
+        )
+
+    rows, gt_sections, matched_sections, hard_cases, cascade = operating_point(
         rows,
         face_threshold=float(THRESHOLDS["face_score"]),
         point_threshold=float(THRESHOLDS["point_presence"]),
@@ -837,7 +1559,12 @@ def evaluate_normalized_predictions(
         "comparison_stage": comparison_stage,
         "split": split,
         "inventory": inventory,
-        "thresholds": {**THRESHOLDS, "selection_source": "locked_baseline_report_and_validation_only"},
+        "thresholds": {
+            **THRESHOLDS,
+            "selection_source": (
+                "common_face_0.33_and_validation_precision_gt_0.90_max_recall"
+            ),
+        },
         "coordinate_contract": {
             "boxes": "xyxy_pixels_in_original_image",
             "ellipse": "cx_cy_major_radius_minor_radius_theta_radians",
@@ -848,10 +1575,28 @@ def evaluate_normalized_predictions(
                 "frozen reference-report rank tail: Val 132 / Test 135; "
                 "descriptive only and never used for selection"
             ),
+            "occlusion_severity_proxy": {
+                "source": "five_fixed_semantic_keypoint_states",
+                "non_visible_definition": "state != visible (state != 2)",
+                "limitations": (
+                    "weakness proxy, not pixel occlusion area ground truth; "
+                    "includes object occlusion, self-occlusion, off-screen "
+                    "truncation, and missing annotation"
+                ),
+                "buckets": {
+                    "occlusion_proxy_0_percent": "0/5 non-visible slots (control)",
+                    "occlusion_proxy_25_percent": "1/5 non-visible slots (20%)",
+                    "occlusion_proxy_50_percent": "2-3/5 non-visible slots (40-60%)",
+                    "occlusion_proxy_75_percent": "4/5 non-visible slots (80%)",
+                    "occlusion_proxy_100_percent": "5/5 non-visible slots (100%)",
+                },
+                "selection_use": "diagnostic_only_never_select_on_test",
+            },
         },
         "head": _head_coco_metrics(coco, predictions_by_image, has_head),
         "gt_head": gt_sections,
         "matched_head": matched_sections,
+        "cascade": cascade,
         "hard_cases": hard_cases,
         "runtime": dict(runtime or _unsupported("runtime_was_not_supplied_by_model_evaluator")),
         "provenance": {
@@ -862,45 +1607,70 @@ def evaluate_normalized_predictions(
             **dict(provenance or {}),
         },
     }
-    if validation_selected_face_threshold is not None:
-        selected_point_threshold = (
-            float(validation_selected_point_threshold)
-            if validation_selected_point_threshold is not None
-            else float(THRESHOLDS["point_presence"])
-        )
+    if has_face and face_threshold_selection.get("status") == "success":
         (
             _selected_rows,
             selected_gt,
             selected_matched,
             selected_hard_cases,
+            selected_cascade,
         ) = operating_point(
             rows,
-            face_threshold=float(validation_selected_face_threshold),
+            face_threshold=float(face_threshold_selection["face_threshold"]),
             point_threshold=selected_point_threshold,
         )
         metrics["validation_selected_operating_point"] = {
-            "selection_source": "validation_only",
+            "selection_source": selection_application_source,
+            "selection_policy": "precision_gt_0.90_then_maximize_recall",
+            "selected_on_split": "val",
             "test_selection_forbidden": True,
-            "face_threshold": float(validation_selected_face_threshold),
+            "face_threshold": float(face_threshold_selection["face_threshold"]),
             "point_threshold": selected_point_threshold,
+            "validation_selection": face_threshold_selection,
             "gt_head": selected_gt,
             "matched_head": selected_matched,
             "hard_cases": selected_hard_cases,
+            "cascade": selected_cascade,
         }
+    elif has_face:
+        metrics["validation_selected_operating_point"] = {
+            "supported": False,
+            "unsupported_reason": face_threshold_selection.get(
+                "unsupported_reason",
+                "validation_face_threshold_selection_unavailable",
+            ),
+            "selection_policy": "precision_gt_0.90_then_maximize_recall",
+            "selected_on_split": None,
+            "test_selection_forbidden": True,
+            "face_threshold": None,
+            "point_threshold": selected_point_threshold,
+            "validation_selection": face_threshold_selection,
+        }
+    else:
+        metrics["validation_selected_operating_point"] = _unsupported(
+            "architecture_does_not_output_face_predictions"
+        )
     flattened: dict[str, Any] = {}
-    for key in ("head", "gt_head", "matched_head", "hard_cases", "runtime"):
+    for key in (
+        "head",
+        "gt_head",
+        "matched_head",
+        "cascade",
+        "hard_cases",
+        "runtime",
+    ):
         _flatten_supported(key, metrics[key], flattened)
     validation_selected_flattened: dict[str, Any] = {}
     selected = metrics.get("validation_selected_operating_point")
-    if isinstance(selected, Mapping):
-        for key in ("gt_head", "matched_head", "hard_cases"):
+    if isinstance(selected, Mapping) and selected.get("supported") is not False:
+        for key in ("gt_head", "matched_head", "cascade", "hard_cases"):
             _flatten_supported(
                 key,
                 selected[key],
                 validation_selected_flattened,
             )
     comparison = []
-    baseline_reference = BASELINE_VAL if split == "val" else BASELINE_TEST
+    baseline_reference = (BASELINE_VAL if split == "val" else BASELINE_TEST) if inventory_contract is None else {}
     comparison_paths = list(baseline_reference)
     comparison_paths.extend(
         name
@@ -935,9 +1705,18 @@ def evaluate_normalized_predictions(
                 if validation_selected_candidate is None or baseline is None
                 else validation_selected_candidate - baseline
             ),
+            "validation_selected_relative_delta": (
+                None
+                if validation_selected_candidate is None or baseline in {None, 0}
+                else (validation_selected_candidate - baseline) / abs(baseline)
+            ),
         })
     metrics["comparison_to_face_dino_report"] = comparison
-    metrics["baseline_reference_split"] = split
+    metrics["baseline_reference_split"] = split if inventory_contract is None else None
+    if inventory_contract is not None:
+        metrics["historical_reference_unsupported_reason"] = "Different split: locked historical report deltas are forbidden"
+        metrics["inventory_contract"] = dict(inventory_contract)
+        metrics["coordinate_contract"]["eccentricity_slice"] = "descriptive top 16 percent by GT ellipse axis ratio; no selection"
     if (
         not allow_partial_inventory
         and inventory["prediction_images"] != inventory["images"]
@@ -957,6 +1736,18 @@ def evaluate_normalized_predictions(
         elif isinstance(value, float) and not math.isfinite(value):
             raise RuntimeError(f"Non-finite common metric: {path}={value}")
 
+    continuous_detector_identity = (provenance or {}).get("continuous_local_face_contract")
+    if local_face_bbox_metrics is not None:
+        if continuous_detector_identity is not None:
+            raise ValueError("Cannot combine independent detector and shared-detector FACE contracts")
+        metrics["primary_local_face_bbox"] = dict(local_face_bbox_metrics)
+    if continuous_detector_identity is not None:
+        from .continuous_face_contract import primary_face_metrics
+
+        metrics["primary_local_face_bbox"] = primary_face_metrics(
+            coco, predictions_by_image, split=split, output_dir=output_dir,
+            candidate_floor=selection_candidate_floor, detector_identity=continuous_detector_identity,
+        )
     assert_finite(metrics)
     assertions = {
         "inventory": True,
@@ -965,17 +1756,79 @@ def evaluate_normalized_predictions(
         "ellipse_metrics": not has_ellipse or metrics["gt_head"]["ellipse"].get("supported") is True,
         "keypoint_metrics": not has_keypoint or metrics["gt_head"]["keypoint"].get("supported") is True,
         "state_metrics": not has_state or metrics["gt_head"]["state"].get("supported") is True,
+        "cascade_waterfall": not has_head
+        or metrics["cascade"].get("supported") is True,
+        "face_threshold_selection": (
+            not has_face
+            or (
+                face_threshold_selection.get("status") == "success"
+                and
+                face_threshold_selection.get("selected_on_split") == "val"
+                and float(face_threshold_selection["face_threshold"])
+                >= float(face_threshold_selection["minimum_threshold"])
+            )
+            or (
+                face_threshold_selection.get("status") == "unsupported"
+                and face_threshold_selection.get("selection_attempted_on_split")
+                == "val"
+                and face_threshold_selection.get("unsupported_reason")
+                == "no_validation_face_threshold_satisfies_precision_gt_0.90"
+                and int(face_threshold_selection.get("eligible_threshold_count", -1))
+                == 0
+            )
+        ),
     }
     if not all(assertions.values()):
         raise RuntimeError(f"Baseline-aligned metric assertion failed: {assertions}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    applied_face_threshold_selection = {
+        **face_threshold_selection,
+        "applied_on_split": split,
+        "application_source": selection_application_source,
+        "validation_selection_artifact": (
+            str(validation_selection_path)
+            if split == "test" and validation_selection_path.is_file()
+            else None
+        ),
+    }
+    (output_dir / FACE_THRESHOLD_SELECTION_FILENAME).write_text(
+        json.dumps(
+            applied_face_threshold_selection,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (output_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     lines = [
         f"# Baseline-aligned comparison: {architecture_id} / {split}",
         "",
-        "| Metric | Face DINO report | Candidate (same locked OP) | Candidate (Val-selected OP) | Locked delta | Val-selected delta |",
-        "|---|---:|---:|---:|---:|---:|",
     ]
+    if local_face_bbox_markdown is not None:
+        lines.extend(local_face_bbox_markdown)
+    elif "primary_local_face_bbox" in metrics:
+        from .continuous_face_contract import markdown_rows
+
+        lines.extend(markdown_rows(metrics["primary_local_face_bbox"]))
+    baseline_roles = dict((provenance or {}).get("baseline_roles", {}))
+    if baseline_roles:
+        lines.extend(
+            [
+                "Baseline roles:",
+                "",
+                *[
+                    f"- `{role}`: {value}"
+                    for role, value in baseline_roles.items()
+                ],
+                "",
+            ]
+        )
+    lines.extend([
+        "| Metric | Face DINO report | Candidate (common Face 0.33) | Candidate (Val-selected P>0.90 OP) | Common Δ abs | Common Δ rel | Val-selected Δ abs | Val-selected Δ rel |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ])
     for row in comparison:
         def fmt(value: Any) -> str:
             return "N/A" if value is None else f"{float(value):.4f}"
@@ -984,14 +1837,51 @@ def evaluate_normalized_predictions(
             f"{fmt(row['candidate'])} | "
             f"{fmt(row['validation_selected_candidate'])} | "
             f"{fmt(row['absolute_delta'])} | "
-            f"{fmt(row['validation_selected_absolute_delta'])} |"
+            f"{fmt(row['relative_delta'])} | "
+            f"{fmt(row['validation_selected_absolute_delta'])} | "
+            f"{fmt(row['validation_selected_relative_delta'])} |"
         )
+    common_operating_point = (
+        "Head 0.30, Face 0.33, and point presence 0.70"
+        if has_head
+        else "Face 0.33 and point presence 0.70"
+    )
+    operating_point_note = (
+        (
+            f"The common operating point is {common_operating_point}. No "
+            "validation Face threshold emitted a prediction "
+            "while satisfying strict precision > 0.90, so the Val-selected "
+            "operating point is reported as N/A and Test does not select a "
+            "replacement threshold."
+        )
+        if has_face and face_threshold_selection.get("status") == "unsupported"
+        else (
+        "This HEAD-only architecture does not output FACE predictions, so "
+        "FACE threshold selection is not applicable."
+        if not has_face
+        else (
+            f"The common operating point is {common_operating_point}. The "
+            "second operating point uses Face threshold "
+            f"{float(face_threshold_selection['face_threshold']):.8g}, selected "
+            "on Val by maximizing recall subject to precision > 0.90 among "
+            + (
+                "matched predicted HEADs"
+                if has_head
+                else "all supervised GT Heads (the declared pipeline has no HEAD stage)"
+            )
+            + ", then frozen before Test. NME uses "
+            "1.20 × max(GT Head width, height)."
+        )
+    )
+    )
     lines.extend([
         "",
-        "The directly comparable operating point is locked at Head 0.30, "
-        "Face 0.80, and point presence 0.70. A separately labeled "
-        "validation-selected operating point is also shown when supplied. "
-        "NME uses 1.20 × max(GT Head width, height); Test was never used for selection.",
+        operating_point_note,
+        "",
+        "The historical Face DINO report column used Face 0.80; FACE-sensitive "
+        "deltas against that column are descriptive rather than "
+        "threshold-aligned. Direct architecture comparison must use the "
+        "common 0.33 column or each model's Val-selected column consistently.",
         "",
         "Unsupported outputs remain N/A in this table; see `unsupported_reason` in metrics.json.",
     ])
@@ -1002,9 +1892,17 @@ def evaluate_normalized_predictions(
         "architecture_id": architecture_id,
         "split": split,
         "metrics_sha256": sha256_file(output_dir / "metrics.json"),
+        "face_threshold_selection_sha256": sha256_file(
+            output_dir / FACE_THRESHOLD_SELECTION_FILENAME
+        ),
         "inventory_verified": not allow_partial_inventory,
-        "supported_sections": {"head": has_head, "ellipse": has_ellipse, "keypoint": has_keypoint, "state": has_state},
+        "supported_sections": {"head": has_head, "face": has_face, "ellipse": has_ellipse, "keypoint": has_keypoint, "state": has_state},
         "assertions": assertions,
     }
     (output_dir / "success.json").write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if has_head and has_keypoint:
+        (output_dir / "cascade_waterfall_success.json").write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     return metrics

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torchvision
 
 import copy
+import math
 
 from .dfine_utils import bbox2distance
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
@@ -39,6 +40,8 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
+        aux_layer_weights=None,
+        dn_layer_weights=None,
         ):
         """Create the criterion.
         Parameters:
@@ -62,8 +65,44 @@ class DEIMCriterion(nn.Module):
         self.own_targets, self.own_targets_dn = None, None
         self.reg_max = reg_max
         self.num_pos, self.num_neg = None, None
-        self.mal_alpha = mal_alpha
+        self.mal_alpha = None if mal_alpha is None else float(mal_alpha)
+        if self.mal_alpha is not None and (
+            not math.isfinite(self.mal_alpha) or self.mal_alpha <= 0.0
+        ):
+            raise ValueError("mal_alpha must be finite and positive when configured")
         self.use_uni_set = use_uni_set
+        self.aux_layer_weights = self._validate_layer_weights(
+            aux_layer_weights, "aux_layer_weights"
+        )
+        self.dn_layer_weights = self._validate_layer_weights(
+            dn_layer_weights, "dn_layer_weights"
+        )
+
+    @staticmethod
+    def _validate_layer_weights(weights, name):
+        if weights is None:
+            return None
+        resolved = tuple(float(value) for value in weights)
+        if not resolved:
+            raise ValueError(f"{name} must not be empty")
+        if any(not math.isfinite(value) or value < 0.0 for value in resolved):
+            raise ValueError(f"{name} values must be finite and non-negative")
+        return resolved
+
+    @staticmethod
+    def _layer_weight(weights, index, count, name):
+        if weights is None:
+            return 1.0
+        if len(weights) < count:
+            raise ValueError(
+                f"{name} has {len(weights)} values but the model emitted {count} layers"
+            )
+        # Lightweight validation keeps the inner decoder in eval mode and
+        # therefore emits only the deployed final DN branch. Align a shortened
+        # output list to the suffix of the configured training-layer weights so
+        # that this branch retains the final-layer weight (normally 1.0).
+        offset = len(weights) - count
+        return weights[offset + index]
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -132,7 +171,7 @@ class DEIMCriterion(nn.Module):
 
         pred_score = F.sigmoid(src_logits).detach()
         target_score = target_score.pow(self.gamma)
-        if self.mal_alpha != None:
+        if self.mal_alpha is not None:
             weight = self.mal_alpha * pred_score.pow(self.gamma) * (1 - target) + target
         else:
             weight = pred_score.pow(self.gamma) * (1 - target) + target
@@ -320,7 +359,14 @@ class DEIMCriterion(nn.Module):
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
+            aux_output_count = len(outputs['aux_outputs'])
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                layer_weight = self._layer_weight(
+                    self.aux_layer_weights,
+                    i,
+                    aux_output_count,
+                    'aux_layer_weights',
+                )
                 if 'local' in self.losses:      # only work for local loss
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
@@ -330,7 +376,11 @@ class DEIMCriterion(nn.Module):
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in, **meta)
 
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                    l_dict = {
+                        k: l_dict[k] * self.weight_dict[k] * layer_weight
+                        for k in l_dict
+                        if k in self.weight_dict
+                    }
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -381,14 +431,25 @@ class DEIMCriterion(nn.Module):
             indices_dn = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
             dn_num_boxes = num_boxes * outputs['dn_meta']['dn_num_group']
 
+            dn_output_count = len(outputs['dn_outputs'])
             for i, aux_outputs in enumerate(outputs['dn_outputs']):
+                layer_weight = self._layer_weight(
+                    self.dn_layer_weights,
+                    i,
+                    dn_output_count,
+                    'dn_layer_weights',
+                )
                 if 'local' in self.losses:      # only work for local loss
                     aux_outputs['is_dn'] = True
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
-                    l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                    l_dict = {
+                        k: l_dict[k] * self.weight_dict[k] * layer_weight
+                        for k in l_dict
+                        if k in self.weight_dict
+                    }
                     l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 

@@ -77,13 +77,87 @@ def checkpoint_state(
     }
 
 
+def checkpoint_component_state(
+    checkpoint_path: str | Path,
+    component: str,
+    *,
+    prefer_ema: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Extract one strict component from a complete cooperative checkpoint.
+
+    Cooperative stage EMA snapshots intentionally contain trainable tensors
+    only.  Build the authoritative full state from ``model`` first and then
+    overlay the available EMA shadow before selecting the component.  This is
+    different from a detector-only strict checkpoint, where an incomplete EMA
+    must remain an error instead of being silently filled from ``model``.
+    """
+
+    path = Path(checkpoint_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint was not found: {path}")
+    if path.suffix.lower() == ".safetensors":
+        state = checkpoint_state(path, prefer_ema=prefer_ema)
+    else:
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(raw, Mapping):
+            raise TypeError(f"Checkpoint is not a mapping: {path}")
+        model_state: Any = raw.get("model")
+        if isinstance(model_state, Mapping) and isinstance(
+            model_state.get("module"), Mapping
+        ):
+            model_state = model_state["module"]
+        if not isinstance(model_state, Mapping):
+            raise TypeError(
+                "A component checkpoint requires a complete 'model' state: "
+                f"{path}"
+            )
+        state = {
+            str(key): tensor
+            for key, tensor in model_state.items()
+            if isinstance(tensor, torch.Tensor)
+        }
+        if prefer_ema and isinstance(raw.get("ema"), Mapping):
+            ema: Any = raw["ema"]
+            if isinstance(ema.get("shadow"), Mapping):
+                ema = ema["shadow"]
+            if isinstance(ema, Mapping):
+                state.update(
+                    {
+                        str(key): tensor
+                        for key, tensor in ema.items()
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                )
+
+    prefix = component.strip().rstrip(".") + "."
+    selected: dict[str, torch.Tensor] = {}
+    for raw_key, tensor in state.items():
+        key = raw_key[len("module.") :] if raw_key.startswith("module.") else raw_key
+        if key.startswith(prefix):
+            selected[key[len(prefix) :]] = tensor
+    if not selected:
+        raise KeyError(
+            f"Checkpoint has no tensors for component {component!r}: {path}"
+        )
+    return selected
+
+
 def load_face_checkpoint_strict(
     face_detector: nn.Module,
     checkpoint_path: str | Path,
     *,
     prefer_ema: bool = True,
+    component: str | None = None,
 ) -> dict[str, Any]:
-    state = checkpoint_state(checkpoint_path, prefer_ema=prefer_ema)
+    state = (
+        checkpoint_component_state(
+            checkpoint_path,
+            component,
+            prefer_ema=prefer_ema,
+        )
+        if component
+        else checkpoint_state(checkpoint_path, prefer_ema=prefer_ema)
+    )
     expected = face_detector.state_dict()
     missing = sorted(set(expected) - set(state))
     unexpected = sorted(set(state) - set(expected))
@@ -115,6 +189,8 @@ def load_face_checkpoint_strict(
         }
     return {
         "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
+        "source_component": component,
         "loaded_tensors": len(expected),
         "total_tensors": len(expected),
         "loaded_elements": sum(int(value.numel()) for value in expected.values()),

@@ -172,6 +172,107 @@ class LandmarkMetricAccumulator:
             "keypoint_coverage": evaluated / labeled_total if labeled_total else None,
             "nme": float(np.mean(evaluated_values)) if evaluated_values else None,
         }
+        # Prospective Transformer checkpoint-selection metric. This is
+        # conditional on a valid face crop with at least one labeled semantic
+        # point; full-cascade Head/Face misses remain part of post-training
+        # deployment evaluation. Unlike the legacy diagnostic NME above, the
+        # normalization and point-presence threshold exactly match the common
+        # evaluation contract.
+        semantic_rows = [row for row in rows if any(bool(value) for value in row["labeled"])]
+        semantic_f1: list[float] = []
+        semantic_details: dict[str, dict[str, float | int]] = {}
+        for index, name in enumerate(self.names):
+            true_positive = 0
+            predicted = 0
+            ground_truth = 0
+            for row in semantic_rows:
+                labeled = bool(row["labeled"][index])
+                ground_truth += int(labeled)
+                scores = row.get("presence_scores")
+                if scores is None:
+                    scores = row.get("landmark_scores")
+                # Scores are produced/stored as float32. Keep a nominal 0.70
+                # score on the inclusive side of the locked >=0.70 threshold.
+                is_predicted = scores is not None and float(scores[index]) >= 0.70 - 1.0e-7
+                predicted += int(is_predicted)
+                if not (labeled and is_predicted) or row.get("predicted_keypoints") is None:
+                    continue
+                x1, y1, x2, y2 = (float(value) for value in row["bbox_xyxy"])
+                denominator = 1.20 * max(1.0e-6, x2 - x1, y2 - y1)
+                predicted_point = np.asarray(row["predicted_keypoints"][index], dtype=np.float64)
+                gt_point = np.asarray(row["gt_keypoints"][index], dtype=np.float64)
+                error = float(np.linalg.norm(predicted_point - gt_point) / denominator)
+                true_positive += int(error <= 0.10)
+            precision = true_positive / predicted if predicted else 0.0
+            recall = true_positive / ground_truth if ground_truth else 0.0
+            f1 = 2.0 * precision * recall / max(1.0e-8, precision + recall)
+            semantic_f1.append(f1)
+            semantic_details[name] = {
+                "predicted": predicted,
+                "ground_truth": ground_truth,
+                "true_positive": true_positive,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+            }
+        result.update(
+            {
+                "conditional_semantic_macro_f1_nme_0.10": (
+                    float(np.mean(semantic_f1)) if semantic_f1 else None
+                ),
+                "conditional_semantic_macro_f1_contract": {
+                    "point_presence_threshold": 0.70,
+                    "nme_threshold": 0.10,
+                    "nme_denominator": "1.20 * max(GT Head width, GT Head height)",
+                    "eligible_face_crops": len(semantic_rows),
+                    "per_semantic": semantic_details,
+                },
+            }
+        )
+
+        def state_semantic_macro_f1(*, visible_state: bool) -> float | None:
+            values: list[float] = []
+            for index in range(len(self.names)):
+                true_positive = 0
+                predicted = 0
+                ground_truth = 0
+                for row in semantic_rows:
+                    eligible = bool(row["labeled"][index]) and (
+                        bool(row["visible"][index]) is visible_state
+                    )
+                    if not eligible:
+                        continue
+                    ground_truth += 1
+                    scores = row.get("presence_scores") or row.get("landmark_scores")
+                    is_predicted = (
+                        scores is not None
+                        and float(scores[index]) >= 0.70 - 1.0e-7
+                    )
+                    predicted += int(is_predicted)
+                    if not is_predicted or row.get("predicted_keypoints") is None:
+                        continue
+                    x1, y1, x2, y2 = (float(value) for value in row["bbox_xyxy"])
+                    denominator = 1.20 * max(1.0e-6, x2 - x1, y2 - y1)
+                    predicted_point = np.asarray(
+                        row["predicted_keypoints"][index], dtype=np.float64
+                    )
+                    gt_point = np.asarray(row["gt_keypoints"][index], dtype=np.float64)
+                    error = float(np.linalg.norm(predicted_point - gt_point) / denominator)
+                    true_positive += int(error <= 0.10)
+                if ground_truth:
+                    precision = true_positive / predicted if predicted else 0.0
+                    recall = true_positive / ground_truth
+                    values.append(
+                        2.0 * precision * recall / max(1.0e-8, precision + recall)
+                    )
+            return float(np.mean(values)) if values else None
+
+        result["visible_semantic_macro_f1_nme_0.10"] = state_semantic_macro_f1(
+            visible_state=True
+        )
+        result[
+            "natural_occluded_semantic_macro_f1_nme_0.10"
+        ] = state_semantic_macro_f1(visible_state=False)
         for threshold in (0.03, 0.05, 0.10):
             count = sum(value <= threshold for value in evaluated_values)
             result[f"pck_{threshold:.2f}"] = count / evaluated if evaluated else None

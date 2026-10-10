@@ -6,6 +6,7 @@ from typing import Any
 from torch import nn
 
 from .centerface_ellipse_head import CenterFaceEllipseHead
+from .co_dino import DINOv3CoDINODetector, build_dinov3_codino_detector
 from .dino_backbone import DinoBackbone, DummyDinoBackbone, build_dino_backbone
 from .dino_centerface_ellipse import DinoCenterFaceEllipseDetector, build_dino_centerface_ellipse_detector
 from .dino_deim_style import (
@@ -42,10 +43,22 @@ def build_detector_from_config(
     cfg = dict(config or {})
     model_cfg = dict(cfg.get("model", cfg))
     model_type = str(model_cfg.get("type", "dino_scrfd")).lower()
+    if model_type in {"dinov3_codino_official", "dinov3_codino_official_ellipse"}:
+        from .co_dino_official import build_official_codino
+        return build_official_codino(cfg, backbone_module=backbone_module)
     if model_type in {"dino_centerface_ellipse", "dino_ellipse", "centerface_ellipse"}:
         return build_dino_centerface_ellipse_detector(cfg, backbone_module=backbone_module)
     if model_type in {"dinov3_deimv2", "dino_deimv2"}:
         return build_dinov3_deimv2_detector(cfg, backbone_module=backbone_module)
+    if model_type in {
+        "dinov3_codino",
+        "dino_codino",
+        "co_dino",
+        "dinov3_codino_ellipse",
+        "dino_codino_ellipse",
+        "co_dino_ellipse",
+    }:
+        return build_dinov3_codino_detector(cfg, backbone_module=backbone_module)
     if model_type in {"dinov3_deimv2_ellipse", "dino_deimv2_ellipse"}:
         return build_dinov3_deimv2_ellipse_detector(cfg, backbone_module=backbone_module)
     if model_type in {
@@ -81,6 +94,7 @@ __all__ = [
     "DINODeimStyleMatcher",
     "DINODeimStylePostProcessor",
     "DINOv3DEIMv2Detector",
+    "DINOv3CoDINODetector",
     "DINOv3DEIMv2EllipseDetector",
     "FaceKeypointCooperativeDETR",
     "HeadCoDINODetector",
@@ -97,6 +111,7 @@ __all__ = [
     "build_dino_centerface_ellipse_detector",
     "build_dino_deim_style_detector",
     "build_dinov3_deimv2_detector",
+    "build_dinov3_codino_detector",
     "build_dinov3_deimv2_ellipse_detector",
     "build_face_keypoint_cooperative_detr",
     "build_head_codino_detector",

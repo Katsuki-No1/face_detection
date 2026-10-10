@@ -42,7 +42,7 @@ def _row() -> dict:
 
 def test_locked_contract_matches_report_inventory() -> None:
     assert THRESHOLDS["head_score"] == pytest.approx(0.30)
-    assert THRESHOLDS["face_score"] == pytest.approx(0.80)
+    assert THRESHOLDS["face_score"] == pytest.approx(0.33)
     assert THRESHOLDS["point_presence"] == pytest.approx(0.70)
     assert EXPECTED["val"]["images"] == 530
     assert EXPECTED["test"]["heads"] == 806

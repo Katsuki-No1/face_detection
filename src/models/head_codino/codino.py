@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 import torch
+from mmcv.cnn.bricks.transformer import MultiheadAttention
 from mmcv.ops import MultiScaleDeformableAttention
 from mmdet.models.dense_heads import DINOHead
 from mmdet.models.layers import (
@@ -19,6 +20,59 @@ from torch.nn.init import normal_
 EXPECTED_QUERY_HEAD_PARAMETERS = 4_541_844
 EXPECTED_ENCODER_DOWNSAMPLE_PARAMETERS = 590_592
 EXPECTED_COMPACT_CODINO_PARAMETERS = 5_132_436
+
+
+class WideRangeMultiheadAttention(MultiheadAttention):
+    """Use wide-range attention math while preserving the caller's dtype."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        value: torch.Tensor | None = None,
+        identity: torch.Tensor | None = None,
+        query_pos: torch.Tensor | None = None,
+        key_pos: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        output_dtype = query.dtype
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+        if identity is None:
+            identity = query
+        if key_pos is None and query_pos is not None and query_pos.shape == key.shape:
+            key_pos = query_pos
+        if query_pos is not None:
+            query = query + query_pos
+        if key_pos is not None:
+            key = key + key_pos
+        if self.batch_first:
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+        use_bfloat16 = query.device.type == "cuda"
+        with torch.autocast(
+            device_type=query.device.type,
+            dtype=torch.bfloat16 if use_bfloat16 else torch.float32,
+            enabled=use_bfloat16,
+        ):
+            output = self.attn(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )[0]
+        if self.batch_first:
+            output = output.transpose(0, 1)
+        output = output.to(dtype=output_dtype)
+        return identity + self.dropout_layer(self.proj_drop(output))
 
 
 def _valid_ratio(mask: torch.Tensor) -> torch.Tensor:
@@ -46,18 +100,52 @@ class CompactCoDINO(nn.Module):
     num_queries = 100
     num_decoder_layers = 3
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        num_classes: int = 1,
+        embed_dims: int = 256,
+        num_feature_levels: int = 3,
+        num_queries: int = 100,
+        num_encoder_layers: int = 1,
+        num_decoder_layers: int = 3,
+        feedforward_channels: int = 1024,
+        num_denoising_queries: int = 50,
+        stable_self_attention: bool = False,
+        enforce_compact_parameter_contract: bool = True,
+    ) -> None:
         super().__init__()
         register_all_modules(init_default_scope=False)
+        self.num_classes = int(num_classes)
+        self.embed_dims = int(embed_dims)
+        self.num_feature_levels = int(num_feature_levels)
+        self.num_queries = int(num_queries)
+        self.num_encoder_layers = int(num_encoder_layers)
+        self.num_decoder_layers = int(num_decoder_layers)
+        self.feedforward_channels = int(feedforward_channels)
+        self.num_denoising_queries = int(num_denoising_queries)
+        self.stable_self_attention = bool(stable_self_attention)
+        if self.num_classes <= 0:
+            raise ValueError("num_classes must be positive")
+        if self.embed_dims <= 0 or self.embed_dims % 2:
+            raise ValueError("embed_dims must be a positive even number")
+        if self.num_feature_levels <= 0:
+            raise ValueError("num_feature_levels must be positive")
+        if self.num_queries <= 0:
+            raise ValueError("num_queries must be positive")
+        if self.num_encoder_layers <= 0 or self.num_decoder_layers <= 0:
+            raise ValueError("encoder and decoder layer counts must be positive")
+        if self.num_denoising_queries <= 0:
+            raise ValueError("num_denoising_queries must be positive")
 
         self.positional_encoding = SinePositionalEncoding(
-            num_feats=128,
+            num_feats=self.embed_dims // 2,
             temperature=20,
             normalize=True,
             offset=0.0,
         )
         self.encoder = DeformableDetrTransformerEncoder(
-            num_layers=1,
+            num_layers=self.num_encoder_layers,
             layer_cfg=dict(
                 self_attn_cfg=dict(
                     embed_dims=self.embed_dims,
@@ -69,7 +157,7 @@ class CompactCoDINO(nn.Module):
                 ),
                 ffn_cfg=dict(
                     embed_dims=self.embed_dims,
-                    feedforward_channels=1024,
+                    feedforward_channels=self.feedforward_channels,
                     num_fcs=2,
                     ffn_drop=0.0,
                     act_cfg=dict(type="ReLU", inplace=True),
@@ -97,20 +185,27 @@ class CompactCoDINO(nn.Module):
                 ),
                 ffn_cfg=dict(
                     embed_dims=self.embed_dims,
-                    feedforward_channels=1024,
+                    feedforward_channels=self.feedforward_channels,
                     num_fcs=2,
                     ffn_drop=0.0,
                     act_cfg=dict(type="ReLU", inplace=True),
                 ),
             ),
         )
+        if self.stable_self_attention:
+            for layer in self.decoder.layers:
+                stable_attention = WideRangeMultiheadAttention(
+                    **dict(layer.self_attn_cfg)
+                )
+                stable_attention.load_state_dict(layer.self_attn.state_dict())
+                layer.self_attn = stable_attention
         self.query_embedding = nn.Embedding(self.num_queries, self.embed_dims)
         self.level_embed = nn.Parameter(torch.empty(self.num_feature_levels, self.embed_dims))
         self.memory_trans_fc = nn.Linear(self.embed_dims, self.embed_dims)
         self.memory_trans_norm = nn.LayerNorm(self.embed_dims)
 
         self.bbox_head = DINOHead(
-            num_classes=1,
+            num_classes=self.num_classes,
             embed_dims=self.embed_dims,
             num_reg_fcs=2,
             sync_cls_avg_factor=True,
@@ -138,12 +233,12 @@ class CompactCoDINO(nn.Module):
             test_cfg=dict(max_per_img=self.num_queries),
         )
         self.dn_query_generator = CdnQueryGenerator(
-            num_classes=1,
+            num_classes=self.num_classes,
             embed_dims=self.embed_dims,
             num_matching_queries=self.num_queries,
             label_noise_scale=0.5,
             box_noise_scale=0.4,
-            group_cfg=dict(dynamic=True, num_dn_queries=50),
+            group_cfg=dict(dynamic=True, num_dn_queries=self.num_denoising_queries),
         )
         self.downsample = nn.Sequential(
             nn.Conv2d(
@@ -164,17 +259,35 @@ class CompactCoDINO(nn.Module):
         )
         downsample_count = sum(parameter.numel() for parameter in self.downsample.parameters())
         total_count = sum(parameter.numel() for parameter in self.parameters())
-        expected = (
-            (EXPECTED_QUERY_HEAD_PARAMETERS, query_count, "query head"),
-            (EXPECTED_ENCODER_DOWNSAMPLE_PARAMETERS, downsample_count, "encoded P6 downsample"),
-            (EXPECTED_COMPACT_CODINO_PARAMETERS, total_count, "compact Co-DINO"),
-        )
-        for expected_count, actual_count, component in expected:
-            if actual_count != expected_count:
-                raise RuntimeError(
-                    f"Unexpected {component} parameter count: "
-                    f"expected={expected_count}, actual={actual_count}"
+        if enforce_compact_parameter_contract:
+            compact_signature = (
+                self.num_classes,
+                self.embed_dims,
+                self.num_feature_levels,
+                self.num_queries,
+                self.num_encoder_layers,
+                self.num_decoder_layers,
+                self.feedforward_channels,
+                self.num_denoising_queries,
+            )
+            expected_signature = (1, 256, 3, 100, 1, 3, 1024, 50)
+            if compact_signature != expected_signature:
+                raise ValueError(
+                    "The historical compact parameter contract is only valid for "
+                    f"{expected_signature}, got {compact_signature}; set "
+                    "enforce_compact_parameter_contract=False for a new architecture."
                 )
+            expected = (
+                (EXPECTED_QUERY_HEAD_PARAMETERS, query_count, "query head"),
+                (EXPECTED_ENCODER_DOWNSAMPLE_PARAMETERS, downsample_count, "encoded P6 downsample"),
+                (EXPECTED_COMPACT_CODINO_PARAMETERS, total_count, "compact Co-DINO"),
+            )
+            for expected_count, actual_count, component in expected:
+                if actual_count != expected_count:
+                    raise RuntimeError(
+                        f"Unexpected {component} parameter count: "
+                        f"expected={expected_count}, actual={actual_count}"
+                    )
 
     def _init_weights(self) -> None:
         for coder in (self.encoder, self.decoder):
@@ -190,17 +303,25 @@ class CompactCoDINO(nn.Module):
         normal_(self.level_embed)
         self.bbox_head.init_weights()
 
-    @staticmethod
     def _validate_inputs(
+        self,
         features: Sequence[torch.Tensor],
         masks: Sequence[torch.Tensor],
     ) -> None:
-        if len(features) != 3 or len(masks) != 3:
-            raise ValueError("Compact Co-DINO requires P3/P4/P5 and exactly three masks")
+        if len(features) != self.num_feature_levels:
+            raise ValueError(
+                f"Co-DINO expects {self.num_feature_levels} feature levels, "
+                f"got {len(features)}"
+            )
+        if len(features) != len(masks):
+            raise ValueError("Co-DINO requires one mask for every feature level")
         batch_size = features[0].shape[0]
-        for level, (feature, mask) in enumerate(zip(features, masks, strict=True), start=3):
-            if feature.ndim != 4 or feature.shape[:2] != (batch_size, 256):
-                raise ValueError(f"P{level} must have shape [B,256,H,W], got {tuple(feature.shape)}")
+        for level, (feature, mask) in enumerate(zip(features, masks, strict=True)):
+            if feature.ndim != 4 or feature.shape[:2] != (batch_size, self.embed_dims):
+                raise ValueError(
+                    f"Feature level {level} must have shape "
+                    f"[B,{self.embed_dims},H,W], got {tuple(feature.shape)}"
+                )
             if mask.shape != (batch_size, *feature.shape[-2:]) or mask.dtype != torch.bool:
                 raise ValueError(
                     f"P{level} mask must be bool [B,H,W], got {tuple(mask.shape)} {mask.dtype}"
@@ -337,10 +458,12 @@ class CompactCoDINO(nn.Module):
                 f"Feature maps provide only {encoder_logits.shape[1]} proposals; "
                 f"at least {self.num_queries} are required"
             )
-        selectable_logits = encoder_logits.masked_fill(
-            ~torch.isfinite(output_proposals).all(dim=-1, keepdim=True),
-            float("-inf"),
-        )
+        # Match MMDetection DINO's two-stage proposal contract: invalid
+        # encoder positions are suppressed through ``output_memory`` and the
+        # unactivated proposal coordinates, while classification logits stay
+        # finite.  Feeding ``-inf`` logits to the encoder QFL makes padded
+        # real-image batches produce a non-finite ``enc_loss_cls``.
+        selectable_logits = encoder_logits
         topk_indices = torch.topk(
             selectable_logits.max(dim=-1).values,
             k=self.num_queries,
@@ -435,6 +558,11 @@ class CompactCoDINO(nn.Module):
             "_references": references,
             "_enc_logits": topk_logits,
             "_enc_boxes": topk_boxes,
+            "_memory": memory,
+            "_memory_mask": memory_mask,
+            "_spatial_shapes": spatial_shapes,
+            "_level_start_index": level_start_index,
+            "_valid_ratios": valid_ratios,
         }
         if self.training:
             result["dn_outputs"] = {

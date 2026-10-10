@@ -294,12 +294,24 @@ class TransformerEncoderLayer(nn.Module):
     def with_pos_embed(tensor, pos_embed):
         return tensor if pos_embed is None else tensor + pos_embed
 
-    def forward(self, src, src_mask=None, pos_embed=None) -> torch.Tensor:
+    def forward(
+        self,
+        src,
+        src_mask=None,
+        pos_embed=None,
+        src_key_padding_mask=None,
+    ) -> torch.Tensor:
         residual = src
         if self.normalize_before:
             src = self.norm1(src)
         q = k = self.with_pos_embed(src, pos_embed)
-        src, _ = self.self_attn(q, k, value=src, attn_mask=src_mask)
+        src, _ = self.self_attn(
+            q,
+            k,
+            value=src,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+        )
 
         src = residual + self.dropout1(src)
         if not self.normalize_before:
@@ -322,10 +334,21 @@ class TransformerEncoder(nn.Module):
         self.num_layers = num_layers
         self.norm = norm
 
-    def forward(self, src, src_mask=None, pos_embed=None) -> torch.Tensor:
+    def forward(
+        self,
+        src,
+        src_mask=None,
+        pos_embed=None,
+        src_key_padding_mask=None,
+    ) -> torch.Tensor:
         output = src
         for layer in self.layers:
-            output = layer(output, src_mask=src_mask, pos_embed=pos_embed)
+            output = layer(
+                output,
+                src_mask=src_mask,
+                pos_embed=pos_embed,
+                src_key_padding_mask=src_key_padding_mask,
+            )
 
         if self.norm is not None:
             output = self.norm(output)
@@ -453,9 +476,35 @@ class HybridEncoder(nn.Module):
 
         return torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
 
-    def forward(self, feats):
+    def forward(self, feats, feature_padding_masks=None):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        if feature_padding_masks is None:
+            padding_masks = [None for _ in proj_feats]
+        else:
+            if len(feature_padding_masks) != len(proj_feats):
+                raise ValueError(
+                    "feature_padding_masks must align with encoder feature levels"
+                )
+            padding_masks = []
+            for feature, mask in zip(proj_feats, feature_padding_masks):
+                mask = mask.to(device=feature.device, dtype=torch.bool)
+                if tuple(mask.shape) != (
+                    feature.shape[0],
+                    feature.shape[-2],
+                    feature.shape[-1],
+                ):
+                    raise ValueError(
+                        f"feature padding mask {tuple(mask.shape)} does not match "
+                        f"feature {tuple(feature.shape)}"
+                    )
+                padding_masks.append(mask)
+            proj_feats = [
+                feature
+                if mask is None
+                else feature.masked_fill(mask[:, None], 0.0)
+                for feature, mask in zip(proj_feats, padding_masks)
+            ]
 
         # encoder
         if self.num_encoder_layers > 0:
@@ -469,8 +518,19 @@ class HybridEncoder(nn.Module):
                 else:
                     pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
 
-                memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
+                key_padding_mask = padding_masks[enc_ind]
+                if key_padding_mask is not None:
+                    key_padding_mask = key_padding_mask.flatten(1)
+                memory :torch.Tensor = self.encoder[i](
+                    src_flatten,
+                    pos_embed=pos_embed,
+                    src_key_padding_mask=key_padding_mask,
+                )
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+                if padding_masks[enc_ind] is not None:
+                    proj_feats[enc_ind] = proj_feats[enc_ind].masked_fill(
+                        padding_masks[enc_ind][:, None], 0.0
+                    )
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
@@ -483,6 +543,10 @@ class HybridEncoder(nn.Module):
             fused_feat = (upsample_feat + feat_low) \
                 if self.fuse_op == 'sum' else torch.concat([upsample_feat, feat_low], dim=1)
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](fused_feat)
+            if padding_masks[idx - 1] is not None:
+                inner_out = inner_out.masked_fill(
+                    padding_masks[idx - 1][:, None], 0.0
+                )
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]
@@ -493,6 +557,8 @@ class HybridEncoder(nn.Module):
             fused_feat = (downsample_feat + feat_height) \
                 if self.fuse_op == 'sum' else torch.concat([downsample_feat, feat_height], dim=1)
             out = self.pan_blocks[idx](fused_feat)
+            if padding_masks[idx + 1] is not None:
+                out = out.masked_fill(padding_masks[idx + 1][:, None], 0.0)
             outs.append(out)
 
         return outs

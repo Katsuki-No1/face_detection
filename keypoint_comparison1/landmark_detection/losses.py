@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .messenger_recovery import patch_occlusion_ratios
+
 
 def stack_targets(targets: Sequence[dict[str, Any]], key: str, device: torch.device) -> torch.Tensor:
     return torch.stack([target[key] for target in targets], dim=0).to(device, non_blocking=True)
@@ -210,3 +212,101 @@ class LandmarkLoss(nn.Module):
             total = total + self.refinement_auxiliary_weight * losses["loss_refinement_auxiliary"]
         losses["loss_total"] = total
         return losses
+
+
+class MessengerRecoveryLoss(nn.Module):
+    """Auxiliary clean-feature recovery and weak scalar-gate supervision."""
+
+    def __init__(
+        self,
+        *,
+        reconstruction_weight: float = 0.10,
+        gate_weight: float = 0.01,
+        patch_size: int | tuple[int, int] = 16,
+    ) -> None:
+        super().__init__()
+        if reconstruction_weight < 0.0 or gate_weight < 0.0:
+            raise ValueError("Messenger loss weights must be non-negative")
+        self.reconstruction_weight = float(reconstruction_weight)
+        self.gate_weight = float(gate_weight)
+        self.patch_size = patch_size
+
+    def forward(
+        self,
+        diagnostics: dict[str, torch.Tensor],
+        clean_feature_map: torch.Tensor,
+        pixel_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        original = diagnostics["original_tokens"]
+        messenger = diagnostics["messenger_tokens"]
+        recovered = diagnostics["recovered_tokens"]
+        alpha = diagnostics["gate_alpha"]
+        clean = clean_feature_map.detach().flatten(2).transpose(1, 2).contiguous()
+        if clean.shape != original.shape:
+            raise ValueError(
+                "Clean and occluded DINO token shapes differ: "
+                f"{tuple(clean.shape)} != {tuple(original.shape)}"
+            )
+        ratios = patch_occlusion_ratios(
+            pixel_mask,
+            patch_size=self.patch_size,
+        ).to(device=original.device, dtype=original.dtype)
+        if ratios.shape != alpha.shape:
+            raise ValueError(
+                f"Patch mask/gate shape mismatch: {tuple(ratios.shape)} != {tuple(alpha.shape)}"
+            )
+        masked = ratios > 0.0
+        if not bool(masked.any()):
+            zero = messenger.sum() * 0.0
+            return {
+                "loss_messenger_reconstruction": zero,
+                "loss_messenger_gate": zero,
+                "loss_messenger_total": zero,
+                "messenger_masked_patches": ratios.sum() * 0.0,
+            }
+
+        cosine_original = F.cosine_similarity(original, clean, dim=-1)
+        cosine_messenger = F.cosine_similarity(messenger, clean, dim=-1)
+        cosine_recovered = F.cosine_similarity(recovered, clean, dim=-1)
+        reconstruction = (
+            (1.0 - cosine_messenger) * ratios
+        ).sum() / ratios.sum().clamp_min(1.0e-8)
+
+        gate_error = (alpha - ratios).square()
+        masked_gate = gate_error[masked].mean()
+        unmasked = ~masked
+        unmasked_gate = (
+            gate_error[unmasked].mean()
+            if bool(unmasked.any())
+            else gate_error.sum() * 0.0
+        )
+        gate = 0.5 * (masked_gate + unmasked_gate)
+        total = (
+            self.reconstruction_weight * reconstruction
+            + self.gate_weight * gate
+        )
+
+        def masked_mean(value: torch.Tensor) -> torch.Tensor:
+            return value[masked].mean()
+
+        return {
+            "loss_messenger_reconstruction": reconstruction,
+            "loss_messenger_gate": gate,
+            "loss_messenger_total": total,
+            "messenger_masked_patches": masked.sum().to(dtype=original.dtype),
+            "messenger_alpha_masked": masked_mean(alpha),
+            "messenger_alpha_unmasked": (
+                alpha[unmasked].mean()
+                if bool(unmasked.any())
+                else alpha.sum() * 0.0
+            ),
+            "messenger_cosine_original_clean": masked_mean(cosine_original),
+            "messenger_cosine_prediction_clean": masked_mean(cosine_messenger),
+            "messenger_cosine_recovered_clean": masked_mean(cosine_recovered),
+            "messenger_prediction_improved_fraction": masked_mean(
+                (cosine_messenger > cosine_original).to(dtype=original.dtype)
+            ),
+            "messenger_recovered_improved_fraction": masked_mean(
+                (cosine_recovered > cosine_original).to(dtype=original.dtype)
+            ),
+        }

@@ -25,8 +25,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=1)
     parser.add_argument("--minimum-relative-improvement", type=float, default=0.005)
     parser.add_argument("--minimum-improving-transition-fraction", type=float, default=0.50)
+    parser.add_argument(
+        "--final-guard",
+        action="append",
+        nargs=3,
+        default=[],
+        metavar=("METRIC", "OPERATOR", "VALUE"),
+        help=(
+            "Require the final-window mean of another metric to satisfy "
+            "OPERATOR ('ge' or 'le') VALUE; may be repeated."
+        ),
+    )
     parser.add_argument("--success-marker", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--keep-checkpoint",
+        type=Path,
+        help=(
+            "On success, keep this best checkpoint and remove sibling .pt "
+            "gate checkpoints. Production retention is unaffected."
+        ),
+    )
     parser.add_argument(
         "--reuse-existing-metrics",
         action="store_true",
@@ -93,6 +112,41 @@ def assess_improvement(
     }
 
 
+def assess_final_guards(
+    path: Path,
+    guards: list[list[str]],
+    *,
+    window: int,
+) -> list[dict[str, Any]]:
+    assessments: list[dict[str, Any]] = []
+    for metric, operator, raw_threshold in guards:
+        if operator not in {"ge", "le"}:
+            raise ValueError(
+                "--final-guard OPERATOR must be 'ge' or 'le', got "
+                f"{operator!r}"
+            )
+        threshold = float(raw_threshold)
+        values = _read_values(path, metric)
+        if len(values) < window:
+            raise RuntimeError(
+                f"Guard metric {metric!r} needs {window} final points, "
+                f"got {len(values)}"
+            )
+        final = sum(values[-window:]) / window
+        passed = final >= threshold if operator == "ge" else final <= threshold
+        assessments.append(
+            {
+                "passed": passed,
+                "metric": metric,
+                "operator": operator,
+                "threshold": threshold,
+                "final_window_mean": final,
+                "window": window,
+            }
+        )
+    return assessments
+
+
 def _archive_previous_attempt(work_dir: Path) -> Path | None:
     if not work_dir.exists():
         return None
@@ -124,6 +178,20 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _retain_only_checkpoint(path: Path) -> list[str]:
+    keep = path.resolve()
+    if not keep.is_file():
+        raise RuntimeError(f"Requested gate checkpoint does not exist: {keep}")
+    removed: list[str] = []
+    for candidate in sorted(keep.parent.glob("*.pt")):
+        resolved = candidate.resolve()
+        if resolved == keep:
+            continue
+        resolved.unlink()
+        removed.append(str(resolved))
+    return removed
+
+
 def main() -> int:
     args = parse_args()
     command = list(args.command)
@@ -144,7 +212,8 @@ def main() -> int:
         completed = subprocess.run(command, check=False)
         if completed.returncode != 0:
             return int(completed.returncode)
-    values = _read_values(args.metrics.resolve(), args.metric)
+    metrics_path = args.metrics.resolve()
+    values = _read_values(metrics_path, args.metric)
     assessment = assess_improvement(
         values,
         direction=args.direction,
@@ -155,8 +224,19 @@ def main() -> int:
             args.minimum_improving_transition_fraction
         ),
     )
+    guard_assessments = assess_final_guards(
+        metrics_path,
+        args.final_guard,
+        window=int(args.window),
+    )
+    passed = assessment["passed"] and all(
+        guard["passed"] for guard in guard_assessments
+    )
+    removed_checkpoints: list[str] = []
+    if passed and args.keep_checkpoint is not None:
+        removed_checkpoints = _retain_only_checkpoint(args.keep_checkpoint)
     report = {
-        "status": "passed" if assessment["passed"] else "failed",
+        "status": "passed" if passed else "failed",
         "gate_stage": "small_scale",
         "metric": args.metric,
         "direction": args.direction,
@@ -165,11 +245,19 @@ def main() -> int:
         "elapsed_seconds": time.time() - started,
         "archived_previous_attempt": str(archived) if archived else None,
         "assessment": assessment,
+        "final_guards": guard_assessments,
+        "retained_checkpoint": (
+            str(args.keep_checkpoint.resolve())
+            if args.keep_checkpoint is not None
+            else None
+        ),
+        "removed_checkpoints": removed_checkpoints,
     }
     _write_json(args.report.resolve(), report)
-    if not assessment["passed"]:
+    if not passed:
         raise RuntimeError(
-            "Small-scale learning did not show the required improvement; "
+            "Small-scale learning did not satisfy the required improvement "
+            "and final metric guards; "
             f"see {args.report.resolve()}"
         )
     _write_json(marker, report)

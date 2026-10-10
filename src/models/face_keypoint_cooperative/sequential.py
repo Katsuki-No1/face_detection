@@ -59,6 +59,15 @@ def validate_strict_sequential_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "strict_sequential_cascade evaluation_face_source must be predicted"
         )
+    head_score_threshold = float(
+        sequential.get("head_score_threshold", float("nan"))
+    )
+    if not math.isfinite(head_score_threshold) or not (
+        0.0 <= head_score_threshold <= 1.0
+    ):
+        raise ValueError(
+            "strict_sequential_cascade.head_score_threshold must be in [0,1]"
+        )
     data = config.get("data", {})
     head_crop = data.get("head_crop", {}) if isinstance(data, Mapping) else {}
     if isinstance(head_crop, Mapping) and bool(head_crop.get("enabled", False)):
@@ -120,12 +129,17 @@ class StrictSequentialCascade:
         self.face_score_threshold = float(
             config.get("face_score_threshold", 0.80)
         )
+        self.head_score_threshold = float(
+            config.get("head_score_threshold", 0.30)
+        )
         self.maximum_face_rois = int(config.get("maximum_face_rois", 100))
         self.enforce_unidirectional_refinement = bool(
             config.get("enforce_unidirectional_refinement", True)
         )
         if not 0.0 <= self.face_score_threshold <= 1.0:
             raise ValueError("strict cascade face_score_threshold must be in [0,1]")
+        if not 0.0 <= self.head_score_threshold <= 1.0:
+            raise ValueError("strict cascade head_score_threshold must be in [0,1]")
         if self.maximum_face_rois <= 0:
             raise ValueError("strict cascade maximum_face_rois must be positive")
 
@@ -183,6 +197,30 @@ class StrictSequentialCascade:
                 else like.new_zeros((0, 4))
             )
         return batches
+
+    def filter_head_detections(
+        self,
+        detections: Sequence[Sequence[HeadDetection]],
+    ) -> tuple[list[list[HeadDetection]], dict[str, Any]]:
+        """Apply the deployment HEAD gate before any FACE ROI is constructed."""
+
+        filtered = [
+            [
+                detection
+                for detection in rows
+                if float(detection.confidence) >= self.head_score_threshold
+            ]
+            for rows in detections
+        ]
+        return filtered, {
+            "score_threshold": self.head_score_threshold,
+            "candidate_count_before": torch.as_tensor(
+                [len(rows) for rows in detections], dtype=torch.long
+            ),
+            "candidate_count_after": torch.as_tensor(
+                [len(rows) for rows in filtered], dtype=torch.long
+            ),
+        }
 
     @staticmethod
     def target_face_boxes(
