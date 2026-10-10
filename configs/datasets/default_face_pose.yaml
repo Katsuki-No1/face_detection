@@ -1,0 +1,87 @@
+schema_version: 1
+
+# Single source of truth for the face-pose dataset used by new training runs.
+# scripts/prepare_default_face_pose_dataset.py only reads the source archive.
+# It materializes an exact verified copy under outputs/ and writes any derived
+# adapters outside the dataset so neither the ZIP nor datasets/ is modified.
+default_dataset:
+  version: face_pose_drive_v2_balanced_811
+  archive: datasets/face_pose_drive_v2_balanced_811_training_export_20260724.zip
+  archive_sha256: f493be94f9c30e5417ddbac505f5fc11042d7aa427ee7ce9da491991d4c06ea7
+  archive_root: face_pose_drive_v2_balanced_811
+  materialized_root: outputs/dataset_cache/immutable_f493be94f9c30e54/face_pose_drive_v2_balanced_811
+  canonical_root: outputs/dataset_cache/face_pose_current
+  adapter_root: outputs/dataset_adapters/face_pose_drive_v2_balanced_811
+  split_policy: group-stratified-balanced-80-10-10
+  expected:
+    images: {train: 4237, val: 530, test: 528}
+    face_annotations: {train: 6529, val: 840, test: 769}
+    head_annotations: {train: 7129, val: 882, test: 806}
+    head_face_annotations: {train: 13658, val: 1722, test: 1575}
+  annotations:
+    deim_dino:
+      train: face_keypoints_train.json
+      val: face_keypoints_val.json
+      test: face_keypoints_test.json
+    face_dino:
+      train: annotations/face_dino_v1/train.json
+      val: annotations/face_dino_v1/val.json
+      test: annotations/face_dino_v1/test.json
+    rtmpose:
+      train: rtmpose/person_keypoints_train.json
+      val: rtmpose/person_keypoints_val.json
+      test: rtmpose/person_keypoints_test.json
+    rtmdet_hf:
+      train: annotations/rtmdet_hf/train.json
+      val: annotations/rtmdet_hf/val.json
+      test: annotations/rtmdet_hf/test.json
+
+# DEIM/DINO-compatible defaults. Model configs can extend this file and only
+# override the model/training recipe.
+data:
+  format: coco
+  dataset_version: face_pose_drive_v2_balanced_811
+  data_root: outputs/dataset_cache/face_pose_current
+  annotation_path: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+  annotation_paths:
+    train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+    val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val.json
+    test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_test.json
+  image_root: outputs/dataset_cache/face_pose_current
+  split: train
+  include_negative: true
+  category_ids: [2]
+  synthetic_if_missing: false
+  leakage_audit:
+    enabled: true
+    splits: [train, val, test]
+
+# YOLO26 Pose-compatible defaults.
+dataset:
+  version: face_pose_drive_v2_balanced_811
+  yaml: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_pose.yaml
+  root: outputs/dataset_cache/face_pose_current
+  coco_annotations:
+    train: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_train.json
+    val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val.json
+    test: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_test.json
+  expected_coco_sha256:
+    train: 2fac1a20b089c801099bed0b439db3ed612d2ea812b5eab21a574f473f981cfa
+    val: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+    test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760
+  expected_images:
+    train: 4237
+    val: 530
+    test: 528
+  expected_category_id: 2
+  expected_names:
+    0: face
+  expected_kpt_shape: [5, 3]
+  expected_flip_idx: [1, 0, 2, 4, 3]
+
+verification:
+  expected_images: {train: 4237, val: 530, test: 528}
+  expected_coco_sha256:
+    train: 2fac1a20b089c801099bed0b439db3ed612d2ea812b5eab21a574f473f981cfa
+    val: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+    test: bbab427fdddbfe2d4c0d669ea8d879db58c6f3bab13d6653738b060cecb3e760

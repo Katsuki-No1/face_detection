@@ -27,7 +27,21 @@ validation固定閾値での結果、bbox/楕円AP、annotation hashを掲載し
 
 ## 準備
 
-Python環境に `requirements.txt` の依存を用意します。
+別デバイスでは `baseline` ブランチを指定して取得します。
+
+```bash
+git clone --branch baseline --single-branch https://github.com/Katsuki-No1/face_detection.git
+cd face_detection
+git clone https://github.com/facebookresearch/dinov3.git models/source/dinov3
+git -C models/source/dinov3 checkout 6876159a11b4df116f30f667f8c9888617df0751
+```
+
+DINOv3の実装はローカルの `models/source/dinov3` から読み込むため、checkpointとは別に必要です。
+上記は元の開発環境で使用しているDINOv3ソースのrevisionです。
+Python環境に `requirements.txt` の依存を用意し、GPUを使う場合はPyTorch・CUDA・ドライバを対応させます。
+顔検出だけならFACE成分のcheckpoint、一式を使う場合はFACEとQuery Refinementの2つを用意します。
+新しいデバイスでの実機動作は未検証です。
+
 入力画像・固定splitのアノテーション・事前学習重み・2成分のcheckpointはローカルに配置してください。
 Gitに重み、データセット、生成キャッシュは含めていません。
 設定内の `outputs/` や初期化重みの絶対パスは学習時の配置を記録しています。

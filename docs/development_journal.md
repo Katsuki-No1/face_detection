@@ -10,6 +10,49 @@
 
 ## 2026-10-10
 
+<!-- dev-journal-entry:start id=baseline-portability-config-restoration-20261010 -->
+### 18:15 JST — Restore inherited baseline configuration and document cross-device prerequisites
+
+- ID: `baseline-portability-config-restoration-20261010`
+- 状態: `completed`
+- 記録元: `User asked whether cloning the baseline branch and separately obtaining checkpoints is sufficient on another device.`
+- Git: `8ce38bf3ae69` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- Inspect actual inference configuration loading rather than assuming --help proves portability. Keep the registered HEAD-free FACE/ellipse -> Face-crop Query Refinement model and checkpoint contracts unchanged.
+
+実装:
+
+- Found that prior cleanup omitted configs/datasets/default_face_pose.yaml: a ../datasets parent escaped the dependency allowlist due to non-normalized path comparison. Restored the exact pre-cleanup file from ec2614d. Frozen metadata is preserved, including unused historical dataset keys.
+- Added tests that load every retained YAML inheritance chain and both registered component configs without external data or weights. README now documents baseline-specific clone, required local DINOv3 source at verified development revision 6876159a11b4df116f30f667f8c9888617df0751, environment/device dependencies, checkpoint count and path requirements.
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run; no training, inference or model performance evaluation.
+
+結果:
+
+- not run; new-device hardware execution and the complete combined pipeline remain unverified.
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- configs/datasets/default_face_pose.yaml; tests/test_baseline_configuration.py; README.md. Journal maintenance recorded in this entry.
+
+検証と意図:
+
+- .venv/bin/python -m pytest -q via the existing project virtualenv: 51 passed. Both registered configs load without data/weights and their SHA-256 values match the registry. DINOv3 source revision and remote checked locally.
+- This repair follows the earlier baseline cleanup; retain original occlusion checkout and remote unchanged. Commit/push and remote SHA verification follow this entry.
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=baseline-portability-config-restoration-20261010 -->
+
 <!-- dev-journal-entry:start id=baseline-branch-focused-cleanup-20261010 -->
 ### 18:09 JST — Restrict baseline branch to model entry points and standalone performance documentation
 
