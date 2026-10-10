@@ -1,0 +1,13 @@
+extends: continuous_recovery_base.yaml
+experiment_name: continuous_recovery_gram_seed42
+model:
+  continuous_recovery:
+    adoption: alpha
+    gram_weight: 0.05
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_gram_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_gram/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_gram
+wandb:
+  group: continuous_recovery_ablation_seed42

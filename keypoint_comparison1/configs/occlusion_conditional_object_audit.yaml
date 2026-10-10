@@ -1,0 +1,21 @@
+# CPU augmentation audit only; not registered for production or gate reuse.
+# HEAD-free FACE/ellipse -> Face-crop DINO -> Messenger -> Query Refinement.
+extends: continuous_recovery_abc_b_object.yaml
+experiment_name: occlusion_conditional_object_audit
+outputs:
+  root: outputs/diagnostics/occlusion_conditional_object_audit
+data:
+  augmentation:
+    paired_occlusion:
+      object_overlap_policy:
+        version: conditional_v1
+        exempt_material_ids: [glasses]
+        route_probabilities: [0.10, 0.10, 0.40, 0.40]
+        keypoint_slots: [0, 1, 2, 3, 4]
+        local_radius_face_fraction: 0.08
+        minimum_local_coverage: 0.20
+        side_face_factors: [0.20, 1.20]
+        maximum_attempts: 128
+        maximum_skip_fraction: 0.05
+        maximum_light_fraction: 0.30
+        minimum_strong_fraction: 0.25

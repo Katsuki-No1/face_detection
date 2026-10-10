@@ -1,0 +1,254 @@
+schema_version: training-plan-v1
+plan_id: real_face_occlusion_w48_s2_20261009
+status: scheduled_pending_training_integration
+runnable: false
+authorization: User requested scheduling; no training launch in this scheduling activity.
+canonical_queue: configs/training_queues/pending_models_tests_then_training.yaml
+design: docs/real_face_occlusion_training_schedule.md
+
+shared_augmentation:
+  implementation: scripts/opaque_boundary_gradient.py
+  width_crop_pixels: 48
+  strength: 2.0
+  alpha_compositing: false
+  modify_recipient_outside_paste: false
+  use_hidden_recipient_pixels: false
+  training_split_only: true
+  donor_must_be_different_source_video: true
+  recipient_original_face_occluded: false
+  recipient_original_keypoint_states: [2, 2, 2, 2, 2]
+  allow_donor_truncation: true
+  clip_crop_to_source_image: true
+  crop_outside_keypoint_state: 0
+  covered_in_crop_keypoint_state: 1
+  missing_coordinate_supervision: false
+  preserve_target_instance_identity: true
+  exclude_donor_keypoints_from_target_supervision: true
+  placement_mask: actual_binary_paste_support_including_donor_background
+  photometric_selection: train_context_Lab_mean_and_luminance_std
+  maximum_delta_L: 12
+  maximum_delta_ab_norm: 12
+  maximum_delta_L_std: 15
+  candidate_videos: 5
+  provisional_request_probability: 0.30
+  one_target_per_source_image: true
+  exclusive_with_other_synthetic_occlusion: true
+  routes:
+    - {name: light, overlap: [0.0, 0.10], probability: 0.20, must_cover_keypoint: true}
+    - {name: medium, overlap: [0.10, 0.20], probability: 0.40}
+    - {name: strong, overlap: [0.20, 0.40], probability: 0.40}
+  interval_convention: lower_exclusive_upper_inclusive
+  maximum_placement_attempts: 128
+  minimum_donor_face_overlap: 0.01
+  profile_donor_probability: 0.50
+  no_silent_route_downgrade: true
+  no_silent_solid_object_fallback: true
+  rate_status: Initial planned rates inherited from the prototype; require production-loader audit.
+
+data:
+  canonical_root: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1
+  train_inventory: {images: 4237, heads: 7129, source_videos: 44}
+  train_sha256: b8a81c114c26a9476907ecb4611ee450e49a5f21a5683021841c8ddcb4a32ecb
+  donor_and_recipient_split: train
+  threshold_selection_split: val
+  test_setting_selection: prohibited
+  cache_provenance: annotation/image/config/code hashes, donor/recipient video and instance IDs, seed, epoch, geometry, binary mask
+
+execution_order:
+  - shared_training_integration_and_distribution_audit
+  - messenger_schema_gpu_step_overfit_small_scale
+  - detector_schema_gpu_step_overfit_small_scale
+  - for_off_control_schema_gpu_step_overfit_small_scale
+  - for_schema_gpu_step_overfit_small_scale
+  - messenger_production
+  - detector_production
+  - for_off_control_production
+  - for_production
+  - common_val_then_validation_locked_test
+ordering_constraints:
+  - Preserve user-prioritized acquisition and inference jobs ahead of training.
+  - Finish all enabled new gate groups before any of the four new production jobs.
+  - Keep the new production jobs contiguous; evaluations follow production.
+  - Failed architecture dependencies skip its production; independent architecture may continue.
+  - Do not retry unrelated failed models, replace baselines, or resume prior runs automatically.
+
+experiments:
+  - id: deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42
+    purpose: Messenger feature recovery under occlusion by another face
+    parent_config: keypoint_comparison1/configs/continuous_recovery_abc_b_object_conditional.yaml
+    deployment:
+      type: ordered_cascade
+      stages: [full_image_face_ellipse, face_crop_dino, messenger_recovery, query_refinement]
+      external_head: false
+    input_contract: clean teacher / face-occluded student for the same target and geometry
+    initialization: Same pinned parent warm start; authenticate files at preparation. Not an automatic resume of conditional-object output.
+    output_root: outputs/landmark_detection/continuous_recovery_abc_b_real_face_w48_s2
+    evaluation_root: outputs/landmark_detection/continuous_recovery_abc_b_real_face_w48_s2/query_refinement/evaluation
+    required_gate_markers:
+      - outputs/training_gates/deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42/schema/success.json
+      - outputs/training_gates/deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42/gpu_step/success.json
+      - outputs/training_gates/deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42/overfit/success.json
+      - outputs/training_gates/deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42/small_scale/success.json
+    limitation: Face-only artificial occluders do not fully reproduce natural occlusion.
+    future_work: Add occlusion by non-face objects as a separate auditable augmentation family.
+  - id: mal_alpha2_face_overlap_w48_s2_seed42
+    purpose: Current local FACE/ellipse detector robustness to overlapping faces
+    parent_config: configs/dinov3_deimv2/mal_alpha2_ellipse_from_existing_wider.yaml
+    deployment:
+      type: non_cascade
+      stages: [full_image_face_ellipse]
+      external_head: false
+    input_contract: Paste on the full image; update donor and recipient detection/ellipse supervision consistently.
+    initialization:
+      registry: configs/model_registry/local_baseline.yaml
+      intended_checkpoint: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/checkpoints/best_val_map.pt
+      expected_sha256: 3bd6e40517bc6f6e276c47e1dfdf639173e8b9c04d32486adbb6f4b407f006a0
+      weight_branch: ema
+      mode: new fine-tuning experiment, not optimizer/epoch resume
+      authentication: Recheck actual checkpoint before preparation; registry is not a current-file verification.
+    output_root: outputs/experiments/mal_alpha2_face_overlap_w48_s2
+    evaluation_root: outputs/experiments/mal_alpha2_face_overlap_w48_s2/evaluation
+    required_gate_markers:
+      - outputs/training_gates/mal_alpha2_face_overlap_w48_s2_seed42/schema/success.json
+      - outputs/training_gates/mal_alpha2_face_overlap_w48_s2_seed42/gpu_step/success.json
+      - outputs/training_gates/mal_alpha2_face_overlap_w48_s2_seed42/overfit/success.json
+      - outputs/training_gates/mal_alpha2_face_overlap_w48_s2_seed42/small_scale/success.json
+    training_contract:
+      effective_batch_size: 16
+      preflight_microbatches: [4, 8, 16]
+      selection: parent FACE/ellipse validation bbox mAP50_95
+      validation_every_epochs: 5
+      loss: MAL alpha2 and parent ellipse losses
+      budget_and_learning_rates: Freeze new fine-tuning config before gates; parent rates are reference, no implicit resume.
+      unsupported_keypoint_state_metrics: N/A
+    baseline_promotion: Not implied by this experiment.
+  - id: face_overlap_control_real_face_w48_s2_seed42
+    purpose: Matched FOR-off control for deciding whether to use the FOR v1 design
+    parent_config: keypoint_comparison1/configs/face_overlap_robustness_v1.yaml
+    planned_model_overrides:
+      face_overlap_robustness: {enabled: false}
+    ablation_group: for_v1_on_off_real_face_w48_s2
+    ablation_arm: for_off
+    deployment:
+      type: ordered_cascade
+      stages: [full_image_face_ellipse, face_crop_dino, query_refinement]
+      external_head: false
+    input_contract: Use the identical composite images, frozen detector predictions, target assignments and crops as FOR-on; do not feed query features or geometry into the keypoint head.
+    initialization: Same common tensors/checkpoint as FOR-on; no FOR parameters; authenticate at preparation.
+    output_root: outputs/face_overlap_robustness/control_real_face_w48_s2
+    evaluation_root: outputs/face_overlap_robustness/control_real_face_w48_s2/query_refinement/evaluation
+    required_gate_markers:
+      - outputs/training_gates/face_overlap_control_real_face_w48_s2_seed42/schema/success.json
+      - outputs/training_gates/face_overlap_control_real_face_w48_s2_seed42/gpu_step/success.json
+      - outputs/training_gates/face_overlap_control_real_face_w48_s2_seed42/overfit/success.json
+      - outputs/training_gates/face_overlap_control_real_face_w48_s2_seed42/small_scale/success.json
+    scope: Architecture ablation control, not an augmentation-off condition or a different detector baseline.
+  - id: face_overlap_robustness_real_face_w48_s2_seed42
+    purpose: FOR target-face keypoint attribution under overlapping faces
+    target_status: User confirmed both detector and crop-keypoint applications; this is the FOR crop-keypoint arm.
+    parent_config: keypoint_comparison1/configs/face_overlap_robustness_v1.yaml
+    planned_model_overrides:
+      face_overlap_robustness: {enabled: true, query_dim: 256}
+    ablation_group: for_v1_on_off_real_face_w48_s2
+    ablation_arm: for_on
+    deployment:
+      type: ordered_cascade
+      stages: [full_image_face_ellipse, face_crop_dino, conditioned_query_refinement]
+      external_head: false
+    input_contract: Composite first; obtain frozen detector queries and crop geometry from that same composite.
+    cached_clean_query_on_occluded_input: prohibited
+    initialization: Parent FOR model contract; authenticate local-baseline detector checkpoint and any keypoint warm start at preparation.
+    output_root: outputs/face_overlap_robustness/real_face_w48_s2
+    evaluation_root: outputs/face_overlap_robustness/real_face_w48_s2/query_refinement/evaluation
+    required_gate_markers:
+      - outputs/training_gates/face_overlap_robustness_real_face_w48_s2_seed42/schema/success.json
+      - outputs/training_gates/face_overlap_robustness_real_face_w48_s2_seed42/gpu_step/success.json
+      - outputs/training_gates/face_overlap_robustness_real_face_w48_s2_seed42/overfit/success.json
+      - outputs/training_gates/face_overlap_robustness_real_face_w48_s2_seed42/small_scale/success.json
+    scope: Reuse the same face-paste operation with current frozen alpha2 detector; the separate detector arm does not silently replace it.
+
+keypoint_training_contract:
+  applies_to: [deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42, face_overlap_control_real_face_w48_s2_seed42, face_overlap_robustness_real_face_w48_s2_seed42]
+  seed: 42
+  nominal_max_epochs: 40
+  effective_batch_size: 64
+  preflight_microbatches: [4, 8, 16]
+  preflight: repeated updates, synchronized timings, production validation, finite values, VRAM<=90%, GPU<83C
+  choose_batch: fastest projected safe plan; within 3 percent choose smaller microbatch
+  runtime_oom_fallback: true
+  validation_every_epochs: 1
+  selection: conditional_semantic_macro_f1_nme_0.10
+  presence_threshold: 0.70
+  early_stop: {minimum_epoch: 10, patience_validations: 5, min_delta: 0.0001}
+  preserve_parent_loss_lr_warmup_and_decay: true
+  flat_epochs_equals_warmup_epochs: true
+  storage: last and validation-selected best; bounded recovery snapshots per AGENTS.md
+  wandb_conditions_and_history: required
+
+ablations:
+  - id: for_v1_on_off_real_face_w48_s2
+    purpose: Decide whether FOR v1 conditioning improves target-face keypoint attribution.
+    arms:
+      control: face_overlap_control_real_face_w48_s2_seed42
+      treatment: face_overlap_robustness_real_face_w48_s2_seed42
+    varied_factor: Entire FOR v1 target-query-feature and predicted-geometry conditioning block, enabled false/true.
+    id_meaning: Image-local decoder-query routing ID; not person recognition and not a learned numeric ID embedding.
+    fixed_conditions:
+      - same frozen current-local alpha2 detector checkpoint, threshold and prediction cap
+      - same canonical group-preserving train/val/test annotations and hashes
+      - same train-only donor/recipient selection and composite-image manifest per epoch
+      - same 48px strength2 binary face-overlap augmentation, routes, skip outcomes, crop transforms and photometric samples
+      - same post-composition predicted detections, target associations, crops and eligible denominators for both arms
+      - same common checkpoint tensors and common initialization hashes; no warm start from an already-trained FOR head
+      - same loss weights, optimizer, learning rates, staged unfreeze, warmup/decay, maximum budget and early-stop contract
+      - same seed42, effective batch64 and sample order; isolate augmentation/model initialization RNG streams
+    initialization_check: New FOR projections start at zero; verify identical initial outputs and common-parameter hashes before updates.
+    disabled_contract: No FOR parameter keys or query/geometry conditioning in the off model; routing IDs may remain metadata for identical sample assignment.
+    gates: Four fresh independent markers for each arm; old FOR-v1 CPU tests or other-arm gates cannot substitute.
+    evaluation:
+      selection_split: val
+      main_metric: conditional_semantic_macro_f1_nme_0.10
+      report_on_minus_off: true
+      required_views:
+        - canonical unaugmented validation overall
+        - natural overlapping-face validation slice with counts and separately frozen eligibility rule
+        - non-overlapping validation slice to expose regression
+        - semantic eye/nose/mouth metrics, missing/localization errors and cross-face attribution errors separately
+        - occlusion robustness table under the common AGENTS.md contract
+        - inference latency, peak VRAM, parameter count and added FOR cost
+      misassociation_protocol: Freeze overlap/attribution definitions, ambiguity handling, denominators and practical regression margins before either production run; do not derive them from test or label nearest-other-face proximity as proven misassociation.
+      comparison_guard: Both arms must have the same matched-prediction cohort and Face thresholds; report detector misses separately under the common contract.
+      decision: Validation-based human review of overlap benefit, overall/non-overlap regression and cost. No automatic promotion; inconclusive results remain inconclusive.
+      seed_limitation: Initial paired seed42 estimates one-run effect; additional paired seeds are a follow-up if needed, not silently scheduled.
+      test: Run only after validation locks checkpoints/thresholds and the FOR-use decision; never decide use/no-use on test.
+    report_output: outputs/face_overlap_robustness/ablation_real_face_w48_s2/val/comparison_table.md
+    does_not_estimate: Effect of augmentation itself, isolated numeric ID effect, or separate query-feature versus geometry contribution.
+
+readiness_requirements:
+  - Integrate shared donor selection/composition into actual training loaders; preview script alone is insufficient.
+  - Messenger masks, clean teacher, missing targets and recovered-feature losses must use the same transformed support.
+  - FOR must re-extract composite full-image queries; cached clean queries cannot be reused.
+  - FOR paste geometry and width48 must be expressed in the destination crop coordinate scale when composing full images.
+  - Detector arm adds donor Face bbox/ellipse labels and updates every touched recipient; no unlabelled pasted faces.
+  - Detector and FOR full-image adapters must reject placements touching pre-occluded ineligible recipients.
+  - Keep partial donor support and truncation separate from natural occlusion; agree detector-label handling before schema gate.
+  - Register executable setup, four gates, production and common val/test jobs only with implemented commands.
+  - Authenticate fresh config/code/checkpoint/cache-bound gates; never reuse object-run or preview reports as success.
+  - Audit actual production jitter/resize/photometric/flip path across seeds42/43 and epochs1/12/40.
+  - Report requested/applied/skipped rates and severity by epoch, route, source video, donor profile and keypoint count.
+  - Resolve placement skips before production; do not silently weaken conditions or relabel skips as augmentation.
+  - FOR on/off must share post-composition prediction/crop manifests even when the off head does not consume query context.
+  - Freeze the FOR ablation's overlap/attribution protocol before production; validate identical initial outputs and per-epoch augmentation manifests.
+distribution_targets:
+  maximum_skip_fraction: 0.05
+  maximum_light_fraction_of_applied: 0.30
+  minimum_strong_fraction_of_applied: 0.25
+  current_preview_is_gate_success: false
+  current_preview: 196 of 240 applied; 44 skips; not the production loader distribution
+evaluation:
+  splits: [val, test]
+  contract: AGENTS.md common baseline-aligned contract, frozen val-selected thresholds before test
+  output_suffix_under_each_evaluation_root: '{val,test}/baseline_aligned'
+  required_files: [metrics.json, comparison_table.md, success.json]
+  unsupported_head_metrics: N/A with explicit unsupported_reason
+  natural_occlusion_and_overlapping_face_diagnostics: Separate from synthetic-distribution audit; no invented misassociation metric.

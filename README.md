@@ -19,6 +19,25 @@ baseline全体の評価済み結果として扱いません。既存active-learn
 2026-10-09の5分比較動画は左が現baselineの顔検出部のみ、右が旧baseline一式であり、
 新旧baseline一式同士の比較ではありません。
 
+## Messenger token model / occlusion source snapshot
+
+The `occlusion` branch builds on the `baseline` source snapshot. Its deployed
+pipeline is HEAD-free: full-image FACE/ellipse -> Face-crop DINO -> Messenger
+recovery -> Query Refinement. It does not promote Messenger to the local baseline.
+
+- Design: [Messenger continuous feature recovery](docs/messenger_continuous_feature_recovery_design.md)
+- Implementation and historical verification: [implementation notes](docs/messenger_continuous_feature_recovery_implementation.md)
+- Configurations: `keypoint_comparison1/configs/continuous_recovery_*.yaml` and `*_messenger_*.yaml`
+- Gates and training: `scripts/run_continuous_recovery_gate.py`, `scripts/train_continuous_recovery.py`
+- Diagnostics: `scripts/evaluate_messenger_recovery.py`, `scripts/evaluate_recovery_abc_diagnostics.py`, `scripts/evaluate_real_mixed_recovery.py`
+
+This publication includes model dependencies, configurations, augmentation tools,
+reports, and regression tests. Checkpoints, datasets, generated occlusion banks,
+and cached results remain local. Historical schedule descriptions are retained as
+records; the workstation's current multi-experiment queue changes and automatic
+continuation are outside this source snapshot. No training or evaluation is
+launched by publishing this branch.
+
 このリポジトリには、顔と頭部の検出、顔ランドマークの抽出、YOLO Pose 用のデータセットへの変換、学習、推論、可視化、評価を行う Python スクリプトが含まれています。
 
 このリポジトリでは、個人情報や実データを Git に含めない運用を前提にしています。モデルの重み、入力動画、抽出したフレーム、アノテーション、生成したデータセット、学習結果、推論結果はローカルに保存し、`.gitignore` によって Git の管理対象から除外します。

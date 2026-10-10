@@ -1,0 +1,66 @@
+# Query Refinement is unchanged; fixed baseline teacher, live student DINO.
+extends: dinov3_vits16_face_pose_drive_v2_messenger_control.yaml
+schema_version: 1
+model:
+  continuous_recovery:
+    enabled: true
+    layers: 2
+    heads: 6
+    feedforward_ratio: 2.0
+    adoption: optimal
+    structure_enabled: false
+    structure_dim: 96
+    structure_heads: 4
+    prototypes: 8
+    temperature: 0.2
+    initial_gate: 0.1
+    mixing_warmup_epochs: 2
+    beta: 0.1
+    huber_delta: 1.0
+    scale_floor: 0.05
+    scale_samples: 256
+    oracle_epsilon: 1.0e-06
+    candidate_weight: 0.1
+    output_weight: 0.1
+    gram_weight: 0.0
+    alpha_weight: 0.01
+    first_alpha_weight: 0.5
+    adoption_weight: 0.01
+    descriptor_weight: 0.1
+    consistency_weight: 0.0
+    cosine_weight: 1.0
+    amplitude_weight: 1.0
+  backbone:
+    freeze: false
+data:
+  structure_head_annotations: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/train.json
+  continuous_source_inventory:
+    train:
+      path: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/train.json
+      sha256: b8a81c114c26a9476907ecb4611ee450e49a5f21a5683021841c8ddcb4a32ecb
+      groups: 44
+      images: 4237
+      heads: 7129
+    val:
+      path: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/val.json
+      sha256: 0e4752e121606fd0ae1c60a090c845d64e058abc87ea540bc22fb142574bd0d0
+      groups: 6
+      images: 530
+      heads: 882
+    test:
+      path: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1/test.json
+      sha256: bd32bd1591686947bfcc79cbbcd79e1059bba1569e8bd06127d3327f2b776487
+      groups: 6
+      images: 528
+      heads: 806
+train:
+  backbone_policy: staged_unfreeze
+  freeze_backbone_epochs: 5
+  lr_backbone: 1.25e-05
+  lr_head: 0.0005
+  lr_messenger: 0.0001
+  checkpoint_every: 0
+  finetune_checkpoint:
+    strict: false
+    allowed_missing_prefixes:
+    - messenger_recovery.

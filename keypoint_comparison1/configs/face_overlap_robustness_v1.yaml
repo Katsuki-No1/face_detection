@@ -1,0 +1,76 @@
+extends: dinov3_vits16_face_pose_drive_v2.yaml
+
+# FOR = Face Overlap Robustness. Implementation candidate, NOT scheduled training.
+# HEAD-free ordered full-image FACE/ellipse -> face-crop DINO -> Query Refinement.
+experiment_name: face_overlap_robustness_v1
+implementation_status: implementation_only_not_scheduled
+model:
+  face_overlap_robustness:
+    enabled: true
+    query_dim: 256
+  backbone:
+    initialize_from_deim_checkpoint: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/checkpoints/best_val_map.pt
+detector:
+  name: mal_alpha2_ellipse_from_existing_wider_frozen
+  config: configs/dinov3_deimv2/mal_alpha2_ellipse_from_existing_wider.yaml
+  checkpoint: outputs/experiments/mal_alpha2_ellipse_from_existing_wider/checkpoints/best_val_map.pt
+  score_threshold: 0.33
+data:
+  ellipse_error_model: null
+  annotations:
+    val: outputs/dataset_adapters/face_pose_drive_v2_balanced_811/face_keypoints_val.json
+  expected:
+    val:
+      images: 530
+      annotations: 840
+      usable_instances: 790
+      sha256: 906fd215ed30d056cc9dfe7666143c796e50f6810aa5b5a50cbffe28bf04a2ab
+  face_context_caches:
+    train: outputs/face_overlap_robustness/v1/cache/train.json
+    val: outputs/face_overlap_robustness/v1/cache/val.json
+    test: outputs/face_overlap_robustness/v1/cache/test.json
+  augmentation:
+    # Cached queries see the original full image. No crop-only occlusion leak.
+    occlusion_probability: 0.0
+    landmark_guided_occlusion: null
+    paired_occlusion: null
+train:
+  # Required by the existing config schema; does not authorize or schedule a run.
+  production_mode: true
+  seed: 42
+  epochs: 40
+  minimum_epochs: 10
+  warmup_epochs: 5
+  flat_epochs: 5
+  microbatch_candidates: [4, 8, 16]
+  intended_effective_batch_size: 64
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  refinement_initialize_from_query: false
+  validation:
+    enabled: true
+    every: 1
+    batch_size: 8
+  checkpoint_selection:
+    metric: conditional_semantic_macro_f1_nme_0.10
+    direction: higher
+    filename: best_conditional_semantic_macro_f1.pt
+  early_stopping:
+    enabled: true
+    minimum_epoch: 10
+    patience_validations: 5
+    min_delta: 0.0001
+evaluation:
+  pipeline_contract:
+    type: cascade
+    stages: [full_image_face_ellipse, face_crop_keypoint]
+  predicted_head: null
+  architecture_id: face_overlap_robustness_v1
+  point_presence_threshold: 0.70
+  default_sets: [v2_val]
+  defer_until_all_checkpoints: false
+  baseline_aligned_output_root: outputs/face_overlap_robustness/v1/query_refinement/evaluation
+outputs:
+  root: outputs/face_overlap_robustness/v1
+wandb:
+  group: face_overlap_robustness

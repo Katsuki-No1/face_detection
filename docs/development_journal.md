@@ -10,6 +10,51 @@
 
 ## 2026-10-10
 
+<!-- dev-journal-entry:start id=messenger-occlusion-github-source-snapshot-20261010 -->
+### 16:28 JST — Publish Messenger token model and occlusion source on occlusion branch
+
+- ID: `messenger-occlusion-github-source-snapshot-20261010`
+- 状態: `completed`
+- 記録元: `User requested Messenger token model code and documentation on branch occlusion and explicitly requested continuing through push.`
+- Git: `ec2614d60c9f` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- Create occlusion from baseline commit ec2614d60c9ff7615795298030e479d1cdd92f18. Preserve HEAD-free ordered full-image FACE/ellipse -> Face-crop DINO -> Messenger recovery -> Query Refinement. No automatic baseline promotion.
+- Publish Messenger/continuous recovery configurations, training gates and launchers, feature recovery diagnostics, real-face/non-face occlusion preparation, FOR-related helpers, documentation and tests. Reuse shared implementation already committed on baseline. Leave mixed multi-experiment canonical queue changes and unrelated work local; README explains historical scheduling references.
+
+実装:
+
+- Selected source/import/configuration dependencies; added scoped README instructions. Updated this journal and recorded the prior baseline publication user reflection verbatim.
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run; no production training, GPU gates, inference or performance evaluation requested or launched.
+
+結果:
+
+- not run; regression tests do not certify production gates or model performance.
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- docs/messenger_continuous_feature_recovery_design.md and docs/messenger_continuous_feature_recovery_implementation.md: design and historical evidence. keypoint_comparison1/configs/continuous_recovery_*.yaml and *_messenger_*.yaml: independent experiment configurations.
+- scripts/run_continuous_recovery_gate.py and scripts/train_continuous_recovery.py: authenticated gates and training. scripts/evaluate_messenger_recovery.py, evaluate_recovery_abc_diagnostics.py and evaluate_real_mixed_recovery.py: separate diagnostic evaluation tools.
+
+検証と意図:
+
+- Isolated Git index snapshot /tmp/face-occlusion-verify-5itl4bxk using .venv/bin/python -m pytest -q with CUDA_VISIBLE_DEVICES empty: 106 passed across four keypoint Messenger/recovery/policy/ABC suites and six audit/occlusion/FOR/CLI suites. No real-data performance evaluation.
+- All 21 selected landmark configurations loaded; implementation_hashes authenticated inventory has all 24 source files. Python syntax, selected file types, credential-pattern scan and whitespace check passed. Existing terminal blank lines retained.
+- Commit and authorized GitHub push follow this source-snapshot entry; verify remote occlusion SHA against local HEAD after push.
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=messenger-occlusion-github-source-snapshot-20261010 -->
+
 <!-- dev-journal-entry:start id=baseline-github-source-snapshot-20261010 -->
 ### 16:14 JST — Publish current MAL alpha2 and Query Refinement baseline source snapshot
 
@@ -53,5 +98,7 @@
 
 #### 4. 結果に対するユーザーの考え・認識
 
-> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+> **ユーザー原文:**
+>
+> 目的の通りに動作していることを確認した
 <!-- dev-journal-entry:end id=baseline-github-source-snapshot-20261010 -->

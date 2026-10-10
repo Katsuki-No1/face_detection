@@ -1,0 +1,41 @@
+extends: dinov3_vits16_face_pose_drive_v2_messenger_control.yaml
+
+schema_version: 1
+experiment_name: dinov3_vits16_face_pose_drive_v2_messenger_recovery_seed42
+
+model:
+  messenger_recovery:
+    enabled: true
+    layers: 1
+    heads: 6
+    feedforward_ratio: 4.0
+    dropout: 0.0
+    positional_encoding: sine_2d
+    attention_scope: full_face_crop
+    self_patch_mask: true
+    gate: soft_scalar
+    initial_gate: 0.10
+    zero_init_projection: true
+
+loss:
+  messenger_reconstruction_weight: 0.10
+  messenger_gate_weight: 0.01
+
+train:
+  finetune_checkpoint:
+    path: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion/query_refinement/checkpoints/best_nme.pt
+    sha256: baf7a6d0b1df6d1089357b2f28ffc1b2da3aadbb6239bae2cb5085d36ef016e0
+    variant: query_refinement
+    prefer_ema: true
+    strict: false
+    allowed_missing_prefixes: [messenger_recovery.]
+
+evaluation:
+  architecture_id: deimv2_l_query_refinement_messenger_recovery_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_messenger_recovery/query_refinement/evaluation
+
+outputs:
+  root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_messenger_recovery
+
+wandb:
+  group: face_pose_drive_v2_messenger_recovery

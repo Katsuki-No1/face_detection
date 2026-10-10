@@ -1,0 +1,14 @@
+extends: continuous_recovery_base.yaml
+experiment_name: continuous_recovery_option3_seed42
+model:
+  continuous_recovery:
+    adoption: local
+    structure_enabled: true
+    gram_weight: 0.0
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_option3_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_option3/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_option3
+wandb:
+  group: continuous_recovery_ablation_seed42

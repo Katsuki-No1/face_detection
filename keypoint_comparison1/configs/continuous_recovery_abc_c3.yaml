@@ -1,0 +1,28 @@
+# HEAD-free: full-image FACE/ellipse -> crop DINO -> recovery -> Query Refinement.
+# A is also C0. All common initial tensors are hash-checked; reference RNG is isolated.
+extends: continuous_recovery_combined_option1.yaml
+experiment_name: continuous_recovery_abc_c3_seed42
+model:
+  continuous_recovery:
+    alpha_weight: 0.0
+    multi_scale: true
+    multi_level: true
+    reference_layers: [3, 7, 11]
+    reference_factors: [1, 2, 4]
+    reference_encoding: crop_rect_level_scale_linear_v1
+    reference_adapter_seed: 20261004
+data:
+  augmentation:
+    paired_occlusion:
+      appearance: solid
+train:
+  epoch0_validation: true
+  record_common_initialization: true
+  expected_common_initialization_sha256: 69728f8b4669b74f490d4b37163b21996f872cf46e53269340cd16f51dc1fea6
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_abc_c3_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_abc_c3/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_abc_c3
+wandb:
+  group: continuous_recovery_abc_seed42

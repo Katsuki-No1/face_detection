@@ -1,0 +1,13 @@
+# Authorized 2026-10-09: conditional object occlusion, isolated four gates and output.
+# HEAD-free ordered full-image FACE/ellipse -> crop DINO -> Messenger -> Query Refinement.
+extends: occlusion_conditional_object_audit.yaml
+experiment_name: continuous_recovery_abc_b_object_conditional_seed42
+train:
+  synchronized_timing: true
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_abc_b_object_conditional_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_abc_b_object_conditional/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_abc_b_object_conditional
+wandb:
+  group: continuous_recovery_abc_conditional_object_seed42

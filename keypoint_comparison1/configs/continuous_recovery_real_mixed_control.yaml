@@ -1,0 +1,12 @@
+# Matched recovery-off control. Same dataset and augmentation as recovery-on.
+extends: continuous_recovery_real_mixed.yaml
+experiment_name: continuous_recovery_real_mixed_control_seed42
+real_mixed_ablation_arm: recovery_off
+model:
+  continuous_recovery:
+    enabled: false
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_abc_real_mixed_control_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_real_mixed_control/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_real_mixed_control

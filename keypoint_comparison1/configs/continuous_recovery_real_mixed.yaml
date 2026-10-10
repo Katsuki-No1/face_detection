@@ -1,0 +1,27 @@
+# Implemented loader candidate, not scheduled and no production gates passed.
+# HEAD-free FACE/ellipse -> crop DINO -> Messenger -> Query Refinement.
+extends: continuous_recovery_abc_b_object_conditional.yaml
+experiment_name: continuous_recovery_real_mixed_seed42
+implementation_status: loader_implemented_not_scheduled
+real_mixed_ablation_arm: recovery_on
+data:
+  augmentation:
+    paired_occlusion:
+      appearance: real_mixed
+      object_overlap_policy: null
+      material_manifest: outputs/dataset_adapters/real_occlusion_mixed_v1/manifest.json
+      material_manifest_sha256: 587da1883206607ca2b883676195059aaa2ff227b11d038265ee260255ea6718
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_abc_real_mixed_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_real_mixed/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_real_mixed
+wandb:
+  group: messenger_real_mixed_on_off_seed42
+augmentation_contract:
+  version: real_mixed_v1
+  family_probabilities: {face: 0.5, non_face: 0.5}
+  recipients: original_face_occluded_false_and_all_five_visible
+  crop_outside_keypoints: missing
+  gradient: {width: 48, strength: 2, alpha: false, edit_recipient_outside_mask: false}
+  limitation: Face/non-face region pastes approximate natural occlusion; not a complete physical reproduction.

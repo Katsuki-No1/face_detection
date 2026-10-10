@@ -1,0 +1,94 @@
+extends: dinov3_vits16_face_pose_drive_v2.yaml
+
+schema_version: 1
+experiment_name: dinov3_vits16_face_pose_drive_v2_messenger_matched_control_seed42
+
+data:
+  augmentation:
+    occlusion_probability: 0.0
+    paired_occlusion:
+      probability: 0.30
+      kinds: [rectangle, irregular, boundary]
+      kind_probabilities: [0.3333333333333333, 0.3333333333333333, 0.3333333333333334]
+      face_overlap: [0.10, 0.40]
+      landmark_anchor_probability: 0.70
+      center_offset_fraction: 0.12
+      maximum_attempts: 128
+      one_face_per_source_image: true
+
+model:
+  backbone:
+    initialize_from_deim_checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco/checkpoints/best_val_ellipse_map.pt
+  messenger_recovery:
+    enabled: false
+    layers: 1
+    heads: 6
+    feedforward_ratio: 4.0
+    dropout: 0.0
+    positional_encoding: sine_2d
+    attention_scope: full_face_crop
+    self_patch_mask: true
+    gate: soft_scalar
+    initial_gate: 0.10
+    zero_init_projection: true
+
+detector:
+  name: deimv2_l_dinov3_vits16_balanced_811_ellipse_landmark_occlusion
+  config: configs/dinov3_deimv2/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco.yaml
+  checkpoint: outputs/experiments/dinov3_deimv2_l_vits16_face_pose_drive_v2_balanced_811_960_ellipse_landmark_occlusion_from_coco/checkpoints/best_val_ellipse_map.pt
+
+loss:
+  messenger_reconstruction_weight: 0.0
+  messenger_gate_weight: 0.0
+
+train:
+  microbatch_candidates: [4, 8, 16]
+  intended_effective_batch_size: 64
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  # The inherited 65536 scale overflows on the first two real-data updates.
+  # Start from the stable scale already used by the other Query Refinement
+  # production variants while retaining dynamic FP16 scaling.
+  grad_scaler_init_scale: 1024.0
+  grad_scaler_growth_interval: 2000
+  minimum_epochs: 10
+  epochs: 40
+  warmup_epochs: 5
+  flat_epochs: 5
+  lr_messenger: 1.0e-4
+  refinement_initialize_from_query: false
+  checkpoint_every: 5
+  finetune_checkpoint:
+    path: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion/query_refinement/checkpoints/best_nme.pt
+    sha256: baf7a6d0b1df6d1089357b2f28ffc1b2da3aadbb6239bae2cb5085d36ef016e0
+    variant: query_refinement
+    prefer_ema: true
+    strict: true
+  validation:
+    enabled: true
+    every: 1
+    batch_size: 32
+  checkpoint_selection:
+    metric: conditional_semantic_macro_f1_nme_0.10
+    direction: higher
+    filename: best_conditional_semantic_macro_f1.pt
+  early_stopping:
+    enabled: true
+    minimum_epoch: 10
+    patience_validations: 5
+    min_delta: 1.0e-4
+
+evaluation:
+  pipeline_contract:
+    type: cascade
+    stages: [full_image_face_ellipse, face_crop_keypoint]
+  architecture_id: deimv2_l_query_refinement_messenger_matched_control_seed42
+  point_presence_threshold: 0.70
+  defer_until_all_checkpoints: false
+  baseline_aligned_output_root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_messenger_control/query_refinement/evaluation
+
+outputs:
+  root: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_messenger_control
+
+wandb:
+  group: face_pose_drive_v2_messenger_matched_control
