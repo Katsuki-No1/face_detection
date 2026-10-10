@@ -1,9 +1,0 @@
-extends: stage3_pose_domain_adaptation.yaml
-experiment_name: hpg_stage4_shape_code
-model:
-  head_pose_geometry:
-    geometry:
-      shape_dimension: 4
-      shape_limit: 0.10
-output:
-  root: outputs/experiments/head_pose_geometry/stage4_shape

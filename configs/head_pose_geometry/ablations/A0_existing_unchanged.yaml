@@ -1,4 +1,0 @@
-extends: ../../face_keypoint_cooperative/face_keypoint_cooperative_detr_l_960.yaml
-experiment_name: hpg_A0_existing_unchanged
-output:
-  root: outputs/experiments/head_pose_geometry/A0

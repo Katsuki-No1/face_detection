@@ -1,4 +1,0 @@
-extends: ../stage3_pose_domain_adaptation.yaml
-experiment_name: hpg_A7_final_stage_pose_finetune
-output:
-  root: outputs/experiments/head_pose_geometry/A7

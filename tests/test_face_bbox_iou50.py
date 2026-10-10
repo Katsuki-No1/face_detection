@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from src.evaluation.face_bbox_iou50 import threshold_metrics, write_evaluation
-from tools.compare_mal_alpha_ablation import select_optimal_alpha
 
 
 def test_threshold_metrics_counts_duplicate_false_positive() -> None:
@@ -99,27 +98,4 @@ def test_write_evaluation_selects_threshold_on_val_and_locks_it_on_test(
         validation["validation_selected"]["threshold"]
     )
 
-
-def _alpha_row(alpha: float, precision: float, recall: float, duplicates: int, rate: float):
-    return {
-        "alpha": alpha,
-        "precision": precision,
-        "recall": recall,
-        "duplicate_extra_prediction_count": duplicates,
-        "duplicate_prediction_rate": rate,
-    }
-
-
-def test_alpha_selection_requires_preserved_precision_recall_and_lower_duplication() -> None:
-    selected, rows = select_optimal_alpha(
-        [
-            _alpha_row(1.0, 0.91, 0.92, 8, 0.010),
-            _alpha_row(1.25, 0.92, 0.91, 4, 0.005),
-            _alpha_row(1.5, 0.92, 0.93, 3, 0.004),
-            _alpha_row(2.0, 0.90, 0.94, 2, 0.003),
-        ]
-    )
-    assert selected == pytest.approx(1.5)
-    eligibility = {float(row["alpha"]): bool(row["eligible"]) for row in rows}
-    assert eligibility == {1.0: False, 1.25: False, 1.5: True, 2.0: False}
 

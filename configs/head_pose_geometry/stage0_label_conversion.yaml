@@ -1,7 +1,0 @@
-extends: base.yaml
-experiment_name: hpg_stage0_label_conversion
-model:
-  head_pose_geometry:
-    enabled: false
-output:
-  root: outputs/experiments/head_pose_geometry/stage0

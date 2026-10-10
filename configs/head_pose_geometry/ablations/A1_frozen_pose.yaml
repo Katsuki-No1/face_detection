@@ -1,4 +1,0 @@
-extends: ../stage1_pose_only.yaml
-experiment_name: hpg_A1_frozen_pose
-output:
-  root: outputs/experiments/head_pose_geometry/A1

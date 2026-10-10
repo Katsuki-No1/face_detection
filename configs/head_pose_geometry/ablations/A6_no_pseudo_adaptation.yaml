@@ -1,4 +1,0 @@
-extends: ../stage2_fixed_geometry.yaml
-experiment_name: hpg_A6_no_pseudo_pose_adaptation
-output:
-  root: outputs/experiments/head_pose_geometry/A6

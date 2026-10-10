@@ -10,6 +10,52 @@
 
 ## 2026-10-10
 
+<!-- dev-journal-entry:start id=baseline-branch-focused-cleanup-20261010 -->
+### 18:09 JST — Restrict baseline branch to model entry points and standalone performance documentation
+
+- ID: `baseline-branch-focused-cleanup-20261010`
+- 状態: `completed`
+- 記録元: `User requested removing unnecessary model scripts and descriptions from baseline and presenting the model performance without comparisons.`
+- Git: `ec2614d60c9f` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- Remove inherited unrelated experiments from the baseline tree with a normal deletion commit; preserve Git history. Use an isolated WSL Git worktree because the desktop worktree tool reported Git unavailable. Original occlusion checkout and uncommitted work remain untouched.
+- Preserve the exact HEAD-free full-image MAL alpha2 FACE/ellipse -> Face-crop DINOv3 Query Refinement topology, frozen registered config identities and imported internal shared implementations. Keep FACE-component evidence separate from combined-pipeline not_run status.
+
+実装:
+
+- Deleted 436 tracked files outside the baseline dependency/configuration/test closure, including obsolete model scripts, comparison reports, experimental configurations, queues and unrelated utilities. Removed unused top-level dependency entries and the ablation-only test attached to the deleted comparison tool. Model inference/training implementation and stored evaluation artifacts were not changed.
+- Rewrote README, docs/README.md and model_baseline_history.md for the current model; added docs/baseline_performance.md and a branch-specific AGENTS scope. This entry also records journal maintenance.
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run; no training, checkpoint selection or new performance evaluation.
+
+結果:
+
+- not run. Preserved complete baseline combined_inference_status and combined_evaluation_status not_run.
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- docs/baseline_performance.md: only candidate FACE-component values copied from hash-verified existing val/test metrics and authenticated success markers. Canonical-v2 val530/FACE840 and test528/FACE769; do not label as latest r3. Common threshold0.33 and validation-locked threshold0.2666015625. Agreed occlusion/profile tables explicitly N/A when matching slice aggregates are unavailable.
+- Configs/model registry remains unchanged: FACE checkpoint SHA 3bd6e40517bc6f6e276c47e1dfdf639173e8b9c04d32486adbb6f4b407f006a0; retained keypoint checkpoint SHA baf7a6d0b1df6d1089357b2f28ffc1b2da3aadbb6239bae2cb5085d36ef016e0.
+
+検証と意図:
+
+- .venv/bin/python -m pytest -q in isolated baseline worktree: 49 passed. Six README-documented CLI entry points passed --help, including FACE image/video inference, detector evaluation, gated detector launcher, keypoint launcher and downstream diagnostic evaluator.
+- Both registered config SHA-256 values unchanged; all retained Python source parsed; README/doc links resolved; public model docs contain no obsolete model-comparison tables. Existing performance sources and marker hashes verified before copying values.
+- Authorized baseline commit and push follow this entry; verify remote SHA and unchanged occlusion SHA after push.
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=baseline-branch-focused-cleanup-20261010 -->
+
 <!-- dev-journal-entry:start id=baseline-github-source-snapshot-20261010 -->
 ### 16:14 JST — Publish current MAL alpha2 and Query Refinement baseline source snapshot
 

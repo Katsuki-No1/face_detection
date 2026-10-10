@@ -1,8 +1,0 @@
-extends: ../stage2_fixed_geometry.yaml
-experiment_name: hpg_A3_geometry_no_fusion
-model:
-  head_pose_geometry:
-    fusion:
-      enabled: false
-output:
-  root: outputs/experiments/head_pose_geometry/A3

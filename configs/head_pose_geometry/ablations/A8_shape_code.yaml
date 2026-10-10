@@ -1,4 +1,0 @@
-extends: ../stage4_shape_code.yaml
-experiment_name: hpg_A8_shape_code
-output:
-  root: outputs/experiments/head_pose_geometry/A8

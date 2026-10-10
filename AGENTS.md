@@ -1,3 +1,9 @@
+## Baseline branch scope (user requested 2026-10-10)
+
+- This branch exposes only the current local baseline entry points and standalone performance documentation. Do not restore unrelated experiment scripts, model-comparison tables or multi-model queues to this branch without a new user request.
+- Preserve shared imported implementations, frozen config/checkpoint identities and the HEAD-free FACE/ellipse -> Face-crop Query Refinement topology. Documentation must distinguish FACE-component evidence from the unevaluated combined pipeline.
+- The user's request for standalone presentation supersedes comparison-table requirements below for this branch's public documentation. Historical source output schemas and stored evidence remain unchanged. No training or evaluation is authorized by repository cleanup.
+
 # Head-pose geometry work
 
 - Use `.venv/bin/python -m pytest` for tests and `.venv/bin/python` for repository tools.

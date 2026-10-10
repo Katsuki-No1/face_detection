@@ -1,7 +1,0 @@
-extends: ../stage2_fixed_geometry.yaml
-experiment_name: hpg_A5_no_valid_pixel_or_border_inputs
-model:
-  head_pose_geometry:
-    use_valid_pixel_and_border_inputs: false
-output:
-  root: outputs/experiments/head_pose_geometry/A5
