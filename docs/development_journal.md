@@ -8,6 +8,50 @@
 
 <!-- development-journal-entries -->
 
+## 2026-10-20
+
+<!-- dev-journal-entry:start id=readme-dataset-v3-performance-20261020 -->
+### 10:16 JST — README performance updated to the authenticated dataset v3 pipeline
+
+- ID: `readme-dataset-v3-performance-20261020`
+- 状態: `completed`
+- 記録元: `User request to replace README performance with dataset v3 results`
+- Git: `b692fd0ceaa2` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- Publish the saved full-v3 HEAD-free FACE/ellipse -> Face-crop Query Refinement results for the V3-trained local baseline. Use validation-maximum FACE F1 and subsequent five-slot Macro F1 selection, frozen on test. Keep historical reports and distinguish the old bundled runtime configuration from the measured V3 checkpoints.
+
+実装:
+
+- Replaced README performance and model description; added docs/baseline_dataset_v3_performance.md with common and selected thresholds, FACE P/R/F1/AP/IoU, semantic keypoints, counts, conditional and end-to-end scopes, occlusion/profile tables, source hashes and limitations. Updated the development journal. No implementation, checkpoint or deployment setting changed.
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run; existing evaluation uses face_pose_condition_balanced_811_latest_sources_r3_20261009, val2022/test2060, native FACE GT3072/2972; detector epoch30 EMA SHA5e17564c and Query epoch15 EMA SHA11b430b5.
+
+結果:
+
+- not run; no new inference or evaluation. Saved FACE F1 val93.73%/test93.45%; end-to-end semantic Macro F1 NME0.10 val90.57%/test90.10%.
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- README.md; docs/baseline_dataset_v3_performance.md; docs/development_journal.md
+- Source: outputs/evaluations/dataset_v3_f1_selected_20261011/candidate/{val,test}/detailed_metrics.json and validation_lock.json; historical candidate is the promoted V3 model.
+
+検証と意図:
+
+- PASS: eight registry-referenced success/metrics/lock hashes matched. val/test checkpoint identities and locked thresholds agree. FACE TP/FP/FN and F1 reconciled; per-slot F1 averaged to semantic Macro F1 and fixed eye weights. README/details Markdown local links and table column counts checked; old performance report unchanged; git diff --check passed. Model tests not run for documentation-only changes.
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=readme-dataset-v3-performance-20261020 -->
+
 ## 2026-10-10
 
 <!-- dev-journal-entry:start id=baseline-portability-config-restoration-20261010 -->

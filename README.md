@@ -6,24 +6,55 @@ HEADを使わない2段構成の顔検出・5点keypoint検出モデルです。
 全画像 → MAL α=2 FACE/楕円検出 → Face crop → DINOv3 Query Refinement
 ```
 
-顔検出部は既存WIDER事前学習済みDEIMv2-Lを目的データでfine-tuneした
-`mal_alpha2_ellipse_from_existing_wider`、keypoint部は既存A1/A2版Query Refinementです。
-定義・設定・checkpoint SHA・閾値は [local_baseline.yaml](configs/model_registry/local_baseline.yaml) に固定しています。
+性能欄の評価対象はV3学習済みの `mal_alpha2_ellipse_dataset_v3_r3` と
+`mal_alpha2_dataset_v3_query_refinement` の組み合わせです。
+使用したcheckpointと固定閾値は[dataset v3の評価記録](docs/baseline_dataset_v3_performance.md)に記載しています。
 
-## 性能
+このブランチに同梱する[registry](configs/model_registry/local_baseline.yaml)と下記の実行例は旧モデルの保存設定です。
+V3の性能値は評価記録に示す2つの重みの結果であり、旧設定・旧重みで再現した値ではありません。
 
-以下は **FACE/楕円検出部のみ** の保存済み結果です。
-一式の新しい組み合わせ全体は未評価であり、この表にはkeypoint性能を含めていません。
+## 性能（dataset v3）
+
+**V3で学習したFACE/楕円検出とQuery Refinementを組み合わせた、HEAD-freeの2段パイプライン**の保存済み結果です。
+データセットは `face_pose_condition_balanced_811_latest_sources_r3_20261009`。
+動画単位の固定split（train 16,411枚／val 2,022枚／test 2,060枚）を使用しています。
+
+validationでFACE bbox F1を最大化した後、FACE閾値を固定して5点keypointのsemantic Macro F1（NME ≤ 0.10）を最大化しています。
+**FACE score = 0.314453125、point presence = 0.59716796875** をtestにも固定適用しました。
+
+### FACE検出
 
 | Split | 画像数 | FACE GT | Precision | Recall | F1 |
-|---|---:|---:|---:|---:|---:|
-| val | 530 | 840 | 93.53% | 91.19% | 92.34% |
-| test | 528 | 769 | 95.74% | 93.50% | 94.61% |
+| --- | --- | --- | --- | --- | --- |
+| val | 2,022 | 3,072 | 95.82% | 91.73% | 93.73% |
+| test | 2,060 | 2,972 | 95.06% | 91.89% | 93.45% |
 
-固定 `face_pose_drive_v2_balanced_811`、FACE score 0.33、bbox IoU 0.50の一対一マッチ。
-checkpointはvalidationで選んだepoch45 EMAです。
-[性能の詳細・遮蔽と横顔の集計状況・出典](docs/baseline_performance.md) に、
-validation固定閾値での結果、bbox/楕円AP、annotation hashを掲載しています。
+FACE bbox IoU ≥ 0.50の一対一マッチで、全native FACE GTを対象にします。
+未対応予測は重複を含めFP、未対応GTはFNです。
+
+| Split | bbox mAP50:95 | bbox AP50 | bbox AP75 | bbox平均IoU（対応済みのみ） | 楕円平均IoU（未検出=0） |
+| --- | --- | --- | --- | --- | --- |
+| val | 65.35% | 94.36% | 74.86% | 0.8395 | 0.6989 |
+| test | 65.95% | 94.48% | 76.77% | 0.8445 | 0.7114 |
+
+APは信頼度順の全予測によるCOCO評価（各画像上限100）です。
+bbox平均IoUは検出成功例のみ、楕円平均IoUは全FACE GTが分母です。
+
+### 5点keypoint（end-to-end）
+
+| Split | Macro F1@NME0.05 | Macro F1@NME0.10 | 眼重視F1@0.05 | 眼重視F1@0.10 | 平均NME |
+| --- | --- | --- | --- | --- | --- |
+| val | 87.84% | 90.57% | 87.11% | 90.03% | 0.0213 |
+| test | 87.37% | 90.10% | 86.61% | 89.45% | 0.0215 |
+
+FACEの見逃しと未対応FACE予測に付随するkeypointのFPを含みます。
+Macro F1は左右の目・鼻・左右の口の5スロットのF1の単純平均、眼重視版は固定重み `[2,2,1,1,1]` です。
+NMEは元画像上の距離を `1.20 × max(GT Head幅, GT Head高さ)` で正規化します（推論にHEAD検出器は使用しません）。
+平均NMEはGT点が存在し、点が出力された例を対象とするため、見逃しを含むF1と併記します。
+属性対応が未解決のFACEはval/test各32件をkeypoint評価から除外し、FACE検出の分母には残しています。
+
+[詳細：共通閾値0.33／0.70、点別性能、遮蔽・横顔、モデルSHA・評価出典](docs/baseline_dataset_v3_performance.md)
+に条件と件数を掲載しています。旧530／528枚のFACE成分のみの結果は[過去の性能記録](docs/baseline_performance.md)に保持しています。
 
 ## 準備
 
@@ -58,7 +89,7 @@ Gitに重み、データセット、生成キャッシュは含めていませ�
 | keypointの学習・評価 | `keypoint_comparison1/scripts/run_landmark_experiments.py`（`query_refinement`） |
 | FACE予測からkeypointまでの診断評価 | `tools/evaluate_deim_query_baseline_aligned.py` |
 
-顔検出部の画像推論例：
+同梱する旧FACE成分の画像推論例（上記V3評価とは別の重み）：
 
 ```bash
 .venv/bin/python tools/infer_dinov3_deimv2_ellipse.py \
@@ -71,7 +102,7 @@ Gitに重み、データセット、生成キャッシュは含めていませ�
 
 各入口の引数は `--help` で確認できます。この画像推論例はFACE/楕円検出部だけを実行します。
 keypoint成分の学習時設定や過去の評価設定は、そのまま現在の一式の実行設定を意味しません。
-一式を評価する際はregistryの2つの重みを明示し、HEAD-freeの構成とvalidation固定閾値を確認してください。
+V3の一式を再現する場合は評価記録の2つの重み・対応する設定を別途用意し、HEAD-freeの構成とvalidation固定閾値を確認してください。
 
 ## 開発
 
