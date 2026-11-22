@@ -10,6 +10,47 @@
 
 ## 2026-11-22
 
+<!-- dev-journal-entry:start id=occlusion-messenger-readme-20261122 -->
+### 20:47 JST — occlusion の README を Messenger 特徴復元に絞る
+
+- ID: `occlusion-messenger-readme-20261122`
+- 状態: `completed`
+- 記録元: `ユーザーが occlusion ブランチの README を Messenger token と特徴復元の構造説明に絞るよう指定`
+- Git: `fc543381a4db` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- 顔 crop から DINOv3、Messenger、混合ゲート、5 点推定までを図示。初期・連続・E 系列の復元処理、マルチスケールとコードブック、人工教師と自然遮蔽の学習条件を記載。
+
+実装:
+
+- 旧 README の作業中の版を README のみの Git stash に保存し、公開用 README を58行に書き直した。
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run。文書更新のみ。
+
+結果:
+
+- not run（学習結果なし）
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- 新規出力なし
+
+検証と意図:
+
+- 図の分岐と混合経路、12件の参照先、差分の空白検査を確認。
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=occlusion-messenger-readme-20261122 -->
+
 <!-- dev-journal-entry:start id=messenger-occlusion-source-commit-20261122 -->
 ### 20:44 JST — 特徴復元のソースを occlusion に集約
 
