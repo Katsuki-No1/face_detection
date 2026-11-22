@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from scripts_YOLO.convert_annotations_to_yolo_pose import (
+from src.data.face_pose_split import (
     build_split_map,
     split_balance_report,
     split_group,

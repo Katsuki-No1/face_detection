@@ -177,6 +177,8 @@ def test_cooperative_queue_waits_and_runs_safety_gates_before_training() -> None
     assert "--models" in jobs[6].command
     assert jobs[6].command[jobs[6].command.index("--models") + 1] == "m"
     assert jobs[6].resume_arguments == ("--resume",)
+    assert jobs[6].enabled is False
+    assert jobs[-1].enabled is False
     assert jobs[7].completion_marker.name == "success.json"
     assert jobs[8].completion_marker.name == "success.json"
     assert jobs[8].depends_on == (

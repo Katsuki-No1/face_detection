@@ -10,6 +10,47 @@
 
 ## 2026-11-22
 
+<!-- dev-journal-entry:start id=occlusion-branch-retired-tools-cleanup-20261122 -->
+### 20:54 JST — occlusion のファイル一覧から旧ツールを整理
+
+- ID: `occlusion-branch-retired-tools-cleanup-20261122`
+- 状態: `completed`
+- 記録元: `ユーザーが不要な項目をブランチの一覧に表示しないためのコミットを希望`
+- Git: `e1b2390720e4` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- 旧YOLOの専用実行コード・設定・テストと、独立したスプレッドシート集計ツールを追跡対象から外す。顔注釈変換、動画単位分割、評価の共通処理は移行済みのモジュールを使い、旧実行履歴は無効状態で保持。
+
+実装:
+
+- 専用ファイル41件の追跡を終了。作業ツリーに存在した対象はGitのインデックスだけで除外し、内容を保持。既存データ変換利用箇所は従来の左右ラベル方針を明示。
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run。学習の起動・操作なし。
+
+結果:
+
+- not run（学習結果なし）
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- 新規出力なし
+
+検証と意図:
+
+- コミット候補の独立展開でCPUテスト366件成功、関連5 CLIのヘルプ起動成功。旧YOLOパッケージのimportが残っていないこと、ローカルコピーのSHA-256が一致することを確認。
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=occlusion-branch-retired-tools-cleanup-20261122 -->
+
 <!-- dev-journal-entry:start id=occlusion-messenger-readme-20261122 -->
 ### 20:47 JST — occlusion の README を Messenger 特徴復元に絞る
 

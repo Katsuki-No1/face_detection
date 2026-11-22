@@ -129,8 +129,9 @@ jobs:
       checkpoint: outputs/experiments/face_keypoint_cooperative_detr_l_960_ellipse_from_coco/checkpoints/last.pt
       arguments: []
 
+  # Retired 2026-10-15: YOLO is no longer used; command retained as execution history.
   - name: yolo26m_pose_balanced_811_960_train
-    enabled: true
+    enabled: false
     command:
       - "{project_root}/.venv/bin/python"
       - "{project_root}/scripts_YOLO/yolo26_pose/run_yolo26_pose.py"
@@ -262,8 +263,9 @@ jobs:
       - cuda:0
     completion_marker: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility/evaluation/v2_test/E_query_refinement_deim/baseline_aligned/success.json
 
+  # Retired 2026-10-15: YOLO is no longer used; command retained as execution history.
   - name: yolo26m_pose_balanced_811_960_evaluate
-    enabled: true
+    enabled: false
     command:
       - "{project_root}/.venv/bin/python"
       - "{project_root}/scripts_YOLO/yolo26_pose/run_yolo26_pose.py"

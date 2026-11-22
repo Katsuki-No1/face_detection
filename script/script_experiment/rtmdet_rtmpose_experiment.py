@@ -2485,8 +2485,8 @@ def audit_repository_for_post_validation(data_root: Path, output_dir: Path, reco
         "script/script_experiment/rtmdet_rtmpose_experiment.py",
         "script/script_experiment/evaluate_face_detections.py",
         "script/script_experiment/visualize_detections.py",
-        "scripts_YOLO/convert_annotations_to_yolo_pose.py",
-        "scripts_YOLO/check_yolo_pose_dataset.py",
+        "scripts/convert_face_annotations.py",
+        "scripts/check_face_pose_dataset.py",
     ]
     checkpoint_candidates = sorted(
         [path.as_posix() for path in (output_dir / "logs").glob("**/*.pth")]

@@ -12,10 +12,10 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check a YOLO Pose dataset for face pose training.")
+    parser = argparse.ArgumentParser(description="Check shared face dataset compatibility labels.")
     parser.add_argument("--data-root", type=Path, default=Path("datasets/face_pose"))
     parser.add_argument("--yaml", type=Path, default=Path("datasets/face_pose/face_pose.yaml"))
-    parser.add_argument("--output", type=Path, default=Path("outputs_exoeriment/yolo_pose_baseline_v001/pretrain_dataset_check.json"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/dataset_checks/face_pose/pretrain_dataset_check.json"))
     return parser.parse_args()
 
 

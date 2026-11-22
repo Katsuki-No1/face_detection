@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts_YOLO.evaluate_yolo_pose_metrics import (  # noqa: E402
+from src.evaluation.legacy_face_pose import (  # noqa: E402
     bbox_iou,
     greedy_matches,
     image_paths,

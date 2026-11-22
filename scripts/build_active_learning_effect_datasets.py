@@ -27,10 +27,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from script.script_data.export_face_keypoints_deim_dino import (  # noqa: E402
     export_deim_dino,
 )
-from scripts_YOLO.convert_annotations_to_yolo_pose import (  # noqa: E402
-    load_records_from_zip,
-    yolo_line_for_face,
-)
+from src.data.face_annotations import load_records_from_zip  # noqa: E402
+from src.data.face_pose_labels import normalized_pose_line_for_face  # noqa: E402
+from src.data.keypoint_side_assignment import LEGACY_POLICY  # noqa: E402
 
 
 class DatasetBuildError(RuntimeError):
@@ -171,11 +170,12 @@ def training_eligibility(record: dict[str, Any]) -> tuple[bool, list[str]]:
     face_bboxes = [face["bbox"] for face in faces]
     reasons: list[str] = []
     for face_index, face in enumerate(faces):
-        line, object_metadata = yolo_line_for_face(
+        line, object_metadata = normalized_pose_line_for_face(
             record,
             face,
             face_bboxes,
             face_index,
+            side_policy=LEGACY_POLICY,
         )
         if line is not None:
             return True, []
@@ -324,11 +324,12 @@ def _extra_metadata_record(
     if faces:
         face_bboxes = [face["bbox"] for face in faces]
         for face_index, face in enumerate(faces):
-            line, object_metadata = yolo_line_for_face(
+            line, object_metadata = normalized_pose_line_for_face(
                 record,
                 face,
                 face_bboxes,
                 face_index,
+                side_policy=LEGACY_POLICY,
             )
             object_metadata["face_index"] = face_index
             if line is None:

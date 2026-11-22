@@ -6,7 +6,6 @@ import gc
 import hashlib
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -28,8 +27,6 @@ from keypoint_comparison1.landmark_detection.model import (  # noqa: E402
 )
 from keypoint_comparison2.common_evaluation import (  # noqa: E402
     CommonKeypointMetrics,
-    bbox_iou,
-    greedy_bbox_matches,
     normalized_to_original,
 )
 from keypoint_comparison2.config import (  # noqa: E402
@@ -45,12 +42,6 @@ from keypoint_comparison2.training import (  # noqa: E402
     best_checkpoint_path,
     load_trained_model,
 )
-from scripts_YOLO.evaluate_yolo_pose_metrics import (  # noqa: E402
-    result_predictions as yolo_result_predictions,
-)
-from scripts_YOLO.yolo26_pose.inference import (  # noqa: E402
-    iter_batched_image_predictions,
-)
 
 
 LANDMARK_MODELS = (
@@ -64,7 +55,7 @@ TOPDOWN_MODELS = (
     "dinov3_orformer_rtmcc",
     *LANDMARK_MODELS,
 )
-ALL_MODELS = (*TOPDOWN_MODELS, "yolo26m_pose")
+ALL_MODELS = TOPDOWN_MODELS
 DISPLAY_NAMES = {
     "rtmpose_face5": "RTMPose Face5",
     "dinov3_fpn_rtmcc": "DINOv3-FPN-RTMCC",
@@ -72,7 +63,6 @@ DISPLAY_NAMES = {
     "vitpose_376": "DINOv3 ViTPose-376",
     "query": "DINOv3 Query",
     "query_refinement": "DINOv3 Query Refinement",
-    "yolo26m_pose": "YOLO26m Pose (legacy v2)",
 }
 
 
@@ -130,18 +120,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument(
-        "--yolo-weights",
-        type=Path,
-        default=(
-            REPO_ROOT
-            / "runs/yolo/yolo26_pose/face_pose_drive_v2/"
-            "yolo26m_pose_full/weights/best.pt"
-        ),
-    )
-    parser.add_argument("--yolo-input-size", type=int, default=960)
-    parser.add_argument("--yolo-score-threshold", type=float, default=0.38)
-    parser.add_argument("--matching-iou-threshold", type=float, default=0.50)
-    parser.add_argument(
         "--output-dir",
         type=Path,
         default=(
@@ -174,11 +152,6 @@ def resolve_image(image_root: Path, file_name: str) -> Path:
     raise FileNotFoundError(
         f"Could not resolve {file_name!r} below {image_root}"
     )
-
-
-def xywh_to_xyxy(box: Sequence[float]) -> list[float]:
-    x, y, width, height = (float(value) for value in box)
-    return [x, y, x + width, y + height]
 
 
 def model_parameters(model: torch.nn.Module) -> int:
@@ -492,36 +465,6 @@ def evaluate_topdown(
     return result
 
 
-def coco_ground_truth(
-    annotation_path: Path,
-) -> tuple[
-    dict[int, dict[str, Any]],
-    dict[int, list[dict[str, Any]]],
-]:
-    coco = read_json(annotation_path)
-    images = {int(row["id"]): row for row in coco.get("images", [])}
-    annotations: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for row in coco.get("annotations", []):
-        if int(row.get("category_id", -1)) == 2:
-            annotations[int(row["image_id"])].append(row)
-    return images, annotations
-
-
-def yolo_training_epochs(weights: Path) -> dict[str, int | None]:
-    run_dir = weights.parent.parent
-    results_path = run_dir / "results.csv"
-    if not results_path.is_file():
-        return {"checkpoint_epoch": None, "completed_epoch": None}
-    with results_path.open("r", encoding="utf-8", newline="") as stream:
-        rows = list(csv.DictReader(stream))
-    completed = int(float(rows[-1]["epoch"])) if rows else None
-    return {
-        # Ultralytics strips optimizer/epoch metadata from best.pt.
-        "checkpoint_epoch": None,
-        "completed_epoch": completed,
-    }
-
-
 def evaluation_image_hashes(
     annotation_path: Path,
     image_root: Path,
@@ -563,9 +506,6 @@ def leakage_audit(
             REPO_ROOT
             / "outputs/dataset_cache/face_pose_current/images/train"
         ),
-        "legacy_yolo_v2_train": (
-            REPO_ROOT / "datasets/face_pose_drive_v2/images/train"
-        ),
     }
     overlaps: dict[str, int] = {}
     for name, directory in training_directories.items():
@@ -577,212 +517,6 @@ def leakage_audit(
         "hash_algorithm": "sha256",
         "training_image_overlap": overlaps,
     }
-
-
-def evaluate_yolo(
-    *,
-    annotation_path: Path,
-    image_root: Path,
-    device: torch.device,
-    weights: Path,
-    input_size: int,
-    batch_size: int,
-    score_threshold: float,
-    matching_iou_threshold: float,
-    output_dir: Path,
-) -> dict[str, Any]:
-    try:
-        from ultralytics import YOLO
-    except ImportError as error:
-        raise RuntimeError("YOLO26m evaluation requires ultralytics") from error
-
-    images_by_id, annotations_by_image = coco_ground_truth(annotation_path)
-    image_rows = sorted(
-        images_by_id.values(),
-        key=lambda row: str(
-            resolve_image(image_root, str(row["file_name"]))
-        ),
-    )
-    image_paths = [
-        resolve_image(image_root, str(row["file_name"]))
-        for row in image_rows
-    ]
-    image_id_by_path = {
-        resolve_image(image_root, str(row["file_name"])): int(row["id"])
-        for row in image_rows
-    }
-    model = YOLO(str(weights), task="pose")
-    parameter_count = model_parameters(model.model)
-    metrics = CommonKeypointMetrics()
-    true_positive = false_positive = false_negative = 0
-    prediction_dir = output_dir / "predictions"
-    prediction_dir.mkdir(parents=True, exist_ok=True)
-    prediction_path = prediction_dir / "yolo26m_pose.jsonl"
-
-    predictions = iter_batched_image_predictions(
-        model,
-        image_paths,
-        imgsz=input_size,
-        conf=0.001,
-        device=str(device),
-        batch_size=batch_size,
-        max_det=100,
-    )
-    with prediction_path.open("w", encoding="utf-8") as prediction_stream:
-        for image_path, raw_result in predictions:
-            image_id = image_id_by_path[image_path.resolve()]
-            all_annotations = annotations_by_image.get(image_id, [])
-            eligible: list[dict[str, Any]] = []
-            ignored_boxes: list[list[float]] = []
-            for annotation in all_annotations:
-                values = np.asarray(
-                    annotation.get("keypoints", [0.0] * 15),
-                    dtype=np.float64,
-                ).reshape(5, 3)
-                if bool((values[:, 2] > 0).any()):
-                    eligible.append(annotation)
-                else:
-                    ignored_boxes.append(xywh_to_xyxy(annotation["bbox"]))
-            for annotation in eligible:
-                values = np.asarray(
-                    annotation["keypoints"],
-                    dtype=np.float64,
-                ).reshape(5, 3)
-                metrics.register_ground_truth(values[:, 2] > 0)
-
-            selected_predictions = [
-                row
-                for row in yolo_result_predictions(raw_result)
-                if float(row["score"]) >= score_threshold
-            ]
-            gt_boxes = [
-                xywh_to_xyxy(annotation["bbox"])
-                for annotation in eligible
-            ]
-            prediction_boxes = [
-                row["bbox"] for row in selected_predictions
-            ]
-            matched, missed, extra = greedy_bbox_matches(
-                gt_boxes,
-                prediction_boxes,
-                iou_threshold=matching_iou_threshold,
-            )
-            extra = [
-                prediction_index
-                for prediction_index in extra
-                if not any(
-                    bbox_iou(
-                        prediction_boxes[prediction_index],
-                        ignored_box,
-                    )
-                    >= matching_iou_threshold
-                    for ignored_box in ignored_boxes
-                )
-            ]
-            true_positive += len(matched)
-            false_negative += len(missed)
-            false_positive += len(extra)
-            match_rows: list[dict[str, Any]] = []
-            for gt_index, prediction_index, overlap in matched:
-                annotation = eligible[gt_index]
-                prediction = selected_predictions[prediction_index]
-                values = np.asarray(
-                    annotation["keypoints"],
-                    dtype=np.float64,
-                ).reshape(5, 3)
-                predicted_keypoints = np.asarray(
-                    [
-                        [point["x"], point["y"]]
-                        for point in prediction["keypoints"]
-                    ],
-                    dtype=np.float64,
-                )
-                visibility_probability = np.asarray(
-                    [
-                        (
-                            float(point["score"])
-                            if point["score"] is not None
-                            else 0.0
-                        )
-                        for point in prediction["keypoints"]
-                    ],
-                    dtype=np.float64,
-                )
-                metric_row = metrics.update(
-                    predicted_keypoints,
-                    values[:, :2],
-                    values[:, 2] > 0,
-                    values[:, 2] > 1,
-                    visibility_probability,
-                    gt_boxes[gt_index],
-                )[0]
-                match_rows.append(
-                    {
-                        "annotation_id": int(annotation.get("id", -1)),
-                        "prediction_index": int(prediction_index),
-                        "iou": float(overlap),
-                        "bbox_xyxy": gt_boxes[gt_index],
-                        "predicted_keypoints": predicted_keypoints.tolist(),
-                        "target_keypoints": values[:, :2].tolist(),
-                        "labeled": (values[:, 2] > 0).tolist(),
-                        "visible": (values[:, 2] > 1).tolist(),
-                        "visibility_probability": (
-                            visibility_probability.tolist()
-                        ),
-                        **metric_row,
-                    }
-                )
-            prediction_stream.write(
-                json.dumps(
-                    {
-                        "image_id": image_id,
-                        "file_name": str(images_by_id[image_id]["file_name"]),
-                        "score_threshold": score_threshold,
-                        "predictions": selected_predictions,
-                        "matches": match_rows,
-                        "missed_annotation_ids": [
-                            int(eligible[index].get("id", -1))
-                            for index in missed
-                        ],
-                        "false_positive_prediction_indices": extra,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
-    precision = true_positive / max(1, true_positive + false_positive)
-    recall = true_positive / max(1, true_positive + false_negative)
-    result = {
-        "model_key": "yolo26m_pose",
-        "model": DISPLAY_NAMES["yolo26m_pose"],
-        "family": "bottom_up_end_to_end",
-        "input_mode": "full frame",
-        "input_size": input_size,
-        "parameters": parameter_count,
-        "checkpoint": str(weights),
-        "checkpoint_sha256": sha256_file(weights),
-        "prediction_file": str(prediction_path),
-        "training_dataset": "face_pose_drive_v2 (legacy, not balanced_811)",
-        "score_threshold": score_threshold,
-        "matching_iou_threshold": matching_iou_threshold,
-        "detector_true_positive": true_positive,
-        "detector_false_positive": false_positive,
-        "detector_false_negative": false_negative,
-        "detector_precision": precision,
-        "detector_recall": recall,
-        "detector_f1": (
-            2.0 * precision * recall
-            / max(1.0e-8, precision + recall)
-        ),
-        **yolo_training_epochs(weights),
-        **metrics.compute(),
-    }
-    del model
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    return result
 
 
 def format_float(
@@ -874,10 +608,6 @@ def visibility_markdown_report(
         )
     lines.extend(
         [
-            "For YOLO26m, visibility/occlusion metrics use matched keypoints "
-            "only. Missed faces are reflected in Coverage and E2E PCK, not "
-            "in this classification matrix.",
-            "",
             landmark_visibility_note(results),
             "",
         ]
@@ -927,9 +657,7 @@ def markdown_report(
         (
             "- train-image SHA-256 overlap: "
             f"balanced-811="
-            f"{protocol['leakage_audit']['training_image_overlap']['balanced_811_train']}, "
-            f"legacy YOLO v2="
-            f"{protocol['leakage_audit']['training_image_overlap']['legacy_yolo_v2_train']}"
+            f"{protocol['leakage_audit']['training_image_overlap']['balanced_811_train']}"
         ),
         "- coordinate mask: COCO visibility `v > 0`",
         "- visibility target: `v > 1`, evaluated only where `v > 0`",
@@ -979,12 +707,6 @@ def markdown_report(
         )
     lines.extend(
         [
-            "",
-            "YOLO26m is an end-to-end full-frame reference. Its conditional "
-            "NME/PCK use matched faces only; Coverage and E2E PCK include "
-            "missed faces. The available weight was trained on the legacy "
-            "`face_pose_drive_v2`, because the balanced-811 YOLO26m run has "
-            "no trained checkpoint.",
             "",
             "Rows with a nonzero train-image overlap are reported for audit "
             "only and must not be used for ranking.",
@@ -1158,22 +880,6 @@ def main() -> int:
                 f"{result['reused_from']}",
                 flush=True,
             )
-        elif model_name == "yolo26m_pose":
-            if not args.yolo_weights.is_file():
-                raise FileNotFoundError(
-                    f"YOLO26m weight not found: {args.yolo_weights}"
-                )
-            result = evaluate_yolo(
-                annotation_path=annotation_path,
-                image_root=image_root,
-                device=device,
-                weights=args.yolo_weights.resolve(),
-                input_size=args.yolo_input_size,
-                batch_size=min(args.batch_size, 8),
-                score_threshold=args.yolo_score_threshold,
-                matching_iou_threshold=args.matching_iou_threshold,
-                output_dir=args.output_dir,
-            )
         else:
             result = evaluate_topdown(
                 model_name,
@@ -1187,11 +893,7 @@ def main() -> int:
                 num_workers=args.num_workers,
                 output_dir=args.output_dir,
             )
-        training_overlap_key = (
-            "legacy_yolo_v2_train"
-            if model_name == "yolo26m_pose"
-            else "balanced_811_train"
-        )
+        training_overlap_key = "balanced_811_train"
         result["evaluation_train_image_overlap"] = int(
             split_leakage_audit["training_image_overlap"][
                 training_overlap_key
