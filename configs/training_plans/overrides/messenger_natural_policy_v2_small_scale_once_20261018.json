@@ -1,0 +1,23 @@
+{
+  "schema": "single-experiment-quality-override-v1",
+  "authorization_date": "2026-10-18",
+  "override_id": "messenger_natural_policy_v2_small_scale_once_20261018",
+  "target_config": "configs/training_plans/messenger_natural_policy_v2.json",
+  "target_config_sha256": "13833f63f93ec9fe341fd5c2bdd0f1276a2aec701b7d459a4114b0693d7893f0",
+  "target_gate_run_id": "messenger_natural_policy_v2_small_scale_20261018",
+  "stage": "small_scale",
+  "scope": "this named fresh gate run only; not inherited by other runs or future configurations",
+  "metric": "conditional_semantic_macro_f1_nme_0.10",
+  "split": "val",
+  "reference": "same-run epoch0 full conditional validation before any update",
+  "candidate": "best completed subsequent validation under the same metric, split and thresholds",
+  "criterion": "candidate > reference",
+  "minimum_delta_exclusive": 0.0,
+  "ties_pass": false,
+  "require_finite": true,
+  "require_identical_validation_contract": true,
+  "automatic_application": false,
+  "historical_results_reclassified": false,
+  "unchanged": ["schema/gpu_step/overfit requirements", "small-scale sample/update/validation budget", "composition distribution and severity constraints", "OOM and GPU safety", "early-stopping min_delta", "F1 best checkpoint selection", "g diagnostics", "production ordering and remaining gates"],
+  "integration_status": "explicit override contract; policy-v2 fresh small-scale runner/production integration remains pending"
+}

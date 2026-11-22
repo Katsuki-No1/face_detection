@@ -1,0 +1,634 @@
+schema_version: messenger-geometry-prior-plan-v1
+architecture: messenger_geometry_prior_v1
+status: nine_productions_and_common_evaluations_complete_full_reports_pending
+enabled: true
+runnable: true
+design: docs/messenger_geometry_prior_design.md
+implementation: keypoint_comparison1/landmark_detection/geometry_prior_recovery.py
+preparation: scripts/prepare_messenger_geometry_priors.py
+authorization: User requested scheduling the implemented adversarial model family on 2026-10-11; production requires
+  integration and four fresh authenticated gates.
+deployment:
+  type: ordered_cascade
+  stages:
+  - full_image_face_ellipse
+  - face_crop_dino
+  - messenger_recovery_with_geometry_prior_fusion
+  - query_refinement
+  external_head: false
+  auxiliary_inference_branch: frozen_crop_dino_for_prior_observation
+  discriminator: training_only
+comparison:
+  first: existing_messenger_matched_control_vs_k1_to_k7_no_adversarial
+  second: validation_selected_prior_without_vs_with_adversarial
+  k_candidates:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  baseline_role: local_existing_messenger_matched_control_not_global_reference
+  same_init_data_augmentation_budget_task_loss: true
+  test_selection: prohibited
+prior:
+  source: audited_clean_train_predicted_ellipse_roi_features
+  fitting: deterministic_kmeans_pp_on_channel_standardized_spatial_features
+  seed: 42
+  max_iterations: 100
+  kmeans_feature_normalization: l2_flattened_map
+  routing: nearest_standardized_geometry_cluster_mean
+  geometry:
+  - log_relative_major_diameter
+  - log_major_minor_ratio
+  - eccentricity_sin_2theta
+  - eccentricity_cos_2theta
+  geometry_temperature_diagnostic: 1.0
+  major_diameter_scale_denominator: sqrt_source_image_width_times_height
+  theta: clockwise_image_x_axis_radians_modulo_pi_after_augmentation
+  observation_backbone: frozen_authenticated_copy_of_initial_student_backbone
+  calibration: disjoint_source_video_subset_of_train
+  score: channel_pearson_correlation_divided_by_one_plus_standardized_mean_l1
+  threshold: cluster_and_position_lower_quantile
+  initial_lower_quantile: 0.05
+  channel_scale_floor: 0.05
+  geometry_scale_floor: 0.1
+  values_status: provisional_implementation_defaults_not_validation_selected
+  missing_keypoints: not_automatically_clean_or_occluded
+mask:
+  support: predicted_face_ellipse_in_crop_feature_grid
+  connectivity: 4
+  initial_minimum_component_fraction: 0.05
+  denominator: ellipse_support_cells
+  face_decision: at_least_one_component_at_or_above_fraction
+  local_fusion: retains_smaller_anomalous_regions_even_without_face_flag
+  differentiable: false
+fusion:
+  formula: Y = X + mask * messenger_adoption_gate * sigmoid(channel_parameter) * (R - X)
+  channel_parameter_initial: 0.0
+  visible_identity: exact
+  warmup: preserve_parent_mixing_enabled_switch
+loss:
+  task: caller_existing_LandmarkLoss
+  paired_reconstruction_initial_weight: 0.1
+  paired_teacher: same_target_same_geometry_clean_crop_fixed_observer
+  adversarial_initial_weight: 0.01
+  adversarial_initially_enabled: false
+  discriminator: spatial_conditional_on_visible_context_geometry_and_mask
+  generator_objective: task_plus_paired_candidate_and_fused_smooth_l1_plus_optional_non_saturating_gan
+  discriminator_objective: logistic_real_fake_on_predicted_mask
+  keypoint_gradient_targets:
+  - student_backbone
+  - messenger_generator
+  - fusion
+  - keypoint_head
+  discriminator_keypoint_gradient: false
+  optimizers: separate_generator_and_discriminator
+future_production_requirements:
+  gates:
+  - schema
+  - gpu_step
+  - overfit
+  - small_scale
+  microbatch_candidates:
+  - 4
+  - 8
+  - 16
+  effective_batch: 64
+  seed: 42
+  runtime_oom_fallback: required
+  wandb: required
+  max_epochs: 40
+  warmup_epochs: 5
+  flat_epochs: 5
+  validation_every_epoch: true
+  selection: conditional_semantic_macro_f1_nme_0.10
+  presence_threshold: 0.7
+  minimum_epoch: 10
+  patience: 5
+  min_delta: 0.0001
+  checkpoints: last_and_best_only_after_success
+  common_evaluation: validation_then_validation_locked_test_with_required_tables_and_failure_review
+schedule:
+  integration_after_production: continuous_recovery_abc_b_real_face_w48_s2_production_train
+  user_order_20261012: Complete real-face Messenger training first, then production/WandB integration, isolated4/8/16
+    preflight, per-arm four gates/queue, common evaluation and validation-only k selection before adversarial.
+  plan_id: messenger_geometry_prior_adversarial_20261011
+  canonical_queue: configs/training_queues/pending_models_tests_then_training.yaml
+  after_existing_production_group:
+  - continuous_recovery_abc_a_production_train
+  - continuous_recovery_abc_b_texture_production_train
+  - continuous_recovery_abc_b_object_production_train
+  - continuous_recovery_abc_c1_production_train
+  - continuous_recovery_abc_c2_production_train
+  - continuous_recovery_abc_c3_production_train
+  priority: after_existing_authorized_followup_training
+  phases:
+  - integrate_production_trainer_observer_fusion_and_two_optimizers
+  - prepare_authenticated_train_only_priors_and_disjoint_train_video_calibration
+  - matched_control_and_k1_to_k7_four_independent_gates
+  - matched_control_and_k1_to_k7_contiguous_production
+  - validation_only_k_selection_and_frozen_selection_manifest
+  - selected_k_adversarial_four_fresh_gates
+  - selected_k_adversarial_production
+  - validation_comparison_then_locked_test_and_full_reports
+  selection_manifest: outputs/landmark_detection/messenger_geometry_prior/selection/validation_selected_k.json
+  k_selection_metric: conditional_semantic_macro_f1_nme_0.10
+  k_selection_tiebreak: smaller_k
+  compare_adversarial_to: identical_selected_k_no_adversarial_arm
+  no_automatic_promotion: true
+  failed_arm_policy: skip_failed_dependencies_and_continue_independent_arms_without_relaxation
+  required_per_arm_gates:
+  - schema
+  - gpu_step
+  - overfit
+  - small_scale
+  required_per_arm_evaluation_splits:
+  - val
+  - test
+  execution_barriers:
+  - End-to-end production trainer integration is unfinished; research components alone are not executable training.
+  - Bind train-only prior/observer/calibration artifacts, configs and code to fresh gate identities.
+  - Include both optimizers and GAN AMP path in repeated-step GPU probes, checkpoint resume and OOM fallback.
+  - Compare common initialization, augmentation and loss budget; D must never receive keypoint gradients.
+  - Lock selected k on validation before constructing the adversarial arm; never select on test.
+  arms:
+  - architecture: messenger_geometry_prior_control_seed42
+    k: null
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/control
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 1
+    production_best_value: 0.8844183278499888
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/control/evaluation/val/baseline_aligned/success.json
+        marker_sha256: cfdba59c6986be2cf2f2e5d3b88c212e2e0e5810eba1c9b839021508f2890560
+        metrics_sha256: 2a35106a26ed7a6198fc8cf8d6802284441012b1132543defb8db835446298a9
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/control/evaluation/test/baseline_aligned/success.json
+        marker_sha256: 1ecc902c70e1fe3fc88eae58f49c45698c16be26ec79805a39c8a68feeb658d7
+        metrics_sha256: 794d394a67280755f5f1b571686385b173f35a67caa0d47b34511a21fabf4353
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k1_seed42
+    k: 1
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k1
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 5
+    production_best_value: 0.8849971431098738
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k1/evaluation/val/baseline_aligned/success.json
+        marker_sha256: e981dca5c6b765450ded8d1fdadad0c52944f063c7fd546f7a21e0d7e98d657d
+        metrics_sha256: 32bc2793365b67acbb4b6dedeea350a321d4420ebb5eab87ef4b142b31a2fec6
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k1/evaluation/test/baseline_aligned/success.json
+        marker_sha256: feb5be98565cb63029b9f10cbd9366a4be165ecc554a27d814cf248f27ff1988
+        metrics_sha256: c865c415f256d13cf3e2a7a7fe07e85f73ca47104583140ee590ac7de89bcacd
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k2_seed42
+    k: 2
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k2
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 12
+    production_best_value: 0.8844343053567065
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k2/evaluation/val/baseline_aligned/success.json
+        marker_sha256: a9923e0a7652268bc29c9adb2cbed68b1e9932471cb96db60f451b65f6d50d9d
+        metrics_sha256: da528a3d679a64908f746741959c9695279afe5b7c0718434fa0ef1edb5364d5
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k2/evaluation/test/baseline_aligned/success.json
+        marker_sha256: bcc56ecdba78501d1803d90e643e59cdc32cd8ea88179b7fbcf289e43cb1c3ca
+        metrics_sha256: 9fb6d96b3da922a91b54cf2b173b0ae9924b78bf1aff2924d336337e832e0fea
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k3_seed42
+    k: 3
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k3
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 19
+    production_best_value: 0.8875939582315855
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k3/evaluation/val/baseline_aligned/success.json
+        marker_sha256: 2f8c6dfb64ae18b1466999a06dd72d33ef298cb54431ebe332e76b8510fd240b
+        metrics_sha256: a13875fddfa2cff66f3986c150713d8a16cde6e04a05f4ea0ae703c9d6e86d49
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k3/evaluation/test/baseline_aligned/success.json
+        marker_sha256: 61c2c36222ede6435953a6d6067bc1190b79906f478c3f91f7f8017000d7c756
+        metrics_sha256: 8ba63af956b0eb16236d3029b0b52b37d536a09ba932624c90c6150e9573cb7a
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k4_seed42
+    k: 4
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k4
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 3
+    production_best_value: 0.8870853588795619
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k4/evaluation/val/baseline_aligned/success.json
+        marker_sha256: 101ce8e454050a411a70f48699600c078a934552bb5f451de697d980d145e741
+        metrics_sha256: 26f343e469d29e659ddda5e0bef3b89e3aa6198c16f8d3a056150ad07129a0b0
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k4/evaluation/test/baseline_aligned/success.json
+        marker_sha256: e9b999620dfed9b0d3ac3f2f4b2896bc76ab0e53eeb0297b9102ccdada43ed3e
+        metrics_sha256: f8c009dcc672ba74e3e1f57dd5b4e6eb23b01ca827a5f1c3d0a37660da53b075
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k5_seed42
+    k: 5
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k5
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 6
+    production_best_value: 0.8841659793127686
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k5/evaluation/val/baseline_aligned/success.json
+        marker_sha256: 733e8d5530e5d834d72a00bba69432472c2be20a4fdb34d1bae81b4f2cc1328e
+        metrics_sha256: 8169091faa415ea80555766c81a7ba8ce057013b4e8cc6d1a26ba2ab61a5e86a
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k5/evaluation/test/baseline_aligned/success.json
+        marker_sha256: 38e879b9837c078bcfcd4c5196253d893e451af0ba835eb7147df07866d13323
+        metrics_sha256: 958f46efffd3aee50a43e53146029edc31e32b7a42e026c1282cb4d952facbee
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k6_seed42
+    k: 6
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k6
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 1
+    production_best_value: 0.8851192879211801
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k6/evaluation/val/baseline_aligned/success.json
+        marker_sha256: c3999787152cd659f2df5e4d82e6b7b479b7585fef81a067a35afa733af7b27d
+        metrics_sha256: fcf75ba1659cbe98611b2011ea80367bfca4791869e49735e67352ca8cf7085a
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k6/evaluation/test/baseline_aligned/success.json
+        marker_sha256: 153b71abb15e99f4192096df74bd971bd491f50d195ac5bcdc4ce38f247c8787
+        metrics_sha256: ad9cdfa95cc956d6b4da9aafa3beb7036d30fb1ea97774edac7e43ccf8e688b6
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_k7_seed42
+    k: 7
+    adversarial: false
+    status: production_completed
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/k7
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    production_best_epoch: 3
+    production_best_value: 0.8859995727006533
+    evaluation_status:
+      val:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k7/evaluation/val/baseline_aligned/success.json
+        marker_sha256: 16e0e67cf9a7db24443b22bd492d475fc195a67334d7a3bd405e2c91fd33bba0
+        metrics_sha256: dec0f0aa33a4f5a71ba551c6bf064d8636ffbb1c138d42aaab6425cec0adce55
+        inventory_verified: true
+      test:
+        status: success
+        marker: outputs/landmark_detection/messenger_geometry_prior/k7/evaluation/test/baseline_aligned/success.json
+        marker_sha256: 55584fa57edd635dfe4ed9776012866b2559c9de0345c6e9a9e3f28983d3553d
+        metrics_sha256: 2c4f99da4badfc93142f3f4e26ff3226231e0e09aa532c977827f7345c0bb1bd
+        inventory_verified: true
+  - architecture: messenger_geometry_prior_selected_k_adversarial_seed42
+    k: validation_selected
+    adversarial: true
+    status: registered_pending_launcher_diagnostic_preflight_four_gates
+    runnable: true
+    output_root: outputs/landmark_detection/messenger_geometry_prior/selected_k_adversarial
+    gates:
+    - schema
+    - gpu_step
+    - overfit
+    - small_scale
+    selected_k: 3
+  selection_implementation: scripts/select_messenger_geometry_prior_k.py
+  selection_job: messenger_geometry_prior_validation_selection_report
+training_data:
+  version: canonical_face_pose_drive_v2_balanced_811
+  annotations: outputs/dataset_cache/face_pose_drive_v2_balanced_811/annotations/face_dino_v1
+  split_inventory:
+    train:
+      groups: 44
+      images: 4237
+      heads: 7129
+    val:
+      groups: 6
+      images: 530
+      heads: 882
+    test:
+      groups: 6
+      images: 528
+      heads: 806
+  priors_and_supervision: train_only
+  selection: val_only
+initialization:
+  parent_training_config: keypoint_comparison1/configs/continuous_recovery_abc_a.yaml
+  checkpoint: outputs/landmark_detection/dinov3_vits16_face_pose_drive_v2_balanced_811_gt_ellipse_long_axis_square_coco_visibility_landmark_occlusion/query_refinement/checkpoints/best_nme.pt
+  expected_sha256: baf7a6d0b1df6d1089357b2f28ffc1b2da3aadbb6239bae2cb5085d36ef016e0
+  requirement: Authenticate common tensors and observer identity during preparation; no optimizer resume or automatic
+    use of v3-trained weights.
+input_integration_20261012:
+  status: predicted_geometry_dataset_adapter_implemented
+  implementation: keypoint_comparison1/landmark_detection/geometry_prior_inputs.py
+  dataset_option: geometry_prior_grid_size
+  default: disabled_existing_paths_unchanged
+  prediction_contract: require_actual_matched_FACE_prediction_no_GT_or_HEAD_fallback
+  geometry: source_major_diameter_over_sqrt_image_area_and_source_axis_ratio_with_crop_frame_major_axis_angle_after_affine_and_flip
+  feature_support: inverse_map_feature_cell_centers_to_source_predicted_ellipse
+  verification: 31 CPU tests passed including actual predicted-cache dataset, rotation/reflection, missing prediction
+    rejection, disabled-path identity and existing prior recovery tests
+  training: not_run
+  runnable: false
+  remaining:
+  - Authenticate predicted train caches, define and audit clean prior eligibility, freeze disjoint train-video calibration
+    partition.
+  - Connect model factory and forward, frozen observer, prior fitting, matched control and k1..7 configs.
+  - Integrate separate G/D optimizers, AMP/accumulation, faithful resume and runtime OOM recovery.
+  - Fresh schema/gpu_step/overfit/small_scale and canonical executable registrations before production.
+clean_inventory_integration_20261012:
+  status: train_membership_and_disjoint_video_partition_prepared
+  implementation: scripts/prepare_messenger_prior_inventory.py
+  artifact: outputs/landmark_detection/messenger_geometry_prior/preparation/clean_train_inventory_20261012.json
+  artifact_sha256: ab01edd75813ec9c0aaa51b5c94ad76b098a94baedaa3ea300254d2ed276846f
+  clean_eligibility: Explicit contour-unoccluded, all five states2, finite in-image keypoints and valid FACE geometry;
+    unknown flags or missing states are excluded.
+  counts:
+    source_face_annotations: 6529
+    clean_records: 2550
+    fit_records: 2036
+    calibration_records: 514
+  partition: Seed42 SHA256-ranked eligible TRAIN video IDs; first ceil(20 percent) for calibration; never use val/test
+    to choose membership.
+  features: completed; 2546 matched predicted crops; original 2550-record eligibility inventory retained
+  fitting_guard: Feature-cache records must match this inventory by ID and video, bind its SHA256, and retain the
+    frozen fit/calibration membership.
+  verification: 47 CPU tests passed; no model gates or training executed.
+  training: not_run
+  runnable: false
+feature_preparation:
+  implementation: scripts/extract_messenger_geometry_features.py
+  scope: Train-only preparation; no production training or model gate success.
+  output: outputs/landmark_detection/messenger_geometry_prior/preparation/predicted_features_20261012
+  detector_role: Inherited matched-control ABC-A detector, pinned independently of the newly promoted V3 baseline.
+  detector_checkpoint_sha256: 8fa78596fabb31e1daba7594cadd8eec48979f73563b51fed5921145d960e013
+  detector_config_sha256: a5b5231c329db916aa756cd6df6ca0784dccaa4933f43ffa44368493e68e0116
+  threshold: 0.33
+  threshold_source: Fixed parent ABC-A configuration; no preparation selection on train or test.
+  prediction_cap: 100
+  observer: EMA backbone of the already pinned initial Query checkpoint; no use of trained ABC outputs.
+  crop: Predicted FACE ellipse long-axis-square scale1.25, input256, deterministic no augmentation; post-crop five-visible
+    eligibility required.
+  extraction: Full canonical train inference, one-to-one bbox IoU0.50 crop assignment, frozen observer float32 grid384x16x16.
+  storage_budget: One train prediction cache, one approximately1GiB float32 feature cache, seven small prior banks;
+    no epoch cache history.
+  resume: Completed stages require exact input/code/artifact hashes; unverified partial outputs stop for inspection.
+  production_runnable: false
+  status: completed_authenticated_not_model_gate
+  result: outputs/landmark_detection/messenger_geometry_prior/preparation/predicted_features_20261012/preparation_complete.json
+  inventory_coverage:
+    clean_records: 2550
+    cached_records: 2546
+    uncached_record_ids:
+    - '3726'
+    - '3742'
+    - '3763'
+    - '3824'
+  prepared_k:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  runtime_compatibility: outputs/training_queues/pending_models_tests_then_training/prior_preparation_runtime_compatibility_20261012.json
+runtime_integration_20261012:
+  status: epoch_validation_checkpoint_integration_checked_production_launcher_pending
+  implementation: keypoint_comparison1/landmark_detection/geometry_prior_training.py
+  probe: scripts/probe_messenger_prior_runtime.py
+  scope: Opt-in update/checkpoint runtime only; nine production arms remain not runnable.
+  update_order: Accumulate G and D at same pre-update D; joint finite-gradient check before both optimizer commits.
+  observer: FP32 under student AMP; observer and prior bank copied bitwise in EMA.
+  resume: G/D/EMA/scaler/epoch/step/RNG/schedulers/loader RNG; reject changed contract.
+  oom: Replay pre-commit OOM with smaller microbatch and same effective window; partial optimizer commit requires
+    complete checkpoint restore.
+  verification: 63 CPU tests passed; after lazy AMP OOM fix, 35 affected tests passed again. Real-data CUDA 4/8/16
+    repeated updates, injected first-forward OOM replay, exact checkpoint-state restore and finite next update passed.
+  training: not run
+  remaining:
+  - Authenticated per-arm production configs and CLI including online W&B run/resume binding
+  - Production full-path isolated preflight4/8/16 at effective64 with repeated updates and validation timing
+  - Independent current-source schema/gpu_step/overfit/small_scale gates and executable canonical model registrations
+  - Common val/test/report integration and validation-only k selection before adversarial arm
+  result: outputs/landmark_detection/messenger_geometry_prior/runtime_probe_20261012/probe_complete.json
+  result_sha256: cae3e889fc1069c486b347ec27f83b1a2d62ef1adfc8585896331f29fcdf661c
+  checkpoint_resume_limitation: finite_and_same_step; CUDA grid_sample prevents bitwise deterministic continuation
+  next_update_difference:
+    generator_max_abs: 1.1920928955078125e-06
+    discriminator_max_abs: 0.0
+epoch_integration_20261012:
+  status: gpu_epoch_validation_resume_checked_not_model_gate
+  implementation: keypoint_comparison1/landmark_detection/geometry_prior_epochs.py
+  validation: keypoint_comparison1/landmark_detection/geometry_prior_validation.py
+  validation_preparation: outputs/landmark_detection/messenger_geometry_prior/preparation/validation_20261012/preparation_complete.json
+  result: outputs/landmark_detection/messenger_geometry_prior/epoch_probe_20261012/probe_complete.json
+  result_sha256: 421099f5a9d6d978225dc2b1890696923fe3306130de949f7f5fbcd4f0302b6a
+  validation_counts:
+    images: 530
+    native_heads: 882
+    eligible_before_FACE_matching: 787
+    excluded:
+      invalid_or_ambiguous_attributes: 48
+      all_missing: 47
+    matched_eligible_heads: 768
+    unmatched_eligible_heads: 19
+  checkpoint_contract: Last after each validated epoch, best on >1e-4 improvement, one rotating snapshot every5
+    epochs, remove snapshots on genuine completion; exact epoch/optimizer/EMA/step/scaler/scheduler/loader RNG/patience
+    restore.
+  runtime_failure: Any failed epoch, including validation or logging failure after updates, requires restoring the
+    last complete checkpoint; no silent epoch replay.
+  production_policy: Preserve backbone freeze5/warmup5, parent Messenger mixing warmup2, effective64, max40, min10/patience5.
+    Diagnostic used isolated2 epochs with freeze/mixing/warmup1 solely to exercise both branches.
+  wandb: Scalar logger adapter implemented; authenticated production run creation/resume still pending.
+  verification: 71 CPU tests passed; actual GPU effective64 frozen/unfrozen updates, full conditional validation
+    and epoch1->2 resume passed. No formal gate or production training.
+  training: not run
+  runnable: false
+launcher_integration_20261012:
+  implementation: scripts/train_messenger_geometry_prior.py
+  contracts: keypoint_comparison1/landmark_detection/geometry_prior_launch.py
+  configurations: configs/training_plans/messenger_geometry_prior_runs
+  status: online_wandb_and_checkpoint_resume_verified
+  arms: control_and_k1_to_k7_no_adversarial
+  production: not_run_four_gates_required
+  diagnostic: outputs/landmark_detection/messenger_geometry_prior/launcher_check_20261012
+  next: Isolated production4/8/16 preflight, per-arm four gates, canonical production/evaluation registrations,
+    val-only k selection then adversarial launcher.
+isolated_preflight_integration_20261012:
+  status: eight_arm_serial_preflight_completed_authenticated
+  implementation: scripts/preflight_messenger_geometry_prior.py
+  output: outputs/landmark_detection/messenger_geometry_prior/preflight_20261012
+  effective_batch: 64
+  candidates:
+  - 4
+  - 8
+  - 16
+  contract: Each candidate in a fresh process; common128 training samples; full768 conditional val; four joint-backbone/mixing
+    optimizer updates; synchronized second-epoch timing; physical VRAM<=90percent and sampled temperature<83C.
+  production: not_run
+  remaining: Per-arm authenticated schema/overfit/small_scale and formal GPU marker; canonical production/common
+    evaluation integration; val-only k selection and adversarial launcher.
+formal_gate_integration_20261012:
+  status: all_32_formal_gates_passed
+  implementation: scripts/run_messenger_geometry_prior_gate.py
+  queue_snapshot: outputs/training_queues/pending_models_tests_then_training/prior_formal_gates_20261012.yaml
+  preflight: all8arms_all3candidates_safe_selected_micro16_effective64
+  overfit: Fixed4 augmented training examples,12epochs, strictly decreasing total training objective.
+  small_scale: 256training examples,20epochs, production augmentation/model/loss/AMP; full768 conditional validation;
+    best subsequent EMA semantic MacroF1 improvement over epoch0 must exceed1e-4.
+  gate_checkpoint_retention: One best per learning gate; no periodic history.
+  failures: Quality failure skips model production; Python/path/IO errors require repair with evidence.
+  production: eight_arms_registered_runner_started_20261013
+runnable_architectures:
+- messenger_geometry_prior_control_seed42
+- messenger_geometry_prior_k1_seed42
+- messenger_geometry_prior_k2_seed42
+- messenger_geometry_prior_k3_seed42
+- messenger_geometry_prior_k4_seed42
+- messenger_geometry_prior_k5_seed42
+- messenger_geometry_prior_k6_seed42
+- messenger_geometry_prior_k7_seed42
+- messenger_geometry_prior_selected_k_adversarial_seed42
+production_integration_20261013:
+  status: all8production_and16common_evaluations_completed
+  runner_pid: 186322
+  queue_snapshot: outputs/training_queues/pending_models_tests_then_training/prior_production_common_20261013.yaml
+  order:
+  - control
+  - k1
+  - k2
+  - k3
+  - k4
+  - k5
+  - k6
+  - k7
+  microbatch: 16
+  accumulation: 4
+  effective_batch: 64
+  evaluation: scripts/evaluate_messenger_geometry_prior.py
+  evaluation_scope: All predicted FACE crops including unmatched detections; full canonical val then locked test.
+    Separate complete current-V3-baseline comparison and additional report requirements remain pending.
+  verification: 7 focused CPU tests passed; real control/k7 gate EMA GPU adapter probe 4 images /16 predictions
+    each passed; not a production evaluation
+  remaining:
+  - Validation-only k selection after k1..7 completed production
+  - Selected-k adversarial launcher/config/preflight/four gates/common evaluation
+  - Full required per-slice/failure-example/current-V3-baseline comparison report
+  process_wrapper: scripts/run_messenger_geometry_prior_production.py
+  repair_evidence: outputs/training_queues/pending_models_tests_then_training/prior_production_fd_repair_20261013.json
+  latest_evidence: outputs/training_queues/pending_models_tests_then_training/monitor_20261013_0911_adversarial_start.json
+adversarial_integration_20261013:
+  status: production_and_common_val_test_complete
+  config: configs/training_plans/messenger_geometry_prior_runs/selected_k_adversarial.json
+  queue_snapshot: outputs/training_queues/pending_models_tests_then_training/adversarial_selected_k3_20261013.yaml
+  tests: 13 G/D runtime, checkpoint and epoch tests passed
+  training: complete
+  selected_k: 3
+  selection_sha256: 390e61908778d0fb5de34cb56794b9363eed560776c0f63a681d4cff6991f282
+  topology: HEAD-free FACE/ellipse -> crop DINO + frozen observer -> Messenger geometry-prior -> Query; discriminator
+    training-only
+  discriminator:
+    channels: 384
+    hidden: 64
+    seed: 42
+    lr: 0.0001
+    weight_decay: 0.01
+    betas:
+    - 0.9
+    - 0.999
+    adversarial_weight: 0.01
+  initialization: Same parent warm start as k3, not k3 trained weights. D RNG isolated; same G data and initialization
+    stream.
+  runner_pid: null
+  latest_evidence: outputs/training_queues/pending_models_tests_then_training/monitor_20261013_1209_adversarial_complete.json
+  launcher_check: checkpoint epoch2/step4; G/D optimizer and scheduler states present; same online W&B run resumed
+  preflight: outputs/landmark_detection/messenger_geometry_prior/adversarial_preflight_20261013/selected_k_adversarial/preflight_complete.json
+  selected_microbatch: 16
+  effective_batch: 64
+  last_epoch: 14
+  best_epoch: 2
+  best_value: 0.885222165759405
+  wandb_url: https://wandb.ai/sato-waseda-university/face_detection/runs/gp-8052dd9e454f30246ee3

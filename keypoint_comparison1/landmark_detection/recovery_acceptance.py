@@ -18,12 +18,13 @@ def common_state_hash(model):
 def implementation_hashes():
     root = Path(__file__).resolve().parents[2]
     files = ["keypoint_comparison1/landmark_detection/" + name + ".py" for name in (
-        "continuous_recovery", "continuous_teacher", "recovery_reference", "occlusion_materials", "occlusion_policy", "real_occlusion", "real_recovery_metrics",
+        "continuous_recovery", "continuous_teacher", "recovery_reference", "occlusion_materials", "occlusion_policy", "real_occlusion", "real_face_occlusion", "geometry_prior_inputs", "real_recovery_metrics",
         "model", "dataset", "config", "training", "recovery_acceptance", "losses", "metrics", "evaluation", "pipeline")]
     files += ["scripts/run_continuous_recovery_gate.py", "scripts/train_continuous_recovery.py",
               "scripts/run_multiscale_query_refinement_gate.py", "scripts/audit_occlusion_distribution.py",
               "scripts/opaque_boundary_gradient.py", "scripts/prepare_real_occlusion_bank.py",
-              "scripts/audit_real_mixed_occlusion.py", "scripts/evaluate_real_mixed_recovery.py"]
+              "scripts/prepare_real_face_occlusion_bank.py", "scripts/audit_real_face_occlusion.py",
+              "scripts/prototype_cross_video_face_occlusion.py", "scripts/audit_real_mixed_occlusion.py", "scripts/evaluate_real_mixed_recovery.py"]
     return {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in files}
 
 

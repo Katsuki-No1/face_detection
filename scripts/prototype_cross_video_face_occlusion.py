@@ -104,7 +104,7 @@ def crop_record(record, *, target):
     return out, ellipse, points, states
 
 
-def place(target, donor, rng, route):
+def place(target, donor, rng, route, *, light_area_only=False):
     image, ellipse, points = target[:3]
     states = np.array(target[3] if len(target)>3 else [2]*5,dtype=np.int64)
     drgb, de = donor[:2]
@@ -130,12 +130,18 @@ def place(target, donor, rng, route):
         inside = (states>0)&(xy[:,0]>=0)&(xy[:,0]<w)&(xy[:,1]>=0)&(xy[:,1]<h)
         covered = np.zeros(len(points),bool)
         covered[inside] = mask[xy[inside,1],xy[inside,0]]
-        if not (lo < overlap <= hi) or (route == 'light' and not covered.any()): continue
+        within_band = lo < overlap < hi if route == 'light' and light_area_only else lo < overlap <= hi
+        requires_point = route == 'light' and not light_area_only
+        if not within_band or (requires_point and not covered.any()): continue
         df = cv2.resize(dface.astype(np.uint8),(dw,dh),interpolation=cv2.INTER_NEAREST)
         foreground = np.zeros((h,w),bool)
         foreground[y0:y1,x0:x1] = df[y0-y:y1-y,x0-x:x1-x] > 0
         actual_face_overlap = float((foreground & face).sum()/face.sum())
-        if actual_face_overlap < .01: continue  # Reject background-only occluders.
+        # Revised light route has no 1% lower bound, but a face must actually occlude the target.
+        if route == 'light' and light_area_only:
+            if actual_face_overlap <= 0: continue
+        elif actual_face_overlap < .01:
+            continue  # Legacy/medium/strong: reject background-only or <1% face overlap.
         out = image.copy(); resized = cv2.resize(drgb,(dw,dh),interpolation=cv2.INTER_LINEAR)
         out[y0:y1,x0:x1] = resized[y0-y:y1-y,x0-x:x1-x]
         updated_states = np.where(covered,1,states).tolist()

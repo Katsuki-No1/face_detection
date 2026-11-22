@@ -1,0 +1,19 @@
+{
+  "schema": "messenger-natural-occlusion-v1",
+  "topology": ["full_image_face_ellipse", "face_crop_dino", "messenger_prior_fusion", "query_refinement"],
+  "parent_config": "configs/training_plans/messenger_geometry_prior_runs/k3.json",
+  "parent_checkpoint_sha256": "ef7dc88c1395e1871d432114003edab526f5ea61061a82d7bcad195934d81fa7",
+  "seed": 42,
+  "train": {"epochs": 40, "warmup_epochs": 5, "effective_batch": 64, "minimum_epoch": 10, "patience": 5, "min_delta": 0.0001, "ema": false, "precision": "fp32", "backbone_freeze_epochs": 5},
+  "observer": {"learning_rate": 0.001, "logit_temperature": 0.1, "anchor_weight": 0.001, "selection": "occlusion_f1", "threshold": "unchanged per-cell similarity threshold", "positive_weight": "full training population negative/positive count"},
+  "composition": {"probability": 0.5, "bins": [[0.05, 0.2], [0.2, 0.4], [0.4, 0.6], [0.6, 0.8]], "upper_bound_exclusive": true, "family_fractions": {"face": 0.5, "non_face": 0.5}, "attempts": 256, "maximum_skip": 0.1, "maximum_stratum_skip": 0.2, "minimum_real_pair_fraction": 0.5, "minimum_requests_per_stratum": 10},
+  "material_bank": {"path": "outputs/dataset_adapters/real_occlusion_mixed_v1/manifest.json", "sha256": "587da1883206607ca2b883676195059aaa2ff227b11d038265ee260255ea6718"},
+  "generator": {"max_rgb_delta": 0.12, "field_size": 4, "learning_rate": 0.0001, "realism_weight": 1.0, "preserve_weight": 10.0, "hardness_weight": 0.1},
+  "discriminator": {"learning_rate": 0.0001, "patch_size": 32, "real_scope": "natural state1 points from train", "matching": "same semantic slot and source ellipse scale/ratio/angle bin; different video; mean RGB difference <=0.2", "input": "RGB patch and symmetric semantic slot only"},
+  "task": {"learning_rate": 0.0001, "backbone_learning_rate": 0.00001, "reconstruction_weight": 0.1, "selection": "conditional_semantic_macro_f1_nme_0.10", "presence_threshold": 0.7, "mixing_enabled": true, "observer_frozen": true},
+  "arms": ["observer", "fixed", "gd", "frozen_g", "gdt"],
+  "comparison": "identical donor/mask/placement seeds and task initialization; learned O optional as separately hash-locked matched pair",
+  "checkpoint": {"selection": "maximum validation F1", "ties": "earlier epoch", "last": "every epoch", "best": "every strict F1 improvement", "recovery_interval": 5, "recovery_keep": 1},
+  "production": {"requires_fresh_gates": ["schema", "gpu_step", "overfit", "small_scale"], "preflight": [4, 8, 16], "wandb": true, "automatic_launch": false},
+  "deferred_separate_experiments": ["learned material/placement/shape", "80-100 percent occlusion", "D_feature", "codebook recovery", "current V3 baseline adoption"]
+}

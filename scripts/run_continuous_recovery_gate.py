@@ -41,10 +41,30 @@ def validate_real_mixed_contract(raw):
     return True
 
 
+def validate_real_face_contract(raw):
+    paired = raw["data"]["augmentation"]["paired_occlusion"]
+    if paired.get("appearance") != "real_face":
+        return False
+    contract = raw.get("augmentation_contract", {})
+    if (contract.get("version") != "real_face_w48_s2_v2_light_area_only"
+            or contract.get("light") != dict(minimum_overlap_exclusive=0.0, maximum_overlap_exclusive=.10, must_cover_keypoint=False, minimum_donor_face_overlap_exclusive=0.0)
+            or contract.get("family_probabilities") != {"face": 1.0}
+            or contract.get("profile_donor_probability") != .5
+            or contract.get("recipients") != "original_face_occluded_false_and_all_five_visible"
+            or contract.get("crop_outside_keypoints") != "missing"
+            or contract.get("gradient") != dict(width=48, strength=2, alpha=False, edit_recipient_outside_mask=False)
+            or paired.get("probability") != .30 or paired.get("object_overlap_policy") is not None):
+        raise ValueError("Real face augmentation contract differs from its implementation")
+    if raw.get("distribution_audit") != dict(maximum_skip_fraction=.07, skip_fraction_scope="aggregate"):
+        raise ValueError("Real face distribution contract differs from user-approved aggregate7 percent")
+    return True
+
+
 def schema_gate(config, work_dir):
     raw = load_landmark_config(config).raw
     cfg = raw["model"]["continuous_recovery"]
     real_mixed = validate_real_mixed_contract(raw)
+    real_face = validate_real_face_contract(raw)
     if not cfg["enabled"] and not real_mixed:
         raise ValueError("Continuous recovery must be enabled")
     conditional_policy = raw["data"]["augmentation"]["paired_occlusion"].get("object_overlap_policy")
@@ -90,6 +110,8 @@ def schema_gate(config, work_dir):
         command.extend(["keypoint_comparison1/tests/test_occlusion_policy.py", "tests/test_conditional_object_training_schedule.py"])
     if real_mixed:
         command.extend(["tests/test_real_mixed_occlusion.py", "tests/test_cross_video_face_occlusion_prototype.py"])
+    if real_face:
+        command.extend(["tests/test_real_face_occlusion.py", "tests/test_cross_video_face_occlusion_prototype.py"])
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
     from keypoint_comparison1.landmark_detection.training import make_dataset
     dataset = make_dataset(raw, split="train", training=True)
@@ -120,7 +142,20 @@ def schema_gate(config, work_dir):
                 raise ValueError("Real mixed distribution audit failed")
             audits.append(dict(path=str(report), sha256=file_hash(report), checks=value["checks"]))
         distribution_audit = dict(real_mixed=audits)
-    if abc and conditional_policy is None and not real_mixed:
+    if real_face:
+        directory = work_dir / "real_face_distribution"
+        subprocess.run([str(PROJECT_ROOT / ".venv/bin/python"), "scripts/audit_real_face_occlusion.py",
+            "--config", str(config), "--output", str(directory)], cwd=PROJECT_ROOT, check=True)
+        report = directory / "report.json"
+        value = json.loads(report.read_text())
+        from scripts.audit_real_face_occlusion import distribution_passed
+        if (value.get("status") != "passed" or value.get("scope") != "full_rgb_actual_loader"
+                or set(value["by_seed_epoch"]) != {f"{s}:{e}" for s in (42,43) for e in (1,12,40)}
+                or value.get("distribution_policy") != raw["distribution_audit"]
+                or not distribution_passed(value, value["by_seed_epoch"], raw["distribution_audit"]["skip_fraction_scope"])):
+            raise ValueError("Real face distribution audit failed")
+        distribution_audit = dict(path=str(report), sha256=file_hash(report), checks=value["checks"])
+    if abc and conditional_policy is None and not real_mixed and not real_face:
         import torch
         from keypoint_comparison1.landmark_detection.training import seed_everything
         dataset.set_epoch(1)

@@ -1,0 +1,15 @@
+extends: face_overlap_robustness_v1.yaml
+experiment_name: face_overlap_real_face_w48_s2
+implementation_status: preparation_only_not_production_ready
+model:
+  face_overlap_robustness:
+    enabled: true
+    # Frozen MAL alpha2 DEIMv2-L decoder hidden_dim and observed query width.
+    query_dim: 224
+data:
+  face_context_caches:
+    train: outputs/face_overlap_robustness/real_face_w48_s2/cache/train_composite.json
+    val: outputs/face_overlap_robustness/real_face_w48_s2/cache/val.json
+    test: outputs/face_overlap_robustness/real_face_w48_s2/cache/test.json
+outputs:
+  root: outputs/face_overlap_robustness/real_face_w48_s2

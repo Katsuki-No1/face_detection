@@ -1,0 +1,51 @@
+extends: dinov3_vits16_face_pose_drive_v2_landmark_occlusion.yaml
+
+# Existing local Query Refinement architecture, not a new Messenger variant.
+# The preparation job binds detector identity and its validation-only threshold.
+experiment_name: mal_alpha2_wider_query_refinement
+model:
+  backbone:
+    initialize_from_deim_checkpoint: outputs/experiments/mal_alpha2_wider_pipeline/ellipse/checkpoints/best_val_map.pt
+detector:
+  name: mal_alpha2_ellipse_from_wider
+  config: outputs/experiments/mal_alpha2_wider_pipeline/configs/ellipse.yaml
+  checkpoint: outputs/experiments/mal_alpha2_wider_pipeline/ellipse/checkpoints/best_val_map.pt
+train:
+  minimum_epochs: 10
+  epochs: 40
+  microbatch_candidates: [4, 8, 16]
+  intended_effective_batch_size: 64
+  batch_size: 8
+  gradient_accumulation_steps: 8
+  warmup_epochs: 5
+  flat_epochs: 5
+  refinement_initialize_from_query: false
+  grad_scaler_init_scale: 1024.0
+  grad_scaler_growth_interval: 2000
+  checkpoint_every: 5
+  validation:
+    enabled: true
+    every: 1
+    batch_size: 32
+  checkpoint_selection:
+    metric: conditional_semantic_macro_f1_nme_0.10
+    direction: higher
+    filename: best_conditional_semantic_macro_f1.pt
+  early_stopping:
+    enabled: true
+    minimum_epoch: 10
+    patience_validations: 5
+    min_delta: 1.0e-4
+evaluation:
+  pipeline_contract:
+    type: cascade
+    stages: [full_image_face_ellipse, face_crop_keypoint]
+  predicted_head: null
+  defer_until_all_checkpoints: false
+  architecture_id: mal_alpha2_wider_query_refinement
+  point_presence_threshold: 0.70
+  baseline_aligned_output_root: outputs/landmark_detection/mal_alpha2_wider_query_refinement/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/mal_alpha2_wider_query_refinement
+wandb:
+  group: mal_alpha2_wider_pipeline

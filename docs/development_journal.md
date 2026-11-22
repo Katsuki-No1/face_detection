@@ -8,6 +8,49 @@
 
 <!-- development-journal-entries -->
 
+## 2026-11-22
+
+<!-- dev-journal-entry:start id=messenger-occlusion-source-commit-20261122 -->
+### 20:44 JST — 特徴復元のソースを occlusion に集約
+
+- ID: `messenger-occlusion-source-commit-20261122`
+- 状態: `completed`
+- 記録元: `ユーザーが特徴復元のコミット、READMEの構造説明、mainとbaselineの同期を指定`
+- Git: `a212935fffac` (`dirty`)
+
+#### 1. 設計意図・判断根拠
+
+- 顔cropからDINO、Messenger token、復元候補、パッチ混合、Query Refinementへの経路をREADMEに記載。人工教師マスクと、自然遮蔽のgを位置損失で学習する設計を明記。
+
+実装:
+
+- 復元モデル、関連実験とデータ処理、設定、既存テストを収録。コードブック診断のキュー登録は無効状態で収録。作業中の自動継続と自然遮蔽の新trainerはローカルに保持。mainをbaselineの52300c4へfast-forward。
+
+#### 2. 学習条件・学習結果
+
+条件:
+
+- not run。既存学習へのシグナル送信なし。
+
+結果:
+
+- not run。
+
+#### 3. 出力・検証・可視化
+
+出力:
+
+- README.md に構造図と入出力表を追記。
+
+検証と意図:
+
+- コミット候補だけを展開したCPUテスト352件成功。E16/E32復元とgの形状・混合式、READMEリンク、無効化済みキューを確認。
+
+#### 4. 結果に対するユーザーの考え・認識
+
+> 未記入（結果確認後、ユーザー本人の言葉を追記する）
+<!-- dev-journal-entry:end id=messenger-occlusion-source-commit-20261122 -->
+
 ## 2026-10-10
 
 <!-- dev-journal-entry:start id=messenger-occlusion-github-source-snapshot-20261010 -->

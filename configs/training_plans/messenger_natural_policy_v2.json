@@ -1,0 +1,20 @@
+{
+  "schema": "messenger-natural-policy-v2",
+  "base_config": "configs/training_plans/messenger_natural_occlusion_v1.json",
+  "topology": ["full_image_face_ellipse", "face_crop_dino", "messenger_prior_fusion", "query_refinement"],
+  "seed": 42,
+  "composition": {
+    "split": "train", "probability": 0.5,
+    "bins": [[0.05, 0.2], [0.2, 0.4], [0.6, 0.8], [0.8, 1.0]],
+    "bin_fractions": [0.25, 0.25, 0.25, 0.25], "alpha": false,
+    "material_candidates": 4, "placements_per_material": 2, "attempts": 256,
+    "action": "one donor, joint material/scale/translation selection from feasible pool",
+    "recipient_input": "predicted ellipse geometry only; no hidden recipient RGB",
+    "real_matching": "same source ellipse geometry bin; different train video; at least one state1"
+  },
+  "generator": {"learning_rate": 0.0001, "natural_weight": 1.0, "position_weight": 0.1, "estimator": "categorical REINFORCE with detached previous-update EMA reward baseline"},
+  "discriminator": {"learning_rate": 0.0001, "input": "full_face_crop_rgb", "loss": "non_saturating_logistic"},
+  "task": {"covered_position_weight": 1.0, "position_loss": "mean normalized xy smooth_l1 over annotated covered points per crop; presence independent", "selection": "conditional_semantic_macro_f1_nme_0.10"},
+  "runtime": {"scope": "bounded CPU implementation smoke only", "epochs": 2, "microbatch": 2, "effective_batch": 16, "requested_per_bin": 2, "natural_crops": 8, "candidate_scan_per_bin": 48},
+  "production": {"enabled": false, "reason": "independent gates, isolated preflight, full-train distribution audit and canonical integration not yet issued"}
+}

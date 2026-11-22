@@ -1,0 +1,33 @@
+# HEAD-free FACE/ellipse -> crop DINO -> Messenger -> Query Refinement.
+# Actual loader candidate; no production authorization marker or passed gates.
+extends: continuous_recovery_abc_b_object_conditional.yaml
+experiment_name: continuous_recovery_abc_b_real_face_w48_s2_seed42
+implementation_status: loader_integrated_pending_distribution_audit_and_four_gates
+data:
+  augmentation:
+    paired_occlusion:
+      appearance: real_face
+      object_overlap_policy: null
+      material_manifest: outputs/dataset_adapters/real_face_occlusion_w48_s2/manifest.json
+      material_manifest_sha256: 3f9f1cd404ac672225373b797c3b4bfc7086404cf686e8852713345c34951364
+evaluation:
+  architecture_id: deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42
+  baseline_aligned_output_root: outputs/landmark_detection/continuous_recovery_abc_b_real_face_w48_s2/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/continuous_recovery_abc_b_real_face_w48_s2
+wandb:
+  group: continuous_recovery_real_face_w48_s2_seed42
+augmentation_contract:
+  version: real_face_w48_s2_v2_light_area_only
+  light: {minimum_overlap_exclusive: 0.0, maximum_overlap_exclusive: 0.10, must_cover_keypoint: false, minimum_donor_face_overlap_exclusive: 0.0}
+  family_probabilities: {face: 1.0}
+  profile_donor_probability: 0.5
+  recipients: original_face_occluded_false_and_all_five_visible
+  crop_outside_keypoints: missing
+  gradient: {width: 48, strength: 2, alpha: false, edit_recipient_outside_mask: false}
+  limitation: Face pastes reproduce occlusion by faces only; non-face object occluders are future work.
+
+# User 2026-10-12: 241/3707 aggregate skips accepted at <=7%.
+distribution_audit:
+  maximum_skip_fraction: 0.07
+  skip_fraction_scope: aggregate

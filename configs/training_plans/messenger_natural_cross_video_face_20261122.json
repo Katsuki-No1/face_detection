@@ -1,0 +1,38 @@
+{
+  "schema": "messenger-natural-g-head-condition-v1",
+  "id": "natural_cross_video_face",
+  "label": "C",
+  "extends": "messenger_natural_g_head_common_20261122.json",
+  "description": "natural plus exact donor face ellipse from a different training video",
+  "augmentation": {
+    "family": "cross-video face paste",
+    "donor_split": "train only",
+    "recipient_video_different": true,
+    "source_crop_expansion_factor": 1.0,
+    "alpha_support": "exact annotated donor ellipse; pixels outside ellipse excluded, no head bbox/background padding",
+    "placement": "resize/rotate/translate unexpanded donor crop to realize requested recipient occlusion area",
+    "natural_to_augmented": [
+      1,
+      1
+    ],
+    "generator_or_harmonizer": false
+  },
+  "fixed_R": {
+    "path": "outputs/diagnostics/messenger_full_e_first_review_20261122/retained_checkpoints/best_R.pt",
+    "sha256": "7c7e2d7cbfb3eee4370186b46e6970454cddc493e3fcf89247b9783575bc938a",
+    "epoch": 49,
+    "dimension": 16,
+    "codes": 8192,
+    "scales": [
+      1,
+      2,
+      4
+    ],
+    "update_during_natural_training": false,
+    "immutable": true,
+    "original_mutable_best_not_used": true
+  },
+  "status": "scheduled_held",
+  "start_authorized": false,
+  "entrypoint": null
+}

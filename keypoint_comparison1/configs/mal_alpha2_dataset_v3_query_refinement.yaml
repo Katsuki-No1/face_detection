@@ -1,0 +1,40 @@
+extends: mal_alpha2_wider_query_refinement.yaml
+experiment_name: mal_alpha2_dataset_v3_query_refinement
+data:
+  dataset_version: face_pose_condition_balanced_811_latest_sources_r3_20261009
+  root: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+  annotations:
+    train: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_train.json
+    val: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_val.json
+    test: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_test.json
+  ellipse_error_model: /home/katsuki/projects/face_detection/outputs/experiments/mal_alpha2_dataset_v3_query_pipeline/configs/train_ellipse_error_model.json
+model:
+  backbone:
+    initialize_from_deim_checkpoint: /home/katsuki/projects/face_detection/outputs/experiments/mal_alpha2_ellipse_dataset_v3_r3/checkpoints/best_val_map.pt
+detector:
+  name: mal_alpha2_ellipse_dataset_v3_r3
+  config: /home/katsuki/projects/face_detection/configs/dinov3_deimv2/mal_alpha2_ellipse_dataset_v3_r3.yaml
+  checkpoint: /home/katsuki/projects/face_detection/outputs/experiments/mal_alpha2_ellipse_dataset_v3_r3/checkpoints/best_val_map.pt
+train:
+  synchronized_timing: true
+evaluation:
+  architecture_id: mal_alpha2_dataset_v3_query_refinement
+  pipeline_contract:
+    type: cascade
+    stages:
+    - full_image_face_ellipse
+    - face_crop_keypoint
+  predicted_head: null
+  baseline_aligned_output_root: outputs/landmark_detection/mal_alpha2_dataset_v3_query_refinement/query_refinement/evaluation
+outputs:
+  root: outputs/landmark_detection/mal_alpha2_dataset_v3_query_refinement
+wandb:
+  group: local_baseline_dataset_v3
+experiment_provenance:
+  preparation_required: true
+  train_error_calibration_split: train
+  detector_threshold_selection_split: val
+  checkpoint_selection: conditional semantic macro F1 NME0.10 on predicted Face assigned
+    to unique GT Head; GT Head normalization
+  common_evaluation: canonical historical splits registered separately; bounded schedule
+    stops at Query Refinement production completion

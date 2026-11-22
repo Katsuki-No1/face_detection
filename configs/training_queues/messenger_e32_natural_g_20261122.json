@@ -1,0 +1,107 @@
+{
+  "schema": "messenger-next-schedule-20261122-v1",
+  "created_utc": "2026-11-22T11:16:41.844915+00:00",
+  "status": "scheduled_held_before_resume",
+  "execution_enabled": false,
+  "schedule_kind": "explicit experiment order and configuration manifest, not an active automatic worker",
+  "user_confirmations": {
+    "R_DINO_fixed": true,
+    "g_head_from_scratch": true,
+    "variants": [
+      "A",
+      "B",
+      "C"
+    ],
+    "natural_bins": [
+      [
+        0,
+        1
+      ],
+      [
+        2
+      ],
+      [
+        3
+      ],
+      [
+        4
+      ],
+      [
+        5
+      ]
+    ],
+    "all_missing_presence_only": true
+  },
+  "jobs": [
+    {
+      "order": 1,
+      "id": "E32K8192_s124_full_train",
+      "config": "configs/training_plans/messenger_e32_full_train_20261122.json",
+      "status": "scheduled_held"
+    },
+    {
+      "order": 2,
+      "id": "natural_only",
+      "config": "configs/training_plans/messenger_natural_only_20261122.json",
+      "status": "scheduled_held"
+    },
+    {
+      "order": 3,
+      "id": "natural_baseline_occlusion",
+      "config": "configs/training_plans/messenger_natural_baseline_occlusion_20261122.json",
+      "status": "scheduled_held"
+    },
+    {
+      "order": 4,
+      "id": "natural_cross_video_face",
+      "config": "configs/training_plans/messenger_natural_cross_video_face_20261122.json",
+      "status": "scheduled_held"
+    }
+  ],
+  "current_run": {
+    "pid": 163377,
+    "start_ticks": "7875505",
+    "state": "SIGSTOP remains in effect",
+    "latest_epoch": 66,
+    "best_epoch": 49,
+    "no_SIGCONT_sent": true
+  },
+  "existing_pending_JS_condition": {
+    "id": "E16K8192_s1248_js001",
+    "state": "retained on hold; not removed, not started; no change to executing original runner"
+  },
+  "before_execution": [
+    "implement missing new-condition runners without modifying paused run source",
+    "confirm exact per-condition optimizer-step budget and mixed balancing implementation in intent table",
+    "pass schema/gpu_step/overfit/small_scale for each new condition",
+    "obtain explicit start/resume instruction; resolve paused process canonical lease before another training job starts"
+  ],
+  "no_new_training_or_gate_started": true,
+  "assets": {
+    "fixed_R": {
+      "path": "outputs/diagnostics/messenger_full_e_first_review_20261122/retained_checkpoints/best_R.pt",
+      "sha256": "7c7e2d7cbfb3eee4370186b46e6970454cddc493e3fcf89247b9783575bc938a",
+      "epoch": 49,
+      "dimension": 16,
+      "codes": 8192,
+      "scales": [
+        1,
+        2,
+        4
+      ],
+      "update_during_natural_training": false,
+      "immutable": true,
+      "original_mutable_best_not_used": true
+    },
+    "DINO": {
+      "path": "outputs/landmark_detection/mal_alpha2_dataset_v3_query_refinement/query_refinement/checkpoints/best_conditional_semantic_macro_f1.pt",
+      "sha256": "11b430b595e56395a14c266cb364bd50848b1a51b5b689548eb6749de0a23856",
+      "load_scope_natural_runs": "backbone only; build all keypoint head modules from random initialization; never load trained head weights"
+    }
+  },
+  "artifacts": {
+    "data_inventory": "outputs/diagnostics/messenger_next_schedule_20261122/data_inventory.json",
+    "sampling_inventory": "outputs/diagnostics/messenger_next_schedule_20261122/natural_train_sampling_inventory.json",
+    "cache_audit": "outputs/diagnostics/messenger_next_schedule_20261122/cache_audit.json"
+  }
+}

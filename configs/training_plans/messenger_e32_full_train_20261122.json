@@ -1,0 +1,138 @@
+{
+  "schema": "messenger-next-training-condition-v1",
+  "id": "E32K8192_s124_full_train",
+  "status": "scheduled_held",
+  "created_utc": "2026-11-22T11:16:41.844915+00:00",
+  "reference_plan": {
+    "path": "outputs/diagnostics/messenger_full_e_20261122/plan.json",
+    "sha256": "6fb08fb5c8cf377535076fa98651e2d4b0b85cdbd2114321d74444a9ced2e3ae"
+  },
+  "delta_from_reference": {
+    "latent_dimension": [
+      16,
+      32
+    ]
+  },
+  "architecture": {
+    "family": "E",
+    "dimension": 32,
+    "codes": 8192,
+    "dictionary_selection": "unit-normalized",
+    "dictionary_update": "EMA",
+    "spatial_attention_after_quantization": true,
+    "scales": [
+      1,
+      2,
+      4
+    ],
+    "js_weight": 0
+  },
+  "initialization": {
+    "type": "fresh model and fresh 32D dictionary, not 16D checkpoint resume",
+    "basis": "top32 of same train512 sensitivity data used for current top16 initialization",
+    "mean_and_kmeans": "all same 8688 clean train faces; 8192 centers in 32 dimensions",
+    "new_artifact_namespace": true
+  },
+  "data": {
+    "train": 8688,
+    "val": 1160,
+    "test": 1009,
+    "selection": "all five visible, face_occluded=false, inside canonical crop",
+    "artificial_mask_plan": {
+      "bins": [
+        0,
+        0.2,
+        0.4,
+        0.6,
+        0.8,
+        1
+      ],
+      "per_face": 5,
+      "shapes": [
+        "line",
+        "face",
+        "hand",
+        "ellipse",
+        "irregular",
+        "multiple"
+      ],
+      "positions": "3x3 ellipse-local anchor grid plus jitter",
+      "area": "pixel mask intersection / GT ellipse area",
+      "target_tolerance": 0.001,
+      "sampling": "stratified within-bin targets; exact per-face five bins; balanced shape-position slots",
+      "mask": "opaque; patch g is ANY occluded RGB pixel, no face-support threshold",
+      "fit": "epoch-specific seed; regenerate RGB and DINO features",
+      "dev_eval": "fixed independent seeds",
+      "appearance": [
+        "flat",
+        "smooth_texture",
+        "pixel_texture"
+      ],
+      "shape_method": "signed-distance silhouette level sets calibrated to actual ellipse intersection",
+      "shape_limit": "high-coverage dilation can merge components; actual topology and coverage are recorded"
+    },
+    "same_epoch_masks_as_E16": true
+  },
+  "fixed": {
+    "DINO_and_head": {
+      "path": "outputs/landmark_detection/mal_alpha2_dataset_v3_query_refinement/query_refinement/checkpoints/best_conditional_semantic_macro_f1.pt",
+      "sha256": "11b430b595e56395a14c266cb364bd50848b1a51b5b689548eb6749de0a23856",
+      "load_scope": "full current baseline DINO and trained keypoint head, both frozen; identical to E16 control"
+    }
+  },
+  "trainable": [
+    "complete recovery including encoder/decoder/spatial correction; dictionary EMA only"
+  ],
+  "g": "fixed artificial binary teacher mask; no learned g",
+  "loss": {
+    "mse_weight": 0.01,
+    "cosine_weight": 0.01,
+    "vq_weight": 0.01,
+    "commitment_weight": 0.25,
+    "position": "same primary GT coordinate loss and coefficient as reference plan"
+  },
+  "optimization": {
+    "lr": 0.0001,
+    "weight_decay": 0.01,
+    "effective_batch": 16,
+    "microbatch": 16,
+    "R_cap": 600,
+    "R_min_epochs": 40,
+    "lr_floors": [
+      1e-06
+    ],
+    "lr_reduce_patience": 8,
+    "stop_patience": 15,
+    "R_selection": "minimum official val balanced position"
+  },
+  "comparison": {
+    "control": {
+      "path": "outputs/diagnostics/messenger_full_e_first_review_20261122/retained_checkpoints/best_R.pt",
+      "sha256": "7c7e2d7cbfb3eee4370186b46e6970454cddc493e3fcf89247b9783575bc938a",
+      "epoch": 49,
+      "dimension": 16,
+      "codes": 8192,
+      "scales": [
+        1,
+        2,
+        4
+      ],
+      "update_during_natural_training": false,
+      "immutable": true,
+      "original_mutable_best_not_used": true
+    },
+    "matched_exposure": "also preserve validation-selected best-so-far and latest at epoch66 for comparison with interrupted E16; final convergence result separately labeled",
+    "test": "same images and fixed five-bin masks; point-size and high-occlusion breakdown",
+    "control_E16_not_converged": true
+  },
+  "gate_required": [
+    "schema",
+    "gpu_step",
+    "overfit",
+    "small_scale"
+  ],
+  "failure_policy": "stop; no threshold relaxation or automatic quality retry",
+  "start_authorized": false,
+  "entrypoint": null,
+  "implementation_status": "new runner/model/cache namespace required before gate"
+}

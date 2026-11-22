@@ -46,6 +46,53 @@ def load_materials(manifest_path, expected_sha256):
     return result
 
 
+def _search_object_support(rgba, face_mask, overlap_bounds):
+    """Place the same binary cutout using actual support after proposal exhaustion.
+
+    Rectangle overlap is not object overlap (especially for hollow glasses or
+    narrow edge faces). Correlate the true alpha against the visible ellipse at
+    bounded scales, then verify integer pixel counts. Never fill alpha holes,
+    switch material, skip augmentation, or relax the locked overlap interval.
+    """
+    face_pixels = int(face_mask.sum())
+    opaque_pixels = int((rgba[..., 3] == 255).sum())
+    if not face_pixels or not opaque_pixels:
+        return None
+    height, width = face_mask.shape
+    low, high = overlap_bounds
+    minimum, maximum = int(np.ceil(low * face_pixels)), int(np.floor(high * face_pixels))
+    if minimum > maximum:
+        return None
+    target = (minimum + maximum) / 2
+    cy, cx = np.argwhere(face_mask).mean(axis=0)
+    base_scale = np.sqrt(target / opaque_pixels)
+    for multiplier in (1., 1.4, 2., 2.8, .7, 4., .5):
+        oh = max(1, min(2 * height, round(rgba.shape[0] * base_scale * multiplier)))
+        ow = max(1, min(2 * width, round(rgba.shape[1] * base_scale * multiplier)))
+        sized = cv2.resize(np.ascontiguousarray(rgba), (ow, oh), interpolation=cv2.INTER_NEAREST)
+        alpha = (sized[..., 3] == 255).astype(np.float32)
+        padded = np.pad(face_mask.astype(np.float32), ((oh - 1, oh - 1), (ow - 1, ow - 1)))
+        counts = np.rint(cv2.matchTemplate(padded, alpha, cv2.TM_CCORR)).astype(np.int32)
+        ys, xs = np.where((counts >= minimum) & (counts <= maximum))
+        if not len(xs):
+            continue
+        # Closest to central placement, then closest to the interval midpoint;
+        # stable row/column tie breaking makes the bounded search reproducible.
+        distance = (xs - (ow - 1) + (ow - 1) / 2 - cx)**2 + (ys - (oh - 1) + (oh - 1) / 2 - cy)**2
+        order = np.lexsort((xs, ys, np.abs(counts[ys, xs] - target), distance))
+        for index in order[:16]:
+            x0, y0 = int(xs[index] - (ow - 1)), int(ys[index] - (oh - 1))
+            x1, y1 = x0 + ow, y0 + oh
+            cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
+            canvas = np.zeros((height, width, 4), dtype=np.uint8)
+            canvas[cy0:cy1, cx0:cx1] = sized[cy0-y0:cy1-y0, cx0-x0:cx1-x0]
+            mask = canvas[..., 3] == 255
+            exact_overlap = int((mask & face_mask).sum()) / face_pixels
+            if low <= exact_overlap <= high:
+                return canvas, mask, [x0, y0, x1, y1], exact_overlap
+    return None
+
+
 def apply_material_occlusion(image, *, face_ellipse, keypoints, keypoint_visibility, config, rng, force_kind):
     """Texture preserves the solid-arm mask RNG; object uses its actual support.
 
@@ -69,23 +116,32 @@ def apply_material_occlusion(image, *, face_ellipse, keypoints, keypoint_visibil
     if flip:
         rgba = rgba[:, ::-1]
     face_mask = ellipse_region_mask(image.shape[0], image.shape[1], face_ellipse)
-    for attempt in range(config.maximum_attempts):
-        _, mask, _, metadata = apply_landmark_occlusion_numpy(image,
-            face_ellipse=face_ellipse, keypoints=keypoints, keypoint_visibility=keypoint_visibility,
-            config=config.landmark_mapping(), rng=rng, force=True, force_kind=force_kind)
-        if not mask.any():
-            continue
-        ys, xs = np.where(mask)
-        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-        resized = cv2.resize(np.ascontiguousarray(rgba), (x1-x0, y1-y0), interpolation=cv2.INTER_NEAREST)
-        canvas = np.zeros((*mask.shape, 4), dtype=np.uint8)
-        canvas[y0:y1, x0:x1] = resized
-        if config.appearance == "object":
-            # Cutout alpha support, never its bounding rectangle or the proposed mask.
-            mask = canvas[..., 3] == 255
-        overlap = float((mask & face_mask).sum()) / max(1, int(face_mask.sum()))
-        if not config.face_overlap[0] <= overlap <= config.face_overlap[1]:
-            continue
+    for attempt in range(config.maximum_attempts + (config.appearance == "object")):
+        if attempt == config.maximum_attempts:
+            placement = _search_object_support(rgba, face_mask, config.face_overlap)
+            if placement is None:
+                break
+            canvas, mask, (x0, y0, x1, y1), overlap = placement
+            metadata = dict(kind="object", requested_kind=force_kind,
+                placement_method="bounded_actual_support_search_v1",
+                proposal_attempts=config.maximum_attempts)
+        else:
+            _, mask, _, metadata = apply_landmark_occlusion_numpy(image,
+                face_ellipse=face_ellipse, keypoints=keypoints, keypoint_visibility=keypoint_visibility,
+                config=config.landmark_mapping(), rng=rng, force=True, force_kind=force_kind)
+            if not mask.any():
+                continue
+            ys, xs = np.where(mask)
+            x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+            resized = cv2.resize(np.ascontiguousarray(rgba), (x1-x0, y1-y0), interpolation=cv2.INTER_NEAREST)
+            canvas = np.zeros((*mask.shape, 4), dtype=np.uint8)
+            canvas[y0:y1, x0:x1] = resized
+            if config.appearance == "object":
+                # Cutout alpha support, never its bounding rectangle or the proposed mask.
+                mask = canvas[..., 3] == 255
+            overlap = float((mask & face_mask).sum()) / max(1, int(face_mask.sum()))
+            if not config.face_overlap[0] <= overlap <= config.face_overlap[1]:
+                continue
         output = image.copy()
         output[mask] = canvas[..., :3][mask]
         states = np.asarray(keypoint_visibility).copy()

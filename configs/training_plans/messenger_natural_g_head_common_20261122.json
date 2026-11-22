@@ -1,0 +1,259 @@
+{
+  "schema": "messenger-natural-g-head-plan-v1",
+  "status": "scheduled_held",
+  "created_utc": "2026-11-22T11:16:41.844915+00:00",
+  "authorization": "User approved fixed R and DINO, fresh g/head, A-C three conditions, five natural point-count strata, and all-missing presence-only routing",
+  "fixed": {
+    "DINO": {
+      "path": "outputs/landmark_detection/mal_alpha2_dataset_v3_query_refinement/query_refinement/checkpoints/best_conditional_semantic_macro_f1.pt",
+      "sha256": "11b430b595e56395a14c266cb364bd50848b1a51b5b689548eb6749de0a23856",
+      "load_scope_natural_runs": "backbone only; build all keypoint head modules from random initialization; never load trained head weights"
+    },
+    "R": {
+      "path": "outputs/diagnostics/messenger_full_e_first_review_20261122/retained_checkpoints/best_R.pt",
+      "sha256": "7c7e2d7cbfb3eee4370186b46e6970454cddc493e3fcf89247b9783575bc938a",
+      "epoch": 49,
+      "dimension": 16,
+      "codes": 8192,
+      "scales": [
+        1,
+        2,
+        4
+      ],
+      "update_during_natural_training": false,
+      "immutable": true,
+      "original_mutable_best_not_used": true
+    },
+    "codebook_ema_updates": false,
+    "module_mode": "eval; gradients disabled and buffer hashes unchanged"
+  },
+  "trainable": {
+    "head": "all non-DINO keypoint components including projections, query embeddings, transformer/refinement, coordinate/presence/visibility heads initialized fresh, same seed and initial state across A/B/C",
+    "g": "fresh NaturalFeatureGate(384), channel=1.0; per-patch sigmoid replacement weight, existing normalized X/R + cosine difference + patch-coordinate inputs",
+    "g_parameter_initialization": "existing gate defaults, last bias=-2; identical A/B/C"
+  },
+  "topology": [
+    "observed or augmented face RGB",
+    "frozen baseline crop DINO -> X [B,384,16,16]",
+    "frozen E16 K8192 epoch49 recovery -> R [B,384,16,16]",
+    "g(X,R) -> [B,1,16,16]",
+    "F=(1-g)*X+g*R",
+    "fresh trainable Query Refinement head -> 5 points, presence and visibility"
+  ],
+  "gate_meaning": "task-optimal feature adoption, not a calibrated physical occlusion probability",
+  "no_oracle_g_even_for_synthetic": true,
+  "supervision": {
+    "g_loss": "final head position error only, valid annotated coordinates v>0; no loss on absent coordinates",
+    "g_no_losses": [
+      "mask BCE",
+      "visibility/presence classification",
+      "clean-feature MSE/cosine",
+      "entropy/sparsity",
+      "weight decay"
+    ],
+    "head_loss": "existing Query Refinement coordinate/presence/visibility and existing auxiliary heads, with their current weights; no new heatmap head",
+    "gradient_routing": "g gradients computed only from L_position; head gradients from L_head_total. Presence/visibility/auxiliary losses must not update g. Frozen R/DINO receive no gradients or EMA updates. All-missing batches skip g optimizer entirely.",
+    "all_missing": "1844 train faces remain in head presence training only; no fabricated coordinate or pseudo-label loss for g",
+    "coordinate_policy": "visible v=2 and annotated occluded v=1 included; missing v=0 excluded",
+    "frozen_R_losses": []
+  },
+  "data": {
+    "annotations": {
+      "train": {
+        "path": "/home/katsuki/projects/face_detection/outputs/diagnostics/keypoint_side_revision_v3_20261031/annotations/deim_dino/face_keypoints_train.json",
+        "sha256": "60d4e51efd54d26678d7126b9314d82fcd302b7f87189816ee52dd09b6702900"
+      },
+      "val": {
+        "path": "/home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_val.json",
+        "sha256": "7728e75be9a17d0f91797c1375db9eee86279b7ae60b67ae0a33251735034016"
+      },
+      "test": {
+        "path": "/home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_test.json",
+        "sha256": "b606e6d672451bb6963aee11b8cd83b683adf9007aecbf49ba4f3297fcdc22d6"
+      }
+    },
+    "counts": {
+      "train_faces": 24218,
+      "train_position_faces": 22374,
+      "train_all_missing": 1844,
+      "val_faces": 3072,
+      "test_faces": 2972
+    },
+    "split": "official train/val/test; no train-internal holdout",
+    "crop": "GT ellipse aligned square x1.25, 256x256, same frozen DINO normalization",
+    "source_video_overlap": "keep official video-separated splits; donor only from same training split and different video",
+    "angle_policy": "as user requested, do not separate pose/self-occlusion from external occlusion in this experiment"
+  },
+  "sampling": {
+    "natural_proxy": "count of original annotated slots with state 0 or 1; not measured area",
+    "natural_bins": [
+      [
+        0,
+        1
+      ],
+      [
+        2
+      ],
+      [
+        3
+      ],
+      [
+        4
+      ],
+      [
+        5
+      ]
+    ],
+    "natural_position_face_counts": [
+      12628,
+      4702,
+      2693,
+      1506,
+      845
+    ],
+    "balance": "same draw count for each of five position-supervised natural groups; cycle minority groups without dropping majority or any original train face",
+    "reference_natural_epoch_draws": 63140,
+    "head_only_missing_extra_draws": 1844,
+    "mixed_source_ratio": {
+      "natural": 0.5,
+      "augmented": 0.5
+    },
+    "mixed_source_ratio_status": "initial scheduling choice; recorded explicitly",
+    "mixed_balance": "natural half balanced by point-count proxy; augmented half balanced by ACTUAL added occlusion area within recipient ellipse. Two different severity measures, reported separately; no claim of measured natural area or uniform physical area for the combined pool.",
+    "augmentation_area_bins": [
+      [
+        0,
+        0.2
+      ],
+      [
+        0.2,
+        0.4
+      ],
+      [
+        0.4,
+        0.6
+      ],
+      [
+        0.6,
+        0.8
+      ],
+      [
+        0.8,
+        1
+      ]
+    ],
+    "joint_distribution_audit": [
+      "source x severity group",
+      "actual synthetic area x resulting nonvisible point count",
+      "video,face size,shape,location",
+      "excluded g-position targets and head-only faces"
+    ],
+    "all_train_usage": "every original recipient face appears; balancing uses repeated minor groups rather than downsampling away training faces"
+  },
+  "augmentation_common": {
+    "non_occlusion_augmentation": {
+      "roi_geometry": "long_axis_square",
+      "scale_factor": 1.25,
+      "scale_jitter": 0.2,
+      "center_jitter": 0.08,
+      "rotation_deg": 25.0,
+      "horizontal_flip_probability": 0.5,
+      "brightness": 0.2,
+      "contrast": 0.2,
+      "saturation": 0.15,
+      "blur_probability": 0.1,
+      "blur_kernel_max": 5,
+      "occlusion_probability": 0.0,
+      "occlusion_area": [
+        0.02,
+        0.12
+      ],
+      "landmark_guided_occlusion": {
+        "probability": 0.0,
+        "regular_probability": 0.5,
+        "landmark_anchor_probability": 0.7,
+        "face_overlap": [
+          0.1,
+          0.4
+        ],
+        "center_offset_fraction": 0.12,
+        "maximum_attempts": 128
+      }
+    },
+    "policy": "same non-occlusion baseline transformations and seeds across A/B/C; disable both baseline occlusion switches in A; in B/C replace the baseline 10-40%/probability settings with the stated mixed-source and five-area-bin schedule",
+    "visibility_update": "retain recipient GT coordinates; newly hidden labeled points become v=1, existing v=1 stays occluded, original missing v=0 remains missing; do not train on donor landmark identities",
+    "synthetic_features": "recompute frozen DINO and R from changed RGB; never reuse unoccluded features for altered images"
+  },
+  "cache": {
+    "existing_cache_root": "outputs/diagnostics/messenger_full_e_preparation_20261122",
+    "existing_canonical_train_faces": 8688,
+    "existing_val_faces": 1160,
+    "existing_test_faces": 1009,
+    "eligible_reuse_train_faces": 8688,
+    "additional_canonical_train_faces_required": 15530,
+    "verified_sha256": {
+      "clean.npy": "127f757e5cf6eee27fbe2481face47524acc13335b0480662117b336e9d3a91a",
+      "rgb.npy": "4470030ebc5cbe4f23b2cb7849c229665918579839571e06e85bc28e79fa2ef1"
+    },
+    "matching_conditions": [
+      "same frozen DINO state",
+      "same original RGB bytes",
+      "same crop affine transform",
+      "same normalization and layer11 output",
+      "same dtype/forward precision"
+    ],
+    "cannot_reuse_for": [
+      "changed artificial occlusion",
+      "donor-face pasted RGB",
+      "geometric or photometric augmentation that changes pixels",
+      "features restored by an older recovery model"
+    ],
+    "natural_input_is_observed_rgb_not_occlusion_free_teacher": true,
+    "private_cache_for_new_experiments": true,
+    "storage_policy": "bounded active-generation cache; no unbounded per-epoch feature archives; no writes to paused-run caches"
+  },
+  "optimization_proposal": {
+    "head": {
+      "lr": 0.0005,
+      "effective_batch": 64,
+      "weight_decay": 0.05,
+      "warmup_epochs": 5
+    },
+    "g": {
+      "lr": 0.0001,
+      "weight_decay": 0
+    },
+    "validation_selection": "minimum equal-stratum natural-validation annotated-point position error; also report all-face micro average and occluded/visible separately",
+    "early_stop": "minimum10 complete balanced passes; 5 validation checks without significant position improvement; maximum40 passes; no forced LR-floor wait",
+    "seed": 42,
+    "identical_update_budget_across_A_B_C": true,
+    "budget_accounting": "A and B/C must be compared at common optimizer step counts and equal draws per shared severity/source contract; report unique faces and repeat counts, not nominal epochs alone",
+    "status": "provisional implementation defaults, not user-confirmed or executed"
+  },
+  "evaluation": [
+    "natural full official val/test, five point-count strata",
+    "visible versus annotated-occluded point errors; missing presence performance separately",
+    "same artificial five-area-bin official test for comparison with current E16",
+    "high-occlusion 60-100% combined, large-error rate, small-face breakdown",
+    "g distributions, all-zero/all-one collapse diagnostics; do not use segmentation accuracy as g objective"
+  ],
+  "gate_required": [
+    "schema",
+    "gpu_step",
+    "overfit",
+    "small_scale"
+  ],
+  "gate_checks": [
+    "fresh head differs from trained baseline and identical across A/B/C",
+    "fixed DINO/R parameters and buffers including codebook EMA unchanged",
+    "g gradients from position only",
+    "all-missing rows give no g position update",
+    "all original train faces covered; natural and synthetic strata each balanced as specified",
+    "no donor video or train/val/test leakage; no expanded donor ellipse",
+    "cache identities match actual transformed RGB and fixed model hashes"
+  ],
+  "failure_policy": "stop; no automatic quality retry or threshold relaxation",
+  "start_authorized": false,
+  "implementation_status": "new g/head trainer, samplers and augmentation interfaces must be implemented before gate",
+  "entrypoint": null
+}

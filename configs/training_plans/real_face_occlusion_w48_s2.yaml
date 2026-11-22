@@ -34,12 +34,12 @@ shared_augmentation:
   one_target_per_source_image: true
   exclusive_with_other_synthetic_occlusion: true
   routes:
-    - {name: light, overlap: [0.0, 0.10], probability: 0.20, must_cover_keypoint: true}
+    - {name: light, overlap: [0.0, 0.10], interval: open, probability: 0.20, must_cover_keypoint: false, minimum_donor_face_overlap_exclusive: 0.0}
     - {name: medium, overlap: [0.10, 0.20], probability: 0.40}
     - {name: strong, overlap: [0.20, 0.40], probability: 0.40}
-  interval_convention: lower_exclusive_upper_inclusive
+  interval_convention: light_both_exclusive_medium_strong_lower_exclusive_upper_inclusive
   maximum_placement_attempts: 128
-  minimum_donor_face_overlap: 0.01
+  minimum_donor_face_overlap: 0.01  # medium/strong; light requires positive overlap only
   profile_donor_probability: 0.50
   no_silent_route_downgrade: true
   no_silent_solid_object_fallback: true
@@ -74,6 +74,15 @@ ordering_constraints:
 
 experiments:
   - id: deimv2_l_query_refinement_continuous_abc_b_real_face_w48_s2_seed42
+    status: completed
+    runnable: true
+    production_job: continuous_recovery_abc_b_real_face_w48_s2_production_train
+    historical_v2_rejection_evidence: outputs/training_queues/pending_models_tests_then_training/real_face_v2_distribution_skip_20261012.json
+    historical_v2_rejection_stage: schema_required_augmentation_distribution
+    historical_v2_result: Full loader seeds42/43 epochs1/12/40 requested3707 applied3466 skipped241; skip6.5012 percent exceeds5 percent in all six groups. No automatic retry or relaxation.
+    historical_v1_rejection_evidence: outputs/training_queues/pending_models_tests_then_training/real_face_distribution_skip_20261012.json
+    historical_v1_rejection_stage: schema_required_augmentation_distribution
+    formal_four_gate_run: completed_authenticated_20261012
     purpose: Messenger feature recovery under occlusion by another face
     parent_config: keypoint_comparison1/configs/continuous_recovery_abc_b_object_conditional.yaml
     deployment:
@@ -124,7 +133,7 @@ experiments:
     baseline_promotion: Not implied by this experiment.
   - id: face_overlap_control_real_face_w48_s2_seed42
     purpose: Matched FOR-off control for deciding whether to use the FOR v1 design
-    parent_config: keypoint_comparison1/configs/face_overlap_robustness_v1.yaml
+    parent_config: keypoint_comparison1/configs/face_overlap_real_face_w48_s2.yaml
     planned_model_overrides:
       face_overlap_robustness: {enabled: false}
     ablation_group: for_v1_on_off_real_face_w48_s2
@@ -146,9 +155,9 @@ experiments:
   - id: face_overlap_robustness_real_face_w48_s2_seed42
     purpose: FOR target-face keypoint attribution under overlapping faces
     target_status: User confirmed both detector and crop-keypoint applications; this is the FOR crop-keypoint arm.
-    parent_config: keypoint_comparison1/configs/face_overlap_robustness_v1.yaml
+    parent_config: keypoint_comparison1/configs/face_overlap_real_face_w48_s2.yaml
     planned_model_overrides:
-      face_overlap_robustness: {enabled: true, query_dim: 256}
+      face_overlap_robustness: {enabled: true, query_dim: 224}
     ablation_group: for_v1_on_off_real_face_w48_s2
     ablation_arm: for_on
     deployment:
@@ -240,7 +249,8 @@ readiness_requirements:
   - FOR on/off must share post-composition prediction/crop manifests even when the off head does not consume query context.
   - Freeze the FOR ablation's overlap/attribution protocol before production; validate identical initial outputs and per-epoch augmentation manifests.
 distribution_targets:
-  maximum_skip_fraction: 0.05
+  maximum_skip_fraction: 0.07
+  skip_fraction_scope: aggregate
   maximum_light_fraction_of_applied: 0.30
   minimum_strong_fraction_of_applied: 0.25
   current_preview_is_gate_success: false
@@ -252,3 +262,166 @@ evaluation:
   required_files: [metrics.json, comparison_table.md, success.json]
   unsupported_head_metrics: N/A with explicit unsupported_reason
   natural_occlusion_and_overlapping_face_diagnostics: Separate from synthetic-distribution audit; no invented misassociation metric.
+
+loader_integration_20261011:
+  status: superseded_by_user_authorized_light_area_only_revision
+  production_training: not_run
+  runnable: false
+  messenger_config: keypoint_comparison1/configs/continuous_recovery_abc_b_real_face_w48_s2.yaml
+  strict_train_manifest: outputs/dataset_adapters/real_face_occlusion_w48_s2/manifest.json
+  strict_train_manifest_sha256: 3f9f1cd404ac672225373b797c3b4bfc7086404cf686e8852713345c34951364
+  full_rgb_loader_audit: outputs/audits/real_face_w48_s2_loader_full_20261011
+  bounded_smoke: outputs/audits/real_face_w48_s2_loader_smoke_20261011/report.json
+  bounded_smoke_result: 30/32 applied; 2 placement skips; not a distribution pass or gate success
+  remaining:
+    - Full seeds42/43 epochs1/12/40 audit must satisfy the unchanged distribution criteria.
+    - All four fresh authenticated Messenger gates and canonical executable job registration.
+    - Detector/FOR full-image composition adapters and shared composite query extraction.
+    - Freeze unresolved FOR overlap/attribution criteria before either production arm.
+
+light_policy_revision_20261012:
+  authorization: User requested relaxing light occlusion to accept occlusion below10 percent.
+  version: real_face_w48_s2_v2_light_area_only
+  criterion: positive actual FACE occlusion with total binary-paste overlap strictly below10 percent
+  must_cover_keypoint: false
+  lower_donor_face_overlap: positive_only_no_one_percent_floor
+  background_only_paste: rejected
+  medium_strong: unchanged
+  historical_v1_result: preserved_as_failed_never_relabelled_success
+  audit: outputs/audits/real_face_w48_s2_loader_full_v2_20261012
+  production_training: not_run_fresh_four_gates_still_required
+
+user_revision_20261012:
+  authorization: User accepts aggregate synthesis skip fraction at or below7 percent and requests real-face training before geometry-prior integration.
+  historical_reports: Preserve prior5 percent failures unchanged.
+  scope: Messenger real-face arm only; other three full-image/FOR arms still pending integration.
+  execution: Fresh schema audit, GPU step, overfit, small scale, production, common val/test.
+
+messenger_completion_20261012:
+  evidence: outputs/training_queues/pending_models_tests_then_training/real_face_completion_20261012_1808.json
+  last_epoch: 19
+  best_epoch: 14
+  other_three_arms: not_integrated
+
+full_image_integration_20261013:
+  status: preparation_implemented_production_not_integrated
+  adapter: scripts/real_face_full_image.py
+  audit: outputs/audits/real_face_full_image_transport_v2_20261013/report.json
+  audit_result: 49 of 64 applied; 15 skipped; bounded preparation only, not a distribution gate
+  tests: 4 full-image invariant tests and 2 composite-context tests passed
+  context_preparation: outputs/face_overlap_robustness/preparation/composite_context_q224_20261013/report.json
+  context_result: 4 composite images, 10 fresh FACE queries; shared FOR-on/off input; no stale clean queries
+  query_dimension_repair: Actual frozen DEIMv2-L decoder and emitted queries are224, not prototype256; new scoped config uses224
+  pending_user_decision: Detector truncated donor bbox visible-support versus full-ellipse envelope; full ellipse retained in either case
+  remaining:
+    - Resolve detector donor labels, connect actual training loader and full jitter/distribution audit
+    - Per-epoch shared full-image composite/prediction/crop manifests for FOR-on and FOR-off
+    - Frozen FOR overlap and attribution validation protocol; connect verified paired initialization into production launcher
+    - Dedicated launcher/W&B/resume, isolated batch4/8/16, four fresh gates and common evaluation for each arm
+  production_training: not run
+  formal_gates: not run
+
+paired_for_preparation_20261013:
+  status: bounded_pair_verified_production_not_integrated
+  implementation: scripts/real_face_for_pair.py
+  verification: scripts/verify_real_face_for_pair.py
+  report: outputs/face_overlap_robustness/preparation/paired_crops_20261013/report.json
+  result: 4 composite images, 6 recipient annotations, 5 matched predicted FACE crops; identical off/on crop tensors and targets
+  initialization: Parent FOR detector-initialized DINO backbone plus seed42 Query Refinement; copy all303 shared tensors from control to conditioned arm
+  reason: Same seed alone leaves8 downstream refinement tensors different due to added FOR module RNG consumption
+  conditioned_difference: Only8 FOR conditioning tensors; residual projections start at zero; full-model initial outputs exactly equal
+  context: Both arms require the same authenticated224-dimensional composite query cache; off model ignores context only at forward
+  source_integrity: Composite PNG and RGB hashes, mask binding, train-only different-video provenance checked; derived keypoint state summaries rebuilt
+  tests: 6 pair/provenance CPU tests passed, plus existing6 full-image/context tests
+  production_training: not run
+  formal_gates: not run
+  remaining:
+    - Shared per-epoch full-train composite/query/crop manifests and real production augmentation distribution audit
+    - Frozen overlap and misattribution validation criteria and natural-occlusion common evaluation
+    - Production launcher, W&B and complete resume contract, isolated batch4/8/16 and four fresh gates
+
+shared_epoch_preparation_20261013:
+  status: initial_and_repaired_recipe_audits_completed_not_formal_gate
+  implementation: scripts/real_face_epoch_inputs.py
+  crop_rng_wrapper: scripts/real_face_for_dataset.py
+  audit_command: .venv/bin/python scripts/audit_real_face_epoch_inputs.py --output outputs/audits/real_face_epoch_recipe_full_20261013 --resume
+  queue_job: real_face_for_full_train_epoch_recipe_audit
+  audit_population: All4237 canonical train images x seeds42/43 x epochs1/12/40;25422 image records
+  sampling: One image-local target at probability0.30 among originally eligible recipients; unchanged/skipped images retained
+  reproducibility: SHA256 recipe seed from policy version,seed,epoch,image ID; isolated crop RNG additionally binds annotation ID
+  resume: Immutable code/data contract; complete JSONL records retained, torn final record replayed; changed contract rejected
+  audit_output: outputs/audits/real_face_epoch_recipe_full_20261013
+  audit_result: 3762 requested,2707 applied,1055 skipped (28.0436 percent); preparation completed, not a gate pass
+  storage: Compact recipes only; no image caches, checkpoints or prediction tensors
+  crop_check: Same-epoch off/on5 real crop tensors and targets identical despite different model RNG; all5 changed at epoch12
+  crop_check_report: outputs/face_overlap_robustness/preparation/paired_crops_20261013/crop_rng_report.json
+  resume_check_report: outputs/audits/real_face_epoch_recipe_resume_check_20261013/resume_check.json
+  formal_gates: not run
+  production_training: not run
+  remaining:
+    - Convert full recipes into fresh post-composition query/crop manifests and audit actual crop augmentation
+    - Inspect full-population skip reasons without weakening augmentation criteria
+    - Complete production/resume/W&B, frozen evaluation protocol, preflight and independent four gates
+
+donor_support_repair_20261013:
+  status: implementation_repaired_full_population_reaudit_completed
+  cause: Additional donor faces were checked in the whole source patch before placement even when clipped out of the final paste
+  correction: Track other donor FACE support through the actual bilinear resize, crop clipping and nearest full-image transport; reject any surviving support
+  unchanged: Recipient eligibility, donor/profile/route sampling,128 placement attempts,severity bounds,no outside-paste pixel edits; no acceptance threshold changes
+  historical_audit: outputs/audits/real_face_epoch_recipe_full_20261013/report.json
+  preserved_source: outputs/audits/real_face_epoch_recipe_full_20261013/source_snapshot/real_face_full_image.py
+  replay_report: outputs/audits/real_face_donor_support_repair_20261013/report.json
+  replay_result: 15 of64 previous patch-level rejections recovered;49 still rejected;64 previously applied RGB and recipient supervision exactly unchanged
+  tests: 9 full-image and epoch-replay tests passed, including clipped-out faces and exact RGB interpolation support
+  queue_job: real_face_for_full_train_epoch_recipe_audit_support_v2
+  revised_audit: outputs/audits/real_face_epoch_recipe_full_support_v2_20261013
+  revised_result: 3762 requested,2814 applied,948 skipped (25.1994 percent);107 more applied; preparation only,not gate acceptance
+  production_training: not run
+  formal_gates: not run
+
+full_epoch_context_preparation_20261014:
+  status: full_train_epoch1_context_preparation_completed_not_gate
+  implementation: scripts/prepare_real_face_for_epoch.py
+  topology: HEAD-free full-image frozen FACE/ellipse -> actual predicted Face crop -> DINO Query Refinement with FOR on/off
+  input: Authenticated support-v2 audit recipes,canonical v2 train4237 images,seed42 epoch1
+  retention: All original images retained including clean and skipped synthesis; donor keypoints excluded from recipient supervision
+  output: outputs/face_overlap_robustness/preparation/epoch1_full_context_20261014
+  queue_job: real_face_for_epoch1_full_context_preparation
+  completed_at: 2026-10-14T00:32:04+09:00
+  result: All4237 images,468 composites,3769 original images,6529 recipient annotations,6203 matched crops;326 unmatched recipient annotations reported
+  artifact_authentication_20261015: Contract/annotation/context hashes and all pinned source files unchanged
+  observed_safety: sampled_peak3301MiB_of24564MiB_and62C
+  smoke: outputs/face_overlap_robustness/preparation/epoch1_context_guarded_smoke_20261014
+  smoke_result: 64 images including4 applied and60 original;87 predicted crops;all crop tensors finite
+  resume_result: Existing record,annotation,context and crop hashes unchanged;complete records reused without rerunning detector
+  identity: Each record authenticates recipe,contract,RGB file and predictions;all queries inferred from actual current input pixels
+  safety: Sample total VRAM<=90 percent and temperature<83C;smoke sampled peak3076MiB/24564MiB and49C
+  storage: One prepared epoch;only modified PNGs stored with2GiB cap;original images reference immutable source
+  formal_gates: not run
+  production_training: not run
+  remaining:
+    - Review complete production crop population and synthesis acceptance independently of preparation success
+    - Connect epoch manifest rotation or deterministic regeneration to full trainer with paired initialization,W&B and complete resume
+    - Freeze FOR overlap/attribution evaluation protocol,isolated4/8/16 and separate authenticated four gates
+
+validation_context_integration_20261015:
+  status: full_validation_preparation_complete_not_gate
+  implementation: scripts/prepare_real_face_for_validation.py
+  epoch_validation: scripts/real_face_for_validation.py
+  queue_job: real_face_for_full_validation_context_preparation
+  output: outputs/face_overlap_robustness/preparation/validation_context_20261015
+  topology: HEAD-free full-image frozen FACE/ellipse -> predicted Face crop -> DINO Query Refinement with optional FOR conditioning
+  input: Full canonical validation530 images and882 GT Heads;no synthetic augmentation;no test data
+  result: 787 eligible Heads,759 matched predicted FACE crops,28 unmatched;48 invalid/ambiguous and47 all-missing excluded explicitly
+  resume_result: All530 records reused;artifact and crop hashes identical;detector not restarted
+  report: outputs/face_overlap_robustness/preparation/validation_context_20261015/report.json
+  selection: Conditional equal-five-semantic Macro F1 at NME0.10,presence0.70,GT Head normalization;fixed scheduled parent FACE score0.33
+  pairing: Same image/crop/query/GT cohort for both arms;only model conditioning arguments differ
+  resume: Contract/source/RGB/prediction hashes validated;reuse authenticated per-image records
+  tests: Four tests passed including semantic Macro F1,off/on routing and stale resume rejection
+  formal_gates: not run
+  production_training: not run
+  remaining:
+    - Full production epoch manifest lifecycle,launcher,W&B and optimizer/EMA/epoch/step resume
+    - Full synthesis skips25.1994percent remain unresolved;do not infer acceptance from preparation success
+    - Freeze overlap/attribution protocol and isolated4/8/16 preflight,independent four gates

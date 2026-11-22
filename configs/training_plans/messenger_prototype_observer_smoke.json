@@ -1,0 +1,19 @@
+{
+  "schema": "messenger-prototype-smoke-v1",
+  "purpose": "bounded implementation verification, not a production gate",
+  "topology": "HEAD-free full-image FACE/ellipse -> Face-crop DINO -> Messenger geometry-prior fusion -> Query Refinement",
+  "parent_config": "configs/training_plans/messenger_geometry_prior_runs/k3.json",
+  "checkpoint_sha256": "ef7dc88c1395e1871d432114003edab526f5ea61061a82d7bcad195934d81fa7",
+  "seed": 42,
+  "train_crops": 128,
+  "updates": 40,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "logit_temperature": 0.1,
+  "anchor_weight": 0.001,
+  "positive_weight": "train_subset_negative_count / train_subset_positive_count",
+  "augmentation": "none; natural state1/state2 sparse point supervision",
+  "selection": "none; fixed final update, no validation-based tuning",
+  "device": "cpu",
+  "threads": 2
+}

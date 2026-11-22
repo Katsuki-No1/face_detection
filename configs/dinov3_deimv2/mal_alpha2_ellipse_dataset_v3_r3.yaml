@@ -1,0 +1,49 @@
+extends: mal_alpha2_ellipse_from_existing_wider.yaml
+experiment_name: mal_alpha2_ellipse_dataset_v3_r3
+data:
+  dataset_version: face_pose_condition_balanced_811_latest_sources_r3_20261009
+  data_root: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+  image_root: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+  image_roots:
+    train: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+    val: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+    test: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009
+  annotation_path: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_train.json
+  annotation_paths:
+    train: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_train.json
+    val: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_val.json
+    test: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/face_keypoints_test.json
+train:
+  name: mal_alpha2_ellipse_dataset_v3_r3
+verification:
+  architecture_id: mal_alpha2_ellipse_dataset_v3_r3
+  output: outputs/training_gates/mal_alpha2_ellipse_dataset_v3_r3/schema
+  expected_images:
+    train: 16411
+    val: 2022
+    test: 2060
+  expected_coco_sha256:
+    train: f2ba5e09fbaf29ece5248eae081db7ba021109321a82bd4e806b55425f6da57c
+    val: 7728e75be9a17d0f91797c1375db9eee86279b7ae60b67ae0a33251735034016
+    test: b606e6d672451bb6963aee11b8cd83b683adf9007aecbf49ba4f3297fcdc22d6
+  expected_ellipse_coco_sha256:
+    train: f2ba5e09fbaf29ece5248eae081db7ba021109321a82bd4e806b55425f6da57c
+    val: 7728e75be9a17d0f91797c1375db9eee86279b7ae60b67ae0a33251735034016
+    test: b606e6d672451bb6963aee11b8cd83b683adf9007aecbf49ba4f3297fcdc22d6
+  expected_ellipse_annotations:
+    train: 24218
+    val: 3072
+    test: 2972
+  ellipse_annotation_summary: /home/katsuki/projects/face_detection/outputs/dataset_cache/face_pose_condition_balanced_811_latest_sources_r3_20261009/annotations/deim_dino/conversion_summary.json
+  dataset_manifest_sha256: 0b7eaf8bf51b20b479281054b820aa2e8ecca25d5237184d0d77788854eb0338
+  source_freshness_sha256: 91ed1d14e1ef9daee9993cf538cf464dd8f02a678d6b8b68f93313f2a5b58de8
+experiment_provenance:
+  baseline_role: current_local_baseline_architecture_retrained_on_dataset_v3_r3
+  baseline_registry: configs/model_registry/local_baseline.yaml
+  baseline_architecture: mal_alpha2_ellipse_from_existing_wider
+  initialization: same WIDER initialization as baseline; fresh target fine-tune, not
+    resume of v2 target checkpoint
+  selection: v3 r3 validation bbox mAP50_95 only
+  common_evaluation: registered separately on locked historical canonical split, bounded
+    launch stops at production completion
+  canonical_dataset_switched: false

@@ -19,24 +19,46 @@ baseline全体の評価済み結果として扱いません。既存active-learn
 2026-10-09の5分比較動画は左が現baselineの顔検出部のみ、右が旧baseline一式であり、
 新旧baseline一式同士の比較ではありません。
 
-## Messenger token model / occlusion source snapshot
+## 特徴復元（`occlusion` ブランチ）
 
-The `occlusion` branch builds on the `baseline` source snapshot. Its deployed
-pipeline is HEAD-free: full-image FACE/ellipse -> Face-crop DINO -> Messenger
-recovery -> Query Refinement. It does not promote Messenger to the local baseline.
+`occlusion` では、顔 crop の DINOv3 特徴と 5 点の Query Refinement の間に復元器を入れます。図は E 系列と自然遮蔽で用いる特徴の流れです。評価では `baseline` と比較できるよう、同じ crop・DINO・head に元特徴をそのまま渡す経路も使います。
 
-- Design: [Messenger continuous feature recovery](docs/messenger_continuous_feature_recovery_design.md)
-- Implementation and historical verification: [implementation notes](docs/messenger_continuous_feature_recovery_implementation.md)
-- Configurations: `keypoint_comparison1/configs/continuous_recovery_*.yaml` and `*_messenger_*.yaml`
-- Gates and training: `scripts/run_continuous_recovery_gate.py`, `scripts/train_continuous_recovery.py`
-- Diagnostics: `scripts/evaluate_messenger_recovery.py`, `scripts/evaluate_recovery_abc_diagnostics.py`, `scripts/evaluate_real_mixed_recovery.py`
+~~~mermaid
+flowchart LR
+    I["全画像"] --> D["FACE・楕円検出"]
+    D --> C["256 × 256 の顔 crop"]
+    C --> X["DINOv3 パッチ特徴 X"]
+    X --> M["Messenger token<br/>各位置から周辺特徴を参照"]
+    M --> R["復元候補 R"]
+    X --> G["元特徴と復元候補を g で混合"]
+    R --> G
+    G --> H["Query Refinement"]
+    H --> O["5 点の座標・存在・可視性"]
+~~~
 
-This publication includes model dependencies, configurations, augmentation tools,
-reports, and regression tests. Checkpoints, datasets, generated occlusion banks,
-and cached results remain local. Historical schedule descriptions are retained as
-records; the workstation's current multi-experiment queue changes and automatic
-continuation are outside this source snapshot. No training or evaluation is
-launched by publishing this branch.
+### Messenger token と特徴復元の構造
+
+| 部分 | 入出力と役割 |
+| --- | --- |
+| DINOv3 | 顔 crop から `X`（`B × 384 × 16 × 16`、`B` はバッチ数）を得ます。特徴格子の各セルは入力の 16 × 16 ピクセルのパッチに対応します。 |
+| Messenger token | 学習可能なトークンを 256 の出力位置に展開し、2D 位置符号を加えて cross-attention の query にします。Key と value は同じ顔 crop の DINO 特徴から作ります。初期の単一スケール実装は、参照先から query と同じ位置のパッチを除きます。 |
+| マルチスケール復元 | E 系列では DINO 最終層を factor 1・2・4（比較条件では 8 も追加）で投影し、16 × 16・8 × 8・4 × 4（および 2 × 2）の参照格子を作ります。各枝は同じ 16 × 16 の出力格子に 384 次元の候補を作り、位置ごとの softmax 重みで統合します。 |
+| E 系列のコードブック | 統合特徴を各位置で 16 または 32 次元に圧縮し、正規化した 8,192 個のコードから最も近いものを選びます。量子化した特徴だけを使って 384 次元に復号し、空間補正を足して `R` を得ます。 |
+| 混合と位置推定 | パッチごとの重み `g`（`B × 1 × 16 × 16`）で `Y = (1 − g) ⊙ X + g ⊙ R` を計算します。Query Refinement が `Y` から左右の目・鼻・左右の口角の座標、存在、可視性を推定します。 |
+
+### 教師マスクと自然遮蔽
+
+- **人工遮蔽で復元器を比較する E 実験**では、人工遮蔽マスクを `g` に与え、DINO と Query Refinement を固定します。主損失は位置誤差で、遮蔽パッチの clean 特徴との MSE・cosine と VQ の commitment を補助損失に使います。コードブックの EMA には遮蔽パッチだけを使います。JS あり条件では、スケールごとのコード選択分布の整合性も学習します。
+- **自然遮蔽で `g` を学習する A〜C の設計**は、自然のみ・自然＋従来型人工遮蔽・自然＋別動画の顔楕円貼り付けの3条件です。各条件でDINO と復元器 `R` を固定し、`g` と keypoint head を新規初期化します。`g` は元特徴・復元候補・両者の cosine 差・パッチ座標から混合重みを出し、最終座標の位置損失だけで更新します。全点欠損の顔は head の存在判定に使います。
+
+### 実装の入口
+
+- [初期 Messenger token](keypoint_comparison1/landmark_detection/messenger_recovery.py)、[連続特徴復元](keypoint_comparison1/landmark_detection/continuous_recovery.py)、[設計記録](docs/messenger_continuous_feature_recovery_design.md)
+- [マルチスケール分岐](src/models/messenger_multiaxis.py)、[コードブック復元](src/models/messenger_codebook_reconstruction.py)、[E16 の比較実装](src/models/messenger_full_e.py)、[E32 の実装](src/models/messenger_e32_followup.py)
+- [自然遮蔽の混合ゲート](src/models/natural_feature_gate.py)、[A〜C の学習条件](configs/training_plans/messenger_natural_g_head_common_20261122.json)
+- [連続復元の gate](scripts/run_continuous_recovery_gate.py)、[連続復元の学習](scripts/train_continuous_recovery.py)、[E16 の実験入口](scripts/run_messenger_full_e.py)
+
+評価・学習には別途、対応する DINO と baseline の重み、データセット、および各実験で指定された入力キャッシュが必要です。
 
 このリポジトリには、顔と頭部の検出、顔ランドマークの抽出、YOLO Pose 用のデータセットへの変換、学習、推論、可視化、評価を行う Python スクリプトが含まれています。
 

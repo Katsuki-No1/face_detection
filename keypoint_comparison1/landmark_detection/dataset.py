@@ -110,8 +110,8 @@ class PairedOcclusionConfig:
             if self.appearance != "object" or tuple(self.face_overlap) != (.10, .40):
                 raise ValueError("Conditional object policy requires object appearance and standard10-40% bounds")
             ObjectOverlapPolicy.from_mapping(self.object_overlap_policy)
-        if self.appearance not in {"solid", "texture", "object", "real_mixed"}:
-            raise ValueError("paired_occlusion.appearance must be solid/texture/object/real_mixed")
+        if self.appearance not in {"solid", "texture", "object", "real_mixed", "real_face"}:
+            raise ValueError("paired_occlusion.appearance must be solid/texture/object/real_mixed/real_face")
         if self.appearance != "solid" and (not self.material_manifest or not self.material_manifest_sha256):
             raise ValueError("Pasted occlusion requires a locked material manifest")
         if not 0.0 <= self.probability <= 1.0:
@@ -260,7 +260,11 @@ class TopDownFaceLandmarkDataset(Dataset):
         structure_head_annotations: str | Path | None = None,
         face_overlap_query_dim: int | None = None,
         face_overlap_detector_identity: Mapping[str, Any] | None = None,
+        geometry_prior_grid_size: tuple[int, int] | None = None,
     ) -> None:
+        self.geometry_prior_grid_size = geometry_prior_grid_size
+        if geometry_prior_grid_size is not None and detector_crop_cache is None:
+            raise ValueError("Geometry prior requires a predicted FACE crop cache; GT fallback is forbidden")
         self.annotation_path = Path(annotation_path)
         self.image_root = Path(image_root)
         self.input_size = int(input_size)
@@ -278,9 +282,11 @@ class TopDownFaceLandmarkDataset(Dataset):
         self.real_occlusion_bank = None
         if self.training and self.augmentation.paired_occlusion:
             paired = PairedOcclusionConfig.from_mapping(self.augmentation.paired_occlusion)
-            if paired.appearance == "real_mixed":
+            if paired.appearance in {"real_mixed", "real_face"}:
                 from .real_occlusion import RealOcclusionBank
-                self.real_occlusion_bank = RealOcclusionBank(paired.material_manifest,
+                from .real_face_occlusion import RealFaceOcclusionBank
+                bank_type = RealFaceOcclusionBank if paired.appearance == "real_face" else RealOcclusionBank
+                self.real_occlusion_bank = bank_type(paired.material_manifest,
                     paired.material_manifest_sha256,annotation_path=self.annotation_path,image_root=self.image_root)
             elif paired.appearance != "solid":
                 from .occlusion_materials import load_materials
@@ -542,7 +548,8 @@ class TopDownFaceLandmarkDataset(Dataset):
         sample = self.samples[index]
         image = np.asarray(Image.open(sample["image_path"]).convert("RGB"))
         crop_bbox = list(sample["bbox_xyxy"])
-        crop_ellipse = sample["gt_ellipse"]
+        crop_ellipse = (sample["detector_crop"]["ellipse"]
+                        if sample["detector_crop"] is not None else sample["gt_ellipse"])
         crop_error_residual = np.zeros((5,), dtype=np.float32)
         crop_error_area_bin = -1
         crop_error_clean = True
@@ -652,9 +659,11 @@ class TopDownFaceLandmarkDataset(Dataset):
                         weights=paired_config.kind_probabilities,
                         k=1,
                     )[0]
-                    if paired_config.appearance == "real_mixed":
+                    if paired_config.appearance in {"real_mixed", "real_face"}:
                         from .real_occlusion import apply_real_mixed
-                        crop, occlusion_mask, keypoint_visibility, paired_occlusion_metadata = apply_real_mixed(
+                        from .real_face_occlusion import apply_real_face
+                        apply_real = apply_real_face if paired_config.appearance == "real_face" else apply_real_mixed
+                        crop, occlusion_mask, keypoint_visibility, paired_occlusion_metadata = apply_real(
                             clean_crop, sample=sample, face_ellipse=crop_ellipse_pixels,
                             keypoints=pixel_keypoints, keypoint_visibility=natural_keypoint_visibility,
                             bank=self.real_occlusion_bank, rng=paired_rng)
@@ -674,7 +683,7 @@ class TopDownFaceLandmarkDataset(Dataset):
                             force=True,
                             force_kind=selected_kind,
                         )
-                    if paired_config.appearance not in {"solid", "real_mixed"}:
+                    if paired_config.appearance not in {"solid", "real_mixed", "real_face"}:
                         from .occlusion_materials import apply_material_occlusion
                         # Restore the pre-mask RNG so texture and solid use identical geometry.
                         material_rng = self._paired_occlusion_rng(index)
@@ -685,7 +694,7 @@ class TopDownFaceLandmarkDataset(Dataset):
                             rng=material_rng, force_kind=selected_kind)
                     paired_occlusion_metadata = {
                         **paired_occlusion_metadata,
-                        "pair_kind": ("object" if paired_config.object_overlap_policy is not None or paired_config.appearance == "real_mixed" else selected_kind),
+                        "pair_kind": ("object" if paired_config.object_overlap_policy is not None or paired_config.appearance in {"real_mixed", "real_face"} else selected_kind),
                     }
                     if bool(paired_occlusion_metadata.get("applied", False)) and paired_occlusion_metadata["pair_kind"] == "boundary":
                         for point_index, point in enumerate(pixel_keypoints):
@@ -872,6 +881,12 @@ class TopDownFaceLandmarkDataset(Dataset):
                 dtype=torch.bool,
             ),
         }
+        if self.geometry_prior_grid_size is not None:
+            from .geometry_prior_inputs import predicted_geometry_inputs
+            target["geometry_prior"] = predicted_geometry_inputs(
+                sample["detector_crop"], affine=transform.matrix, flipped=flipped,
+                source_size=(sample["image_width"], sample["image_height"]),
+                crop_size=(self.input_size, self.input_size), grid_size=self.geometry_prior_grid_size)
         if self.face_overlap_query_dim is not None:
             from .face_overlap import crop_face_context
             target.update(crop_face_context(sample["detector_crop"], transform, flipped=flipped))

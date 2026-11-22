@@ -169,3 +169,47 @@ def test_materials_support_same_texture_mask_and_no_fallback(tmp_path):
 def test_reference_schema_rejects_unlocked_or_ambiguous_settings(kwargs):
     with pytest.raises(ValueError):
         ContinuousRecoveryConfig.from_mapping(kwargs)
+
+
+@pytest.mark.parametrize("ellipse", [[64,64,48,40,0], [3,64,4,58,.1], [126,125,35,12,.8]])
+def test_object_placement_exhaustion_search_keeps_binary_support_and_bounds(tmp_path, monkeypatch, ellipse):
+    import keypoint_comparison1.landmark_detection.occlusion_materials as materials
+    manifest = build_materials(tmp_path)
+    cfg = PairedOcclusionConfig.from_mapping(dict(appearance="object", maximum_attempts=1,
+        material_manifest=str(manifest), material_manifest_sha256=sha256(manifest)))
+    image = np.full((128,128,3),127,np.uint8)
+    points = np.array([[1,64],[3,65],[64,64],[122,125],[0,0]],np.float32)
+    states = np.array([2,1,2,2,0])
+    # Reproduce the failed proposal branch independently of random good luck.
+    monkeypatch.setattr(materials, "apply_landmark_occlusion_numpy", lambda image, **kw:
+        (image, np.zeros(image.shape[:2],bool), states, {}))
+    for seed in range(12):
+        kwargs = dict(face_ellipse=ellipse,keypoints=points,keypoint_visibility=states,config=cfg,force_kind="boundary")
+        out, mask, updated, meta = materials.apply_material_occlusion(image, rng=random.Random(seed), **kwargs)
+        again = materials.apply_material_occlusion(image, rng=random.Random(seed), **kwargs)
+        assert meta["placement_method"] == "bounded_actual_support_search_v1"
+        assert .1 <= meta["face_overlap"] <= .4
+        assert meta["mask_source"] == "actual_binary_alpha"
+        assert meta["material_id"] == again[3]["material_id"]
+        np.testing.assert_array_equal(mask,again[1])
+        np.testing.assert_array_equal(out[~mask],image[~mask])
+        assert updated[4] == 0
+        assert meta["masked_face_pixels"] == int((mask & materials.ellipse_region_mask(128,128,ellipse)).sum())
+        # Reconstruct the selected asset transform and compare every support pixel.
+        asset, rgba = next((a,r) for a,r in load_materials(str(manifest),sha256(manifest)) if a["id"] == meta["material_id"])
+        rgba = np.rot90(rgba,meta["quarter_turns"])
+        if meta["material_flip"]: rgba = rgba[:,::-1]
+        import cv2
+        x0,y0,x1,y1=meta["bbox_xyxy"]
+        sized=cv2.resize(np.ascontiguousarray(rgba),(x1-x0,y1-y0),interpolation=cv2.INTER_NEAREST)
+        expected=np.zeros_like(mask)
+        cx0,cy0,cx1,cy1=max(0,x0),max(0,y0),min(128,x1),min(128,y1)
+        expected[cy0:cy1,cx0:cx1]=sized[cy0-y0:cy1-y0,cx0-x0:cx1-x0,3]==255
+        np.testing.assert_array_equal(mask,expected)
+
+
+def test_object_support_search_does_not_relax_impossible_pixel_interval():
+    from keypoint_comparison1.landmark_detection.occlusion_materials import _search_object_support
+    rgba=np.full((8,8,4),255,np.uint8)
+    face=np.zeros((16,16),bool);face[0,0]=True
+    assert _search_object_support(rgba,face,(.1,.4)) is None

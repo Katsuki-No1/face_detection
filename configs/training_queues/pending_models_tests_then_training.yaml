@@ -1930,3 +1930,292 @@ jobs:
       - --stage
       - all
     completion_marker: data/output/active_learning/active_learning08-02-6-4/summary.json
+
+  - name: messenger_codebook_weighted16_diagnostic
+    architecture: messenger_codebook_weighted16
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_weighted16_schema_gate
+    - messenger_codebook_weighted16_gpu_step_gate
+    - messenger_codebook_weighted16_overfit_gate
+    - messenger_codebook_weighted16_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_continuous16_diagnostic
+    architecture: messenger_codebook_continuous16
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_continuous16_schema_gate
+    - messenger_codebook_continuous16_gpu_step_gate
+    - messenger_codebook_continuous16_overfit_gate
+    - messenger_codebook_continuous16_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_vq4096_fixed_diagnostic
+    architecture: messenger_codebook_vq4096_fixed
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_vq4096_fixed_schema_gate
+    - messenger_codebook_vq4096_fixed_gpu_step_gate
+    - messenger_codebook_vq4096_fixed_overfit_gate
+    - messenger_codebook_vq4096_fixed_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_vq4096_trainable_diagnostic
+    architecture: messenger_codebook_vq4096_trainable
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_vq4096_trainable_schema_gate
+    - messenger_codebook_vq4096_trainable_gpu_step_gate
+    - messenger_codebook_vq4096_trainable_overfit_gate
+    - messenger_codebook_vq4096_trainable_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_vq8192_fixed_diagnostic
+    architecture: messenger_codebook_vq8192_fixed
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_vq8192_fixed_schema_gate
+    - messenger_codebook_vq8192_fixed_gpu_step_gate
+    - messenger_codebook_vq8192_fixed_overfit_gate
+    - messenger_codebook_vq8192_fixed_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_vq8192_trainable_diagnostic
+    architecture: messenger_codebook_vq8192_trainable
+    enabled: false
+    phase: evaluation
+    disabled_reason: User-authorized gated comparison on the existing fit split; one bounded manual runner owns the canonical lease.
+    command: ['{project_root}/.venv/bin/python', scripts/run_messenger_codebook.py, train, --wait]
+    depends_on:
+    - messenger_codebook_vq8192_trainable_schema_gate
+    - messenger_codebook_vq8192_trainable_gpu_step_gate
+    - messenger_codebook_vq8192_trainable_overfit_gate
+    - messenger_codebook_vq8192_trainable_small_scale_gate
+    completion_marker: outputs/diagnostics/messenger_codebook_20261119/numeric_completion.json
+  - name: messenger_codebook_weighted16_schema_gate
+    architecture: messenger_codebook_weighted16
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/weighted16/schema/success.json
+  - name: messenger_codebook_weighted16_gpu_step_gate
+    architecture: messenger_codebook_weighted16
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/weighted16/gpu_step/success.json
+  - name: messenger_codebook_weighted16_overfit_gate
+    architecture: messenger_codebook_weighted16
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/weighted16/overfit/success.json
+  - name: messenger_codebook_weighted16_small_scale_gate
+    architecture: messenger_codebook_weighted16
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/weighted16/small_scale/success.json
+  - name: messenger_codebook_continuous16_schema_gate
+    architecture: messenger_codebook_continuous16
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/continuous16/schema/success.json
+  - name: messenger_codebook_continuous16_gpu_step_gate
+    architecture: messenger_codebook_continuous16
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/continuous16/gpu_step/success.json
+  - name: messenger_codebook_continuous16_overfit_gate
+    architecture: messenger_codebook_continuous16
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/continuous16/overfit/success.json
+  - name: messenger_codebook_continuous16_small_scale_gate
+    architecture: messenger_codebook_continuous16
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/continuous16/small_scale/success.json
+  - name: messenger_codebook_vq4096_fixed_schema_gate
+    architecture: messenger_codebook_vq4096_fixed
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_fixed/schema/success.json
+  - name: messenger_codebook_vq4096_fixed_gpu_step_gate
+    architecture: messenger_codebook_vq4096_fixed
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_fixed/gpu_step/success.json
+  - name: messenger_codebook_vq4096_fixed_overfit_gate
+    architecture: messenger_codebook_vq4096_fixed
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_fixed/overfit/success.json
+  - name: messenger_codebook_vq4096_fixed_small_scale_gate
+    architecture: messenger_codebook_vq4096_fixed
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_fixed/small_scale/success.json
+  - name: messenger_codebook_vq4096_trainable_schema_gate
+    architecture: messenger_codebook_vq4096_trainable
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_trainable/schema/success.json
+  - name: messenger_codebook_vq4096_trainable_gpu_step_gate
+    architecture: messenger_codebook_vq4096_trainable
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_trainable/gpu_step/success.json
+  - name: messenger_codebook_vq4096_trainable_overfit_gate
+    architecture: messenger_codebook_vq4096_trainable
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_trainable/overfit/success.json
+  - name: messenger_codebook_vq4096_trainable_small_scale_gate
+    architecture: messenger_codebook_vq4096_trainable
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq4096_trainable/small_scale/success.json
+  - name: messenger_codebook_vq8192_fixed_schema_gate
+    architecture: messenger_codebook_vq8192_fixed
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_fixed/schema/success.json
+  - name: messenger_codebook_vq8192_fixed_gpu_step_gate
+    architecture: messenger_codebook_vq8192_fixed
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_fixed/gpu_step/success.json
+  - name: messenger_codebook_vq8192_fixed_overfit_gate
+    architecture: messenger_codebook_vq8192_fixed
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_fixed/overfit/success.json
+  - name: messenger_codebook_vq8192_fixed_small_scale_gate
+    architecture: messenger_codebook_vq8192_fixed
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_fixed/small_scale/success.json
+  - name: messenger_codebook_vq8192_trainable_schema_gate
+    architecture: messenger_codebook_vq8192_trainable
+    enabled: false
+    phase: gate
+    gate_stage: schema
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_trainable/schema/success.json
+  - name: messenger_codebook_vq8192_trainable_gpu_step_gate
+    architecture: messenger_codebook_vq8192_trainable
+    enabled: false
+    phase: gate
+    gate_stage: gpu_step
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_trainable/gpu_step/success.json
+  - name: messenger_codebook_vq8192_trainable_overfit_gate
+    architecture: messenger_codebook_vq8192_trainable
+    enabled: false
+    phase: gate
+    gate_stage: overfit
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_trainable/overfit/success.json
+  - name: messenger_codebook_vq8192_trainable_small_scale_gate
+    architecture: messenger_codebook_vq8192_trainable
+    enabled: false
+    phase: gate
+    gate_stage: small_scale
+    disabled_reason: Executed together by the bounded gate_messenger_codebook runner before the comparison; no general queue launch.
+    command: ['{project_root}/.venv/bin/python', scripts/gate_messenger_codebook.py, --wait]
+    depends_on: []
+    completion_marker: outputs/training_gates/messenger_codebook_20261119/vq8192_trainable/small_scale/success.json
